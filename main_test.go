@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -165,6 +166,31 @@ func TestMissingGhostscript(t *testing.T) {
 	}
 	assertMissing(t, output)
 	assertNoTemps(t, dir)
+}
+
+func TestBrokenGhostscriptOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell stub")
+	}
+	for _, exit := range []string{"0", "1"} {
+		t.Run("exit="+exit, func(t *testing.T) {
+			dir := t.TempDir()
+			stub := filepath.Join(dir, "gs")
+			writeFile(t, stub, []byte("#!/bin/sh\nprintf '%s\\n' '%PDF-1.7' 'broken'\nexit "+exit+"\n"))
+			if err := os.Chmod(stub, 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir)
+			input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+			writeFile(t, input, testPDF(1000))
+			err := run(t.Context(), []string{"--engine", "ghostscript", "-o", output, input}, io.Discard, io.Discard)
+			if err == nil {
+				t.Fatal("accepted broken Ghostscript output")
+			}
+			assertMissing(t, output)
+			assertNoTemps(t, dir)
+		})
+	}
 }
 
 func TestWriteNewFailure(t *testing.T) {

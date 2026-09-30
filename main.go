@@ -118,12 +118,11 @@ func squeeze(ctx context.Context, input, output, engine, quality string, stderr 
 		os.Remove(tmp.Name())
 	}()
 
+	conf := model.NewStatelessConfiguration()
+	conf.Offline = true
+	conf.PreserveInfoDict = true
 	switch engine {
 	case "pdfcpu":
-		conf := model.NewStatelessConfiguration()
-		conf.Offline = true
-		conf.PostProcessValidate = true
-		conf.PreserveInfoDict = true
 		err = api.Optimize(ctx, in, tmp, conf, nil)
 	case "ghostscript":
 		err = ghostscript(ctx, in, tmp, quality, stderr)
@@ -133,7 +132,10 @@ func squeeze(ctx context.Context, input, output, engine, quality string, stderr 
 	if err != nil {
 		return 0, 0, fmt.Errorf("%s: %w", engine, err)
 	}
-	if err := checkPDF(tmp); err != nil {
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return 0, 0, err
+	}
+	if err := api.Validate(ctx, tmp, conf, nil); err != nil {
 		return 0, 0, fmt.Errorf("%s output: %w", engine, err)
 	}
 	compressed, err := tmp.Stat()
