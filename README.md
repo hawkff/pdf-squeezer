@@ -1,6 +1,6 @@
 # pdf-squeezer
 
-Compress a PDF from the command line. Choose a built-in Go engine or an external Ghostscript installation.
+A PDF compressor written in Go.
 
 ## Install
 
@@ -51,18 +51,6 @@ The CLI prints the input and output sizes. If compression would not make the PDF
 - Compression can invalidate digital signatures. Ghostscript can also change or discard forms, annotations, accessibility tags, attachments, and encryption. Keep originals and inspect the result before sharing it. Use another tool for signed or password-protected documents.
 - Both engines process files on your machine. The CLI does not upload PDFs. Keep Ghostscript updated before processing untrusted files.
 
-## Development
-
-CI uses Namespace runners. To run the same tests in a Go environment with Ghostscript and Poppler installed:
-
-```sh
-gofmt -w main.go main_test.go
-PDF_SQUEEZER_INTEGRATION=1 go test -race ./...
-go vet ./...
-```
-
-Without `PDF_SQUEEZER_INTEGRATION=1`, tests skip optional external tools if they are missing. CI requires them and checks both engines, PDF validity, text retention, and file handling.
-
 ## License
 
-[MIT](LICENSE). Dependencies retain their own licenses. Ghostscript is a separate installation and is not bundled.
+[MIT](LICENSE).
