@@ -1,0 +1,33 @@
+# Go output
+/pdf-squeezer
+/pdf-squeezer.exe
+/bin/
+/dist/
+/coverage/
+*.test
+*.out
+go.work
+go.work.sum
+
+# Local configuration and credentials
+AGENTS.md
+AGENTS.local.md
+.pi/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.log
+
+# Local documents
+*.pdf
+!testdata/**/*.pdf
+
+# Editors and macOS metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+._*
