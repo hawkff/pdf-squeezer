@@ -33,14 +33,23 @@ directory must already exist; it also holds a temporary file during
 compression.
 
 Flags:
+  --dpi N            Ghostscript: resample color and gray images above N dpi
   --engine NAME      pdfcpu (default) or ghostscript
+  --gray             Ghostscript: convert all colors to grayscale
   -h, --help         print this help and exit
+  --images           pdfcpu: re-encode images (see README for what changes)
   -o, --output PATH  output file, or a directory for input.squeezed.pdf
   --privacy          drop document info, XMP metadata, and piece info
   --quality PRESET   Ghostscript preset: screen, ebook (default), printer, prepress
   -V, --verbose      report each step on stderr
   -v, --version      print the version and exit
 `
+
+type options struct {
+	engine, quality                string
+	dpi                            int
+	gray, images, privacy, verbose bool
+}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -56,15 +65,19 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("pdf-squeezer", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	// Help text lives in usage: PrintDefaults would list short and long forms separately.
-	engine := flags.String("engine", "pdfcpu", "")
-	quality := flags.String("quality", "", "")
+	var opts options
+	flags.StringVar(&opts.engine, "engine", "pdfcpu", "")
+	flags.StringVar(&opts.quality, "quality", "", "")
+	flags.IntVar(&opts.dpi, "dpi", 0, "")
+	flags.BoolVar(&opts.gray, "gray", false, "")
+	flags.BoolVar(&opts.images, "images", false, "")
 	var output string
 	flags.StringVar(&output, "output", "", "")
 	flags.StringVar(&output, "o", "", "")
-	var privacy, verbose, showVersion bool
-	flags.BoolVar(&privacy, "privacy", false, "")
-	flags.BoolVar(&verbose, "verbose", false, "")
-	flags.BoolVar(&verbose, "V", false, "")
+	var showVersion bool
+	flags.BoolVar(&opts.privacy, "privacy", false, "")
+	flags.BoolVar(&opts.verbose, "verbose", false, "")
+	flags.BoolVar(&opts.verbose, "V", false, "")
 	flags.BoolVar(&showVersion, "version", false, "")
 	flags.BoolVar(&showVersion, "v", false, "")
 	flags.Usage = func() { fmt.Fprint(stderr, usage) }
@@ -95,22 +108,33 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		flags.Usage()
 		return errors.New("provide exactly one input PDF")
 	}
-	switch *engine {
+	if opts.dpi < 0 {
+		return errors.New("--dpi must be positive")
+	}
+	switch opts.engine {
 	case "pdfcpu":
-		if *quality != "" {
+		switch {
+		case opts.quality != "":
 			return errors.New("--quality requires --engine ghostscript")
+		case opts.dpi != 0:
+			return errors.New("--dpi requires --engine ghostscript")
+		case opts.gray:
+			return errors.New("--gray requires --engine ghostscript")
 		}
 	case "ghostscript":
-		if *quality == "" {
-			*quality = "ebook"
+		if opts.images {
+			return errors.New("--images requires --engine pdfcpu")
 		}
-		switch *quality {
+		if opts.quality == "" {
+			opts.quality = "ebook"
+		}
+		switch opts.quality {
 		case "screen", "ebook", "printer", "prepress":
 		default:
-			return fmt.Errorf("unknown quality %q: use screen, ebook, printer, or prepress", *quality)
+			return fmt.Errorf("unknown quality %q: use screen, ebook, printer, or prepress", opts.quality)
 		}
 	default:
-		return fmt.Errorf("unknown engine %q: use pdfcpu or ghostscript", *engine)
+		return fmt.Errorf("unknown engine %q: use pdfcpu or ghostscript", opts.engine)
 	}
 	input := inputs[0]
 	name := strings.TrimSuffix(filepath.Base(input), filepath.Ext(input)) + ".squeezed.pdf"
@@ -119,26 +143,32 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	} else if info, err := os.Stat(output); err == nil && info.IsDir() {
 		output = filepath.Join(output, name)
 	}
-	before, after, err := squeeze(ctx, input, output, *engine, *quality, privacy, stderr, verbose)
+	before, after, err := squeeze(ctx, input, output, opts, stderr)
 	if err != nil {
 		return err
 	}
 	switch {
-	case before == after && !privacy:
-		fmt.Fprintf(stdout, "%s: no reduction; copied the original (%d bytes)\n", output, before)
+	case before == after && !opts.privacy:
+		hint := "try --engine ghostscript"
+		if opts.engine == "ghostscript" {
+			hint = "try --quality screen or a lower --dpi"
+		} else if !opts.images {
+			hint = "try --images or --engine ghostscript"
+		}
+		fmt.Fprintf(stdout, "%s: no reduction; copied the original (%d bytes); %s\n", output, before, hint)
 	case after > before:
 		fmt.Fprintf(stdout, "%s: %d -> %d bytes (%.1f%% larger, %s)\n",
-			output, before, after, 100*(float64(after)/float64(before)-1), *engine)
+			output, before, after, 100*(float64(after)/float64(before)-1), opts.engine)
 	default:
 		fmt.Fprintf(stdout, "%s: %d -> %d bytes (%.1f%% smaller, %s)\n",
-			output, before, after, 100*(1-float64(after)/float64(before)), *engine)
+			output, before, after, 100*(1-float64(after)/float64(before)), opts.engine)
 	}
 	return nil
 }
 
-func squeeze(ctx context.Context, input, output, engine, quality string, privacy bool, stderr io.Writer, verbose bool) (int64, int64, error) {
+func squeeze(ctx context.Context, input, output string, opts options, stderr io.Writer) (int64, int64, error) {
 	logf := func(format string, args ...any) {
-		if verbose {
+		if opts.verbose {
 			fmt.Fprintf(stderr, format+"\n", args...)
 		}
 	}
@@ -182,40 +212,41 @@ func squeeze(ctx context.Context, input, output, engine, quality string, privacy
 	conf.PreserveInfoDict = true
 	// api.Optimize always optimizes; this only stops api.Validate from re-optimizing the output.
 	conf.Optimize = false
-	if verbose {
+	if opts.verbose {
 		// Surface pdfcpu's repair and skipped-object notices.
 		log.SetCLILogger(stdlog.New(stderr, "", 0))
 		defer log.DisableLoggers()
 	}
 	start := time.Now()
-	switch engine {
+	switch opts.engine {
 	case "pdfcpu":
-		err = optimize(ctx, in, tmp, conf, privacy)
+		err = optimize(ctx, in, tmp, conf, opts, logf)
 	case "ghostscript":
-		if err = ghostscript(ctx, in, tmp, quality, stderr, verbose); err == nil && privacy {
-			err = optimize(ctx, tmp, tmp, conf, true)
+		if err = ghostscript(ctx, in, tmp, opts, stderr); err == nil && opts.privacy {
+			opts.images = false
+			err = optimize(ctx, tmp, tmp, conf, opts, logf)
 		}
 	default:
-		err = fmt.Errorf("unknown engine %q", engine)
+		err = fmt.Errorf("unknown engine %q", opts.engine)
 	}
 	if err != nil {
-		return 0, 0, fmt.Errorf("%s: %w", engine, err)
+		return 0, 0, fmt.Errorf("%s: %w", opts.engine, err)
 	}
 	compressed, err := tmp.Stat()
 	if err != nil {
 		return 0, 0, err
 	}
-	logf("%s: %d bytes in %s", engine, compressed.Size(), time.Since(start).Round(time.Millisecond))
+	logf("%s: %d bytes in %s", opts.engine, compressed.Size(), time.Since(start).Round(time.Millisecond))
 	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
 		return 0, 0, err
 	}
 	start = time.Now()
 	if err := api.Validate(ctx, tmp, conf, nil); err != nil {
-		return 0, 0, fmt.Errorf("%s output: %w", engine, err)
+		return 0, 0, fmt.Errorf("%s output: %w", opts.engine, err)
 	}
 	logf("validated in %s", time.Since(start).Round(time.Millisecond))
 	source := tmp
-	if compressed.Size() >= info.Size() && !privacy {
+	if compressed.Size() >= info.Size() && !opts.privacy {
 		source = in
 	}
 	if _, err := source.Seek(0, io.SeekStart); err != nil {
@@ -226,15 +257,22 @@ func squeeze(ctx context.Context, input, output, engine, quality string, privacy
 	return info.Size(), written, err
 }
 
-// optimize is api.Optimize with an optional metadata strip before writing.
+// optimize is api.Optimize with optional image re-encoding and metadata stripping before writing.
 // pdfcpu holds the whole document in memory, so in and out may be the same file.
-func optimize(ctx context.Context, in io.ReadSeeker, out *os.File, conf *model.Configuration, privacy bool) error {
+func optimize(ctx context.Context, in io.ReadSeeker, out *os.File, conf *model.Configuration, opts options, logf func(string, ...any)) error {
 	conf.Cmd = model.OPTIMIZE
 	pdf, err := api.ReadValidateAndOptimize(ctx, in, conf, nil)
 	if err != nil {
 		return err
 	}
-	if privacy {
+	if opts.images {
+		stats, err := optimizeImages(pdf)
+		if err != nil {
+			return err
+		}
+		logf("%s", stats)
+	}
+	if opts.privacy {
 		if err := stripMetadata(pdf); err != nil {
 			return err
 		}
@@ -271,7 +309,7 @@ func stripMetadata(pdf *model.Context) error {
 		default:
 			continue
 		}
-		for _, key := range []string{"Metadata", "PieceInfo", "LastModified"} {
+		for _, key := range []string{"Metadata", "PieceInfo", "LastModified", "SpiderInfo"} {
 			delete(d, key)
 		}
 	}
@@ -289,7 +327,7 @@ func checkPDF(file *os.File) error {
 	return nil
 }
 
-func ghostscript(ctx context.Context, input, output *os.File, quality string, stderr io.Writer, verbose bool) error {
+func ghostscript(ctx context.Context, input, output *os.File, opts options, stderr io.Writer) error {
 	names := []string{"gs"}
 	if runtime.GOOS == "windows" {
 		names = []string{"gswin64c", "gswin32c", "gs"}
@@ -304,17 +342,24 @@ func ghostscript(ctx context.Context, input, output *os.File, quality string, st
 	if executable == "" {
 		return errors.New("Ghostscript not found in PATH; install it or use --engine pdfcpu")
 	}
-	cmd := exec.CommandContext(ctx, executable,
-		"-dSAFER", "-dBATCH", "-dNOPAUSE", "-dPDFSTOPONERROR",
-		// The presets convert colors to sRGB, which drops 16-bit ICC images with soft masks (iOS Photos exports).
-		"-sDEVICE=pdfwrite", "-dPDFSETTINGS=/"+quality, "-sColorConversionStrategy=LeaveColorUnchanged",
-		"-sOutputFile=-", "-sstdout=%stderr", "-f", "-")
+	// The presets convert colors to sRGB, which drops 16-bit ICC images with soft masks (iOS Photos exports).
+	colors := "-sColorConversionStrategy=LeaveColorUnchanged"
+	if opts.gray {
+		colors = "-sColorConversionStrategy=Gray"
+	}
+	args := []string{"-dSAFER", "-dBATCH", "-dNOPAUSE", "-dPDFSTOPONERROR",
+		"-sDEVICE=pdfwrite", "-dPDFSETTINGS=/" + opts.quality, colors}
+	if opts.dpi > 0 {
+		// Monochrome scans keep the preset's resolution: downsampling them costs legibility.
+		args = append(args, fmt.Sprintf("-dColorImageResolution=%d", opts.dpi), fmt.Sprintf("-dGrayImageResolution=%d", opts.dpi))
+	}
+	cmd := exec.CommandContext(ctx, executable, append(args, "-sOutputFile=-", "-sstdout=%stderr", "-f", "-")...)
 	// Stream file contents, not user paths, to avoid Ghostscript filename syntax.
 	cmd.Stdin, cmd.Stdout = input, output
 	// Not -q: it would also hide the warning summary checked below.
 	var messages bytes.Buffer
 	cmd.Stderr = &messages
-	if verbose {
+	if opts.verbose {
 		cmd.Stderr = io.MultiWriter(stderr, &messages)
 		fmt.Fprintln(stderr, "running", strings.Join(cmd.Args, " "))
 	}
@@ -323,7 +368,7 @@ func ghostscript(ctx context.Context, input, output *os.File, quality string, st
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if !verbose {
+		if !opts.verbose {
 			stderr.Write(messages.Bytes())
 		}
 		return err

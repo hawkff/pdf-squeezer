@@ -35,6 +35,15 @@ pdf-squeezer document.pdf -o .
 # Reduce image quality with Ghostscript
 pdf-squeezer --engine ghostscript --quality ebook -o smaller.pdf scan.pdf
 
+# Ghostscript with images resampled to 100 dpi, everything in grayscale
+pdf-squeezer --engine ghostscript --dpi 100 --gray scan.pdf
+
+# Re-encode images without Ghostscript
+pdf-squeezer --images document.pdf
+
+# Every PDF below the current directory, each output next to its original
+fd -e pdf -x pdf-squeezer {}
+
 # Drop document metadata as well
 pdf-squeezer --privacy document.pdf
 
@@ -49,13 +58,15 @@ Short flags: `-o` output file or directory, `-V` verbose, `-v` version, `-h` hel
 
 `--engine pdfcpu` is the default. It removes redundant PDF objects and compresses document structure without downsampling images. Already optimized PDFs may not shrink.
 
-`--engine ghostscript` rewrites the PDF and can downsample images. Choose `--quality screen` for low-resolution output, `ebook` for medium resolution, or `printer` / `prepress` for print-oriented output. The default is `ebook`. These presets change more than resolution and can reduce quality. Colors stay in their original color spaces. `--quality` only applies to Ghostscript.
+`--engine ghostscript` rewrites the PDF and can downsample images. Choose `--quality screen` for low-resolution output, `ebook` for medium resolution, or `printer` / `prepress` for print-oriented output. The default is `ebook`. These presets change more than resolution and can reduce quality. Colors stay in their original color spaces unless `--gray` converts everything to grayscale. `--dpi N` resamples color and gray images that exceed 1.5 times N dpi down to N; monochrome images keep the preset's resolution because downsampling them costs legibility. `--quality`, `--dpi`, and `--gray` only apply to Ghostscript.
+
+`--images` re-encodes images with the pdfcpu engine and no external software. It only touches 8- or 16-bit gray and RGB images stored losslessly or as a single JPEG. An RGB image whose pixels are all exactly gray becomes DeviceGray, a gray image holding only black and white becomes 1-bit, 16-bit samples become 8-bit, and each image then keeps the smaller of Flate with PNG predictors and JPEG at quality 75. The original bytes stay unless the re-encode saves at least 2% and 1 KiB. Image masks, images with `/Mask` or `/Decode` entries, indexed and CMYK images, soft masks (kept lossless), and anything with other filters are left byte for byte. Photos stored losslessly can come out as JPEG, so treat `--images` as lossy.
 
 If Ghostscript cannot decode an image, it would normally leave the page blank. The CLI stops with an error instead, so a Ghostscript error on a file that other viewers open usually means that file needs `--engine pdfcpu`.
 
 The CLI prints the input and output sizes. If compression would not make the PDF smaller, it copies the original bytes to the output instead, unless `--privacy` is set.
 
-`--privacy` works with both engines. It empties the document information dictionary (title, author, subject, keywords, creator, producer, dates), removes XMP metadata streams and application piece info from every object, and gives the file a fresh identifier. Page content, annotations, form fields, and attachments stay as they are, so names in comments or embedded files remain. Check those separately.
+`--privacy` works with both engines. It empties the document information dictionary (title, author, subject, keywords, creator, producer, dates), removes XMP metadata streams, application piece info, and web capture information from every object, and gives the file a fresh identifier. Page content, annotations, form fields, and attachments stay as they are, so names in comments or embedded files remain. Check those separately.
 
 ## File safety and limitations
 
