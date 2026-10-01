@@ -215,13 +215,14 @@ func ghostscript(ctx context.Context, input, output *os.File, quality string, st
 	if executable == "" {
 		return errors.New("Ghostscript not found in PATH; install it or use --engine pdfcpu")
 	}
-	args := []string{"-q", "-dSAFER", "-dBATCH", "-dNOPAUSE", "-dPDFSTOPONERROR",
-		"-sDEVICE=pdfwrite", "-dPDFSETTINGS=/" + quality,
-		"-sOutputFile=-", "-sstdout=%stderr", "-f", "-"}
-	if verbose {
-		args = args[1:] // Let Ghostscript report its progress.
+	var quiet []string
+	if !verbose {
+		quiet = []string{"-q"}
 	}
-	cmd := exec.CommandContext(ctx, executable, args...)
+	cmd := exec.CommandContext(ctx, executable, append(quiet,
+		"-dSAFER", "-dBATCH", "-dNOPAUSE", "-dPDFSTOPONERROR",
+		"-sDEVICE=pdfwrite", "-dPDFSETTINGS=/"+quality,
+		"-sOutputFile=-", "-sstdout=%stderr", "-f", "-")...)
 	// Stream file contents, not user paths, to avoid Ghostscript filename syntax.
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = input, output, stderr
 	cmd.Env = append(os.Environ(), "GS_OPTIONS=")

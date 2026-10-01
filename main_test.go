@@ -21,55 +21,64 @@ import (
 
 func TestEngines(t *testing.T) {
 	for _, engine := range []string{"pdfcpu", "ghostscript"} {
-		t.Run(engine, func(t *testing.T) {
-			if engine == "ghostscript" {
-				requireTool(t, "gs")
-				// Inherited options must not disable rendering or override safety flags.
-				t.Setenv("GS_OPTIONS", "-dNODISPLAY")
-			}
-			dir := t.TempDir()
-			input := filepath.Join(dir, "@scan 100%.pdf")
-			original := testPDF(64 * 1024)
-			writeFile(t, input, original)
-			var stdout, stderr bytes.Buffer
-			args := []string{"-V", "--engine", engine}
-			if engine == "ghostscript" {
-				args = append(args, "--quality", "screen")
-			}
-			if err := run(t.Context(), append(args, input), &stdout, &stderr); err != nil {
-				t.Fatalf("%v\n%s", err, &stderr)
-			}
-			output := filepath.Join(dir, "@scan 100%.squeezed.pdf")
-			result := readFile(t, output)
-			if len(result) >= len(original) {
-				t.Fatalf("did not shrink: %d -> %d bytes", len(original), len(result))
-			}
-			if !bytes.Equal(readFile(t, input), original) {
-				t.Fatal("input changed")
-			}
-			conf := model.NewStatelessConfiguration()
-			if err := api.Validate(t.Context(), bytes.NewReader(result), conf, nil); err != nil {
-				t.Fatalf("invalid output: %v", err)
-			}
-			if pages, err := api.PageCount(t.Context(), bytes.NewReader(result), conf); err != nil || pages != 1 {
-				t.Fatalf("page count = %d, err = %v", pages, err)
-			}
-			if !strings.Contains(stdout.String(), "smaller, "+engine) {
-				t.Fatalf("missing size summary: %s", &stdout)
-			}
-			if !strings.Contains(stderr.String(), "input: ") || !strings.Contains(stderr.String(), engine+": ") {
-				t.Fatalf("missing verbose steps: %s", &stderr)
-			}
-			assertNoTemps(t, dir)
-			if path, err := exec.LookPath("pdftotext"); err == nil {
-				text, err := exec.Command(path, output, "-").CombinedOutput()
-				if err != nil || !bytes.Contains(text, []byte("Squeeze this PDF.")) {
-					t.Fatalf("text changed: %q, err = %v", text, err)
+		for _, verbose := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/verbose=%t", engine, verbose), func(t *testing.T) {
+				if engine == "ghostscript" {
+					requireTool(t, "gs")
+					// Inherited options must not disable rendering or override safety flags.
+					t.Setenv("GS_OPTIONS", "-dNODISPLAY")
 				}
-			} else if os.Getenv("PDF_SQUEEZER_INTEGRATION") == "1" {
-				t.Fatal("pdftotext is required for integration tests")
-			}
-		})
+				dir := t.TempDir()
+				input := filepath.Join(dir, "@scan 100%.pdf")
+				original := testPDF(64 * 1024)
+				writeFile(t, input, original)
+				var stdout, stderr bytes.Buffer
+				args := []string{"--engine", engine}
+				if engine == "ghostscript" {
+					args = append(args, "--quality", "screen")
+				}
+				if verbose {
+					args = append(args, "-V")
+				}
+				if err := run(t.Context(), append(args, input), &stdout, &stderr); err != nil {
+					t.Fatalf("%v\n%s", err, &stderr)
+				}
+				output := filepath.Join(dir, "@scan 100%.squeezed.pdf")
+				result := readFile(t, output)
+				if len(result) >= len(original) {
+					t.Fatalf("did not shrink: %d -> %d bytes", len(original), len(result))
+				}
+				if !bytes.Equal(readFile(t, input), original) {
+					t.Fatal("input changed")
+				}
+				conf := model.NewStatelessConfiguration()
+				if err := api.Validate(t.Context(), bytes.NewReader(result), conf, nil); err != nil {
+					t.Fatalf("invalid output: %v", err)
+				}
+				if pages, err := api.PageCount(t.Context(), bytes.NewReader(result), conf); err != nil || pages != 1 {
+					t.Fatalf("page count = %d, err = %v", pages, err)
+				}
+				if !strings.Contains(stdout.String(), "smaller, "+engine) {
+					t.Fatalf("missing size summary: %s", &stdout)
+				}
+				if verbose {
+					if !strings.Contains(stderr.String(), "input: ") || !strings.Contains(stderr.String(), engine+": ") {
+						t.Fatalf("missing verbose steps: %s", &stderr)
+					}
+				} else if stderr.Len() != 0 {
+					t.Fatalf("unexpected stderr: %s", &stderr)
+				}
+				assertNoTemps(t, dir)
+				if path, err := exec.LookPath("pdftotext"); err == nil {
+					text, err := exec.Command(path, output, "-").CombinedOutput()
+					if err != nil || !bytes.Contains(text, []byte("Squeeze this PDF.")) {
+						t.Fatalf("text changed: %q, err = %v", text, err)
+					}
+				} else if os.Getenv("PDF_SQUEEZER_INTEGRATION") == "1" {
+					t.Fatal("pdftotext is required for integration tests")
+				}
+			})
+		}
 	}
 }
 

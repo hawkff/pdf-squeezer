@@ -64,6 +64,7 @@ jobs:
             [ "${target%/*}" = windows ] && name="$name.exe"
             CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -trimpath -ldflags="-s -w" -o "dist/$name" .
           done
+          test "$(dist/pdf-squeezer_linux_amd64 --version)" = "$GITHUB_REF_NAME"
           (cd dist && sha256sum * > checksums.txt)
       - name: Publish release
         env:
