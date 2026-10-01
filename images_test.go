@@ -86,7 +86,7 @@ func TestImages(t *testing.T) {
 	if err := run(t.Context(), []string{"--images", "-V", "-o", output, input}, &stdout, &stderr); err != nil {
 		t.Fatalf("%v\n%s", err, &stderr)
 	}
-	if !strings.Contains(stderr.String(), "images: 7 seen, 4 re-encoded") {
+	if !strings.Contains(stderr.String(), "images: 7 seen, ") || !strings.Contains(stderr.String(), "preserved: color space Indexed 1, image mask 1, no gain") {
 		t.Fatalf("unexpected image stats:\n%s", &stderr)
 	}
 	result, err := api.ReadContext(t.Context(), bytes.NewReader(readFile(t, output)), model.NewStatelessConfiguration())

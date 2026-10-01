@@ -8,8 +8,10 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
@@ -55,22 +57,54 @@ func optimizeImages(pdf *model.Context) (imageStats, error) {
 			}
 		}
 	}
+	type job struct {
+		objNr    int
+		entry    *model.XRefTableEntry
+		sd       types.StreamDict
+		comps    int
+		softMask bool
+		encoding
+	}
+	var jobs []*job
 	for objNr, entry := range pdf.Table {
-		sd, ok := imageStream(entry)
-		if !ok {
+		if sd, ok := imageStream(entry); ok {
+			var comps int
+			reason := precheck(&sd)
+			if reason == "" {
+				comps, reason = components(pdf, &sd)
+			}
+			jobs = append(jobs, &job{objNr: objNr, entry: entry, sd: sd, comps: comps, softMask: softMasks[objNr], encoding: encoding{reason: reason}})
+		}
+	}
+	// Images are independent; the color space lookups above were the only reads of the context.
+	var wg sync.WaitGroup
+	workers := make(chan struct{}, runtime.GOMAXPROCS(0))
+	for _, j := range jobs {
+		if j.reason != "" {
 			continue
 		}
+		wg.Add(1)
+		workers <- struct{}{}
+		go func(j *job) {
+			defer wg.Done()
+			j.encoding = reencode(&j.sd, j.comps, j.softMask)
+			<-workers
+		}(j)
+	}
+	wg.Wait()
+	for _, j := range jobs {
+		sd := j.sd
 		stats.seen++
 		stats.before += int64(len(sd.Raw))
-		data, filter, parms, bpc, gray, reason, err := reencode(pdf, &sd, softMasks[objNr])
-		if err != nil {
-			return stats, fmt.Errorf("image object %d: %w", objNr, err)
+		if j.err != nil {
+			return stats, fmt.Errorf("image object %d: %w", j.objNr, j.err)
 		}
-		if reason != "" {
-			stats.preserved[reason]++
+		if j.reason != "" {
+			stats.preserved[j.reason]++
 			stats.after += int64(len(sd.Raw))
 			continue
 		}
+		data, filter, parms, bpc, gray := j.data, j.filter, j.parms, j.bpc, j.gray
 		sd.Raw, sd.Content = data, nil
 		length := int64(len(data))
 		sd.StreamLength, sd.StreamLengthObjNr = &length, nil
@@ -87,7 +121,7 @@ func optimizeImages(pdf *model.Context) (imageStats, error) {
 		if gray {
 			sd.Update("ColorSpace", types.Name("DeviceGray"))
 		}
-		entry.Object = sd
+		j.entry.Object = sd
 		stats.changed++
 		stats.after += length
 	}
@@ -106,72 +140,89 @@ func imageStream(entry *model.XRefTableEntry) (types.StreamDict, bool) {
 	return sd, subtype != nil && *subtype == "Image"
 }
 
-// reencode returns the new stream data and its filter description, or a reason to leave the image alone.
-func reencode(pdf *model.Context, sd *types.StreamDict, isSoftMask bool) (data []byte, filter string, parms types.Dict, bpc int, toGray bool, reason string, err error) {
+// encoding is the outcome for one image: new stream data, or a reason to leave it alone.
+type encoding struct {
+	data   []byte
+	filter string
+	parms  types.Dict
+	bpc    int
+	gray   bool // color space becomes DeviceGray
+	reason string
+	err    error
+}
+
+func preserve(reason string) encoding {
+	return encoding{reason: reason}
+}
+
+// precheck returns the reason an image is out of scope before its color space is looked at.
+func precheck(sd *types.StreamDict) string {
 	if mask := sd.BooleanEntry("ImageMask"); mask != nil && *mask {
-		return nil, "", nil, 0, false, "image mask", nil
+		return "image mask"
 	}
 	for _, key := range []string{"Mask", "Decode"} {
 		if _, found := sd.Find(key); found {
-			return nil, "", nil, 0, false, strings.ToLower(key) + " entry", nil
+			return strings.ToLower(key) + " entry"
 		}
 	}
 	width, height := sd.IntEntry("Width"), sd.IntEntry("Height")
 	bits := sd.IntEntry("BitsPerComponent")
 	if width == nil || height == nil || bits == nil || *width <= 0 || *height <= 0 {
-		return nil, "", nil, 0, false, "invalid dimensions", nil
+		return "invalid dimensions"
 	}
 	if *bits != 8 && *bits != 16 {
-		return nil, "", nil, 0, false, fmt.Sprintf("%d-bit", *bits), nil
+		return fmt.Sprintf("%d-bit", *bits)
 	}
-	comps, reason := components(pdf, sd)
-	if reason != "" {
-		return nil, "", nil, 0, false, reason, nil
-	}
+	return ""
+}
+
+func reencode(sd *types.StreamDict, comps int, isSoftMask bool) encoding {
+	width, height, bits := sd.IntEntry("Width"), sd.IntEntry("Height"), sd.IntEntry("BitsPerComponent")
 	if int64(*width)*int64(*height)*int64(comps)*int64(*bits/8) > maxImageBytes {
-		return nil, "", nil, 0, false, "too large", nil
+		return preserve("too large")
 	}
 	w, h, declared := *width, *height, comps
 	var samples []byte // 8-bit, comps per pixel, row-major
 	switch kind := filterKind(sd.FilterPipeline); kind {
 	case "lossless":
 		if err := sd.Decode(); err != nil {
-			return nil, "", nil, 0, false, "undecodable", nil
+			return preserve("undecodable")
 		}
 		samples = sd.Content
 		if *bits == 16 {
 			samples = highBytes(samples)
 		}
 		if len(samples) != w*h*comps {
-			return nil, "", nil, 0, false, "length mismatch", nil
+			return preserve("length mismatch")
 		}
 	case "jpeg":
 		img, err := jpeg.Decode(bytes.NewReader(sd.Raw))
 		if err != nil || img.Bounds().Dx() != w || img.Bounds().Dy() != h {
-			return nil, "", nil, 0, false, "undecodable jpeg", nil
+			return preserve("undecodable jpeg")
 		}
 		if samples, comps = jpegSamples(img); samples == nil {
-			return nil, "", nil, 0, false, "jpeg color model", nil
+			return preserve("jpeg color model")
 		}
 	default:
-		return nil, "", nil, 0, false, kind, nil
+		return preserve(kind)
 	}
+	var out encoding
 	if comps != declared {
 		if comps != 1 {
-			return nil, "", nil, 0, false, "jpeg color model", nil
+			return preserve("jpeg color model")
 		}
-		toGray = true // a gray JPEG declared as RGB
+		out.gray = true // a gray JPEG declared as RGB
 	}
 	if comps == 3 && allGray(samples) {
-		samples, comps, toGray = grayChannel(samples), 1, true
+		samples, comps, out.gray = grayChannel(samples), 1, true
 	}
 	bilevel := comps == 1 && !isSoftMask && onlyBlackAndWhite(samples)
 
 	var img image.Image
-	bpc = 8
+	out.bpc = 8
 	switch {
 	case bilevel:
-		bpc = 1
+		out.bpc = 1
 		p := image.NewPaletted(image.Rect(0, 0, w, h), color.Palette{color.Gray{0}, color.Gray{255}})
 		for i, v := range samples {
 			if v != 0 {
@@ -191,24 +242,24 @@ func reencode(pdf *model.Context, sd *types.StreamDict, isSoftMask bool) (data [
 	}
 	flate, err := pngIDAT(img)
 	if err != nil {
-		return nil, "", nil, 0, false, "", err
+		return encoding{err: err}
 	}
-	data, filter = flate, "FlateDecode"
-	parms = types.Dict{"Predictor": types.Integer(15), "Colors": types.Integer(comps), "BitsPerComponent": types.Integer(bpc), "Columns": types.Integer(w)}
+	out.data, out.filter = flate, "FlateDecode"
+	out.parms = types.Dict{"Predictor": types.Integer(15), "Colors": types.Integer(comps), "BitsPerComponent": types.Integer(out.bpc), "Columns": types.Integer(w)}
 	if !bilevel && !isSoftMask {
 		var buf bytes.Buffer
 		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: jpegQuality}); err != nil {
-			return nil, "", nil, 0, false, "", err
+			return encoding{err: err}
 		}
 		if buf.Len() < len(flate) {
-			data, filter, parms = buf.Bytes(), "DCTDecode", nil
+			out.data, out.filter, out.parms = buf.Bytes(), "DCTDecode", nil
 		}
 	}
-	saved := len(sd.Raw) - len(data)
+	saved := len(sd.Raw) - len(out.data)
 	if saved < minImageSavings || saved < len(sd.Raw)/50 {
-		return nil, "", nil, 0, false, "no gain", nil
+		return preserve("no gain")
 	}
-	return data, filter, parms, bpc, toGray, "", nil
+	return out
 }
 
 // components resolves the color space to 1 (gray) or 3 (RGB) samples per pixel.
@@ -227,19 +278,21 @@ func components(pdf *model.Context, sd *types.StreamDict) (int, string) {
 		}
 		return 0, "color space " + string(cs)
 	case types.Array:
-		if len(cs) == 2 {
-			if name, ok := cs[0].(types.Name); ok && name == "ICCBased" {
-				if profile, _, err := pdf.DereferenceStreamDict(cs[1]); err == nil && profile != nil {
-					if n := profile.IntEntry("N"); n != nil && (*n == 1 || *n == 3) {
-						return *n, ""
-					}
+		if len(cs) == 0 {
+			return 0, "color space"
+		}
+		name, ok := cs[0].(types.Name)
+		if !ok {
+			return 0, "color space"
+		}
+		if name == "ICCBased" && len(cs) == 2 {
+			if profile, _, err := pdf.DereferenceStreamDict(cs[1]); err == nil && profile != nil {
+				if n := profile.IntEntry("N"); n != nil && (*n == 1 || *n == 3) {
+					return *n, ""
 				}
-				return 0, "color space ICCBased"
-			}
-			if name, ok := cs[0].(types.Name); ok {
-				return 0, "color space " + string(name)
 			}
 		}
+		return 0, "color space " + string(name)
 	}
 	return 0, "color space"
 }
@@ -318,7 +371,7 @@ func onlyBlackAndWhite(gray []byte) bool {
 // exactly what /FlateDecode with /Predictor 15 expects.
 func pngIDAT(img image.Image) ([]byte, error) {
 	var file bytes.Buffer
-	if err := (&png.Encoder{CompressionLevel: png.BestCompression}).Encode(&file, img); err != nil {
+	if err := png.Encode(&file, img); err != nil {
 		return nil, err
 	}
 	var idat []byte
