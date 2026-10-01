@@ -35,6 +35,9 @@ pdf-squeezer document.pdf -o .
 # Reduce image quality with Ghostscript
 pdf-squeezer --engine ghostscript --quality ebook -o smaller.pdf scan.pdf
 
+# Drop document metadata as well
+pdf-squeezer --privacy document.pdf
+
 # Report each step on stderr, including Ghostscript's own progress
 pdf-squeezer -V document.pdf
 
@@ -50,7 +53,9 @@ Short flags: `-o` output file or directory, `-V` verbose, `-v` version, `-h` hel
 
 If Ghostscript cannot decode an image, it would normally leave the page blank. The CLI stops with an error instead, so a Ghostscript error on a file that other viewers open usually means that file needs `--engine pdfcpu`.
 
-The CLI prints the input and output sizes. If compression would not make the PDF smaller, it copies the original bytes to the output instead.
+The CLI prints the input and output sizes. If compression would not make the PDF smaller, it copies the original bytes to the output instead, unless `--privacy` is set.
+
+`--privacy` works with both engines. It empties the document information dictionary (title, author, subject, keywords, creator, producer, dates), removes XMP metadata streams and application piece info from every object, and gives the file a fresh identifier. Page content, annotations, form fields, and attachments stay as they are, so names in comments or embedded files remain. Check those separately.
 
 ## File safety and limitations
 

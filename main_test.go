@@ -17,6 +17,7 @@ import (
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
 func TestEngines(t *testing.T) {
@@ -95,6 +96,63 @@ func TestNoReduction(t *testing.T) {
 		t.Fatalf("expected original bytes and no-reduction summary: %s", &stdout)
 	}
 	assertNoTemps(t, dir)
+}
+
+func TestPrivacy(t *testing.T) {
+	for _, engine := range []string{"pdfcpu", "ghostscript"} {
+		t.Run(engine, func(t *testing.T) {
+			if engine == "ghostscript" {
+				requireTool(t, "gs")
+			}
+			dir := t.TempDir()
+			input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+			writeFile(t, input, metadataPDF())
+			var stdout bytes.Buffer
+			if err := run(t.Context(), []string{"--engine", engine, "--privacy", "-o", output, input}, &stdout, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(stdout.String(), "copied the original") {
+				t.Fatalf("copied the original with its metadata: %s", &stdout)
+			}
+			result := readFile(t, output)
+			for _, secret := range []string{"Secret Report", "Jane Example", "Example Writer", "20260101", "xpacket", "Trace"} {
+				if bytes.Contains(result, []byte(secret)) {
+					t.Errorf("%q remains in the output", secret)
+				}
+			}
+			pdf, err := api.ReadContext(t.Context(), bytes.NewReader(result), model.NewStatelessConfiguration())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pdf.Info != nil {
+				if d, err := pdf.DereferenceDict(*pdf.Info); err != nil || len(d) != 0 {
+					t.Errorf("info dict remains: %v, err = %v", d, err)
+				}
+			}
+			for objNr, entry := range pdf.Table {
+				if entry == nil || entry.Free {
+					continue
+				}
+				var d types.Dict
+				switch o := entry.Object.(type) {
+				case types.Dict:
+					d = o
+				case types.StreamDict:
+					d = o.Dict
+				default:
+					continue
+				}
+				if typ := d.Type(); typ != nil && *typ == "Metadata" {
+					t.Errorf("object %d is a metadata stream", objNr)
+				}
+				for _, key := range []string{"Metadata", "PieceInfo", "LastModified"} {
+					if _, found := d.Find(key); found {
+						t.Errorf("object %d keeps %s", objNr, key)
+					}
+				}
+			}
+		})
+	}
 }
 
 func TestRejectsInvalidArguments(t *testing.T) {
@@ -300,6 +358,28 @@ func brokenImagePDF() []byte {
 		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
 		"<< /Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceFoo /BitsPerComponent 8 /Length 16 >>\nstream\n0123456789abcdef\nendstream",
 	)
+}
+
+// metadataPDF carries metadata in every place the privacy flag must clear: the Info dict,
+// a document XMP stream, and page-level XMP, piece info, and modification date.
+func metadataPDF() []byte {
+	content := "BT /F1 12 Tf 20 100 Td (Squeeze this PDF.) Tj ET\n"
+	xmp := `<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" ` +
+		`xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:creator><rdf:Seq><rdf:li>Jane Example</rdf:li></rdf:Seq>` +
+		`</dc:creator></rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+	pdf := buildPDF(0,
+		"<< /Type /Catalog /Pages 2 0 R /Metadata 7 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R"+
+			" /Metadata 7 0 R /LastModified (D:20260101120000Z) /PieceInfo << /ExampleApp << /LastModified (D:20260101120000Z) /Private (Trace) >> >> >>",
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		"<< /Title (Secret Report) /Author (Jane Example) /Creator (Example Writer) /Producer (Example Writer) /CreationDate (D:20260101120000Z) /ModDate (D:20260101120000Z) >>",
+		fmt.Sprintf("<< /Type /Metadata /Subtype /XML /Length %d >>\nstream\n%s\nendstream", len(xmp), xmp),
+	)
+	// The trailer follows the xref table, so adding /Info there leaves the offsets intact.
+	return bytes.Replace(pdf, []byte("/Root 1 0 R"), []byte("/Root 1 0 R /Info 6 0 R"), 1)
 }
 
 func buildPDF(padding int, objects ...string) []byte {

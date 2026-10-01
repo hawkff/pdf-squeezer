@@ -21,6 +21,7 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/log"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
 const usage = `Usage: pdf-squeezer [flags] input.pdf
@@ -35,6 +36,7 @@ Flags:
   --engine NAME      pdfcpu (default) or ghostscript
   -h, --help         print this help and exit
   -o, --output PATH  output file, or a directory for input.squeezed.pdf
+  --privacy          drop document info, XMP metadata, and piece info
   --quality PRESET   Ghostscript preset: screen, ebook (default), printer, prepress
   -V, --verbose      report each step on stderr
   -v, --version      print the version and exit
@@ -59,7 +61,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	var output string
 	flags.StringVar(&output, "output", "", "")
 	flags.StringVar(&output, "o", "", "")
-	var verbose, showVersion bool
+	var privacy, verbose, showVersion bool
+	flags.BoolVar(&privacy, "privacy", false, "")
 	flags.BoolVar(&verbose, "verbose", false, "")
 	flags.BoolVar(&verbose, "V", false, "")
 	flags.BoolVar(&showVersion, "version", false, "")
@@ -116,20 +119,24 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	} else if info, err := os.Stat(output); err == nil && info.IsDir() {
 		output = filepath.Join(output, name)
 	}
-	before, after, err := squeeze(ctx, input, output, *engine, *quality, stderr, verbose)
+	before, after, err := squeeze(ctx, input, output, *engine, *quality, privacy, stderr, verbose)
 	if err != nil {
 		return err
 	}
-	if before == after {
+	switch {
+	case before == after && !privacy:
 		fmt.Fprintf(stdout, "%s: no reduction; copied the original (%d bytes)\n", output, before)
-	} else {
+	case after > before:
+		fmt.Fprintf(stdout, "%s: %d -> %d bytes (%.1f%% larger, %s)\n",
+			output, before, after, 100*(float64(after)/float64(before)-1), *engine)
+	default:
 		fmt.Fprintf(stdout, "%s: %d -> %d bytes (%.1f%% smaller, %s)\n",
 			output, before, after, 100*(1-float64(after)/float64(before)), *engine)
 	}
 	return nil
 }
 
-func squeeze(ctx context.Context, input, output, engine, quality string, stderr io.Writer, verbose bool) (int64, int64, error) {
+func squeeze(ctx context.Context, input, output, engine, quality string, privacy bool, stderr io.Writer, verbose bool) (int64, int64, error) {
 	logf := func(format string, args ...any) {
 		if verbose {
 			fmt.Fprintf(stderr, format+"\n", args...)
@@ -183,9 +190,11 @@ func squeeze(ctx context.Context, input, output, engine, quality string, stderr 
 	start := time.Now()
 	switch engine {
 	case "pdfcpu":
-		err = api.Optimize(ctx, in, tmp, conf, nil)
+		err = optimize(ctx, in, tmp, conf, privacy)
 	case "ghostscript":
-		err = ghostscript(ctx, in, tmp, quality, stderr, verbose)
+		if err = ghostscript(ctx, in, tmp, quality, stderr, verbose); err == nil && privacy {
+			err = optimize(ctx, tmp, tmp, conf, true)
+		}
 	default:
 		err = fmt.Errorf("unknown engine %q", engine)
 	}
@@ -206,7 +215,7 @@ func squeeze(ctx context.Context, input, output, engine, quality string, stderr 
 	}
 	logf("validated in %s", time.Since(start).Round(time.Millisecond))
 	source := tmp
-	if compressed.Size() >= info.Size() {
+	if compressed.Size() >= info.Size() && !privacy {
 		source = in
 	}
 	if _, err := source.Seek(0, io.SeekStart); err != nil {
@@ -215,6 +224,58 @@ func squeeze(ctx context.Context, input, output, engine, quality string, stderr 
 	logf("writing %s", output)
 	written, err := writeNew(ctx, output, source)
 	return info.Size(), written, err
+}
+
+// optimize is api.Optimize with an optional metadata strip before writing.
+// pdfcpu holds the whole document in memory, so in and out may be the same file.
+func optimize(ctx context.Context, in io.ReadSeeker, out *os.File, conf *model.Configuration, privacy bool) error {
+	conf.Cmd = model.OPTIMIZE
+	pdf, err := api.ReadValidateAndOptimize(ctx, in, conf, nil)
+	if err != nil {
+		return err
+	}
+	if privacy {
+		if err := stripMetadata(pdf); err != nil {
+			return err
+		}
+	}
+	if err := out.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := out.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return api.WriteContext(ctx, pdf, out)
+}
+
+// stripMetadata empties the document information dictionary and drops XMP metadata and
+// application piece info from every object. Unreferenced objects are not written.
+func stripMetadata(pdf *model.Context) error {
+	// pdfcpu fills a missing Info dict with its own producer and dates; an empty one stays empty.
+	info, err := pdf.IndRefForNewObject(types.NewDict())
+	if err != nil {
+		return err
+	}
+	pdf.Info = info
+	pdf.ID = nil
+	for _, entry := range pdf.Table {
+		if entry == nil || entry.Free {
+			continue
+		}
+		var d types.Dict
+		switch o := entry.Object.(type) {
+		case types.Dict:
+			d = o
+		case types.StreamDict:
+			d = o.Dict
+		default:
+			continue
+		}
+		for _, key := range []string{"Metadata", "PieceInfo", "LastModified"} {
+			delete(d, key)
+		}
+	}
+	return nil
 }
 
 func checkPDF(file *os.File) error {
