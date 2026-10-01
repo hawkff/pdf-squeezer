@@ -101,8 +101,7 @@ func TestRejectsInvalidArguments(t *testing.T) {
 	for _, args := range [][]string{
 		{}, {"one.pdf", "two.pdf"}, {"--engine", "other", "input.pdf"},
 		{"--quality", "screen", "input.pdf"},
-		{"--engine", "ghostscript", "--quality", "other", "input.pdf"},
-		{"input.pdf", "--engine", "ghostscript"}, {"--unknown"},
+		{"--engine", "ghostscript", "--quality", "other", "input.pdf"}, {"--unknown"},
 	} {
 		if err := run(t.Context(), args, io.Discard, io.Discard); err == nil {
 			t.Errorf("accepted %q", args)
@@ -112,6 +111,24 @@ func TestRejectsInvalidArguments(t *testing.T) {
 		if err := run(t.Context(), []string{arg}, io.Discard, io.Discard); !errors.Is(err, flag.ErrHelp) {
 			t.Fatalf("%s: %v", arg, err)
 		}
+	}
+}
+
+func TestTrailingFlagsAndOutputDir(t *testing.T) {
+	dir, outDir := t.TempDir(), t.TempDir()
+	input := filepath.Join(dir, "doc.pdf")
+	writeFile(t, input, testPDF(1000))
+	var stdout, stderr bytes.Buffer
+	if err := run(t.Context(), []string{input, "-o", outDir, "-V"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(outDir, "doc.squeezed.pdf")
+	if !strings.HasPrefix(stdout.String(), output+": ") || !strings.Contains(stderr.String(), "input: ") {
+		t.Fatalf("stdout: %s\nstderr: %s", &stdout, &stderr)
+	}
+	readFile(t, output)
+	if err := run(t.Context(), []string{"--", input, "-V"}, io.Discard, io.Discard); err == nil {
+		t.Fatal("treated an argument after -- as a flag")
 	}
 }
 

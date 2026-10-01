@@ -26,13 +26,14 @@ const usage = `Usage: pdf-squeezer [flags] input.pdf
 
 Optimize with pdfcpu, or choose Ghostscript for lossy image compression.
 The input stays unchanged. Existing output files are never overwritten.
-The output directory must already exist; it also holds a temporary file
-during compression.
+Without -o, the result is input.squeezed.pdf next to the input. The output
+directory must already exist; it also holds a temporary file during
+compression.
 
 Flags:
   --engine NAME      pdfcpu (default) or ghostscript
   -h, --help         print this help and exit
-  -o, --output PATH  output file (default: input.squeezed.pdf next to the input)
+  -o, --output PATH  output file, or a directory for input.squeezed.pdf
   --quality PRESET   Ghostscript preset: screen, ebook (default), printer, prepress
   -V, --verbose      report each step on stderr
   -v, --version      print the version and exit
@@ -63,8 +64,20 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags.BoolVar(&showVersion, "version", false, "")
 	flags.BoolVar(&showVersion, "v", false, "")
 	flags.Usage = func() { fmt.Fprint(stderr, usage) }
-	if err := flags.Parse(args); err != nil {
-		return err
+	// Accept flags after the filename: Parse stops at the first positional argument.
+	var inputs []string
+	for {
+		if err := flags.Parse(args); err != nil {
+			return err
+		}
+		rest := flags.Args()
+		consumed := len(args) - len(rest)
+		if len(rest) == 0 || (consumed > 0 && args[consumed-1] == "--") {
+			inputs = append(inputs, rest...)
+			break
+		}
+		inputs = append(inputs, rest[0])
+		args = rest[1:]
 	}
 	if showVersion {
 		v := "unknown"
@@ -74,9 +87,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintln(stdout, v)
 		return nil
 	}
-	if flags.NArg() != 1 {
+	if len(inputs) != 1 {
 		flags.Usage()
-		return errors.New("provide one input PDF, with flags before the filename")
+		return errors.New("provide exactly one input PDF")
 	}
 	switch *engine {
 	case "pdfcpu":
@@ -95,9 +108,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	default:
 		return fmt.Errorf("unknown engine %q: use pdfcpu or ghostscript", *engine)
 	}
-	input := flags.Arg(0)
+	input := inputs[0]
+	name := strings.TrimSuffix(filepath.Base(input), filepath.Ext(input)) + ".squeezed.pdf"
 	if output == "" {
-		output = strings.TrimSuffix(input, filepath.Ext(input)) + ".squeezed.pdf"
+		output = filepath.Join(filepath.Dir(input), name)
+	} else if info, err := os.Stat(output); err == nil && info.IsDir() {
+		output = filepath.Join(output, name)
 	}
 	before, after, err := squeeze(ctx, input, output, *engine, *quality, stderr, verbose)
 	if err != nil {

@@ -29,6 +29,9 @@ pdf-squeezer document.pdf
 # Choose an output path
 pdf-squeezer -o smaller.pdf document.pdf
 
+# Write document.squeezed.pdf into the current directory
+pdf-squeezer document.pdf -o .
+
 # Reduce image quality with Ghostscript
 pdf-squeezer --engine ghostscript --quality ebook -o smaller.pdf scan.pdf
 
@@ -39,7 +42,7 @@ pdf-squeezer --version
 pdf-squeezer --help
 ```
 
-Short flags: `-o` output, `-V` verbose, `-v` version, `-h` help. Put flags before the input filename. Use `--` before a filename that starts with a dash.
+Short flags: `-o` output file or directory, `-V` verbose, `-v` version, `-h` help. Flags may come before or after the filename. Use `--` before a filename that starts with a dash.
 
 `--engine pdfcpu` is the default. It removes redundant PDF objects and compresses document structure without downsampling images. Already optimized PDFs may not shrink.
 
