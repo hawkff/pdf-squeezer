@@ -4,7 +4,7 @@ A PDF compressor written in Go.
 
 ## Install
 
-Requires Go 1.26 or newer.
+Download a binary for Linux, macOS, or Windows from the [releases page](https://github.com/hawkff/pdf-squeezer/releases), or build from source with Go 1.26 or newer:
 
 ```sh
 go install github.com/hawkff/pdf-squeezer@latest
@@ -32,10 +32,14 @@ pdf-squeezer -o smaller.pdf document.pdf
 # Reduce image quality with Ghostscript
 pdf-squeezer --engine ghostscript --quality ebook -o smaller.pdf scan.pdf
 
+# Report each step on stderr, including Ghostscript's own progress
+pdf-squeezer -V document.pdf
+
+pdf-squeezer --version
 pdf-squeezer --help
 ```
 
-Put flags before the input filename. Use `--` before a filename that starts with a dash.
+Short flags: `-o` output, `-V` verbose, `-v` version, `-h` help. Put flags before the input filename. Use `--` before a filename that starts with a dash.
 
 `--engine pdfcpu` is the default. It removes redundant PDF objects and compresses document structure without downsampling images. Already optimized PDFs may not shrink.
 

@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -12,6 +13,9 @@ permissions:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  TARGETS: linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 
 jobs:
   check:
@@ -34,6 +38,37 @@ jobs:
         run: go vet ./...
       - name: Cross-compile
         run: |
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+          for target in $TARGETS; do
             CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -trimpath -o /tmp/pdf-squeezer .
           done
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: check
+    runs-on: namespace-profile-default
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0 # Go stamps the version from the tag on HEAD.
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - name: Build release binaries
+        # Build outside the checkout: files in the tree would mark Go's version stamp +dirty.
+        run: |
+          mkdir "$RUNNER_TEMP/dist"
+          for target in $TARGETS; do
+            name="pdf-squeezer_${target%/*}_${target#*/}"
+            [ "${target%/*}" = windows ] && name="$name.exe"
+            CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -trimpath -ldflags="-s -w" -o "$RUNNER_TEMP/dist/$name" .
+          done
+          cd "$RUNNER_TEMP/dist"
+          test "$(./pdf-squeezer_linux_amd64 --version)" = "$GITHUB_REF_NAME"
+          sha256sum * > checksums.txt
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes "$RUNNER_TEMP"/dist/*
