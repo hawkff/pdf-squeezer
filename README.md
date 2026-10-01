@@ -42,7 +42,7 @@ pdf-squeezer --engine ghostscript --dpi 100 --gray scan.pdf
 pdf-squeezer --images document.pdf
 
 # Every PDF below the current directory, each output next to its original
-fd -e pdf -x pdf-squeezer {}
+fd -e pdf -E '*.squeezed.pdf' -x pdf-squeezer {}
 
 # Drop document metadata as well
 pdf-squeezer --privacy document.pdf

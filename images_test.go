@@ -137,6 +137,50 @@ func TestImages(t *testing.T) {
 	}
 }
 
+func TestGhostscriptImageFlags(t *testing.T) {
+	requireTool(t, "gs")
+	// 300x300 color noise drawn at 72x72 pt: 300 dpi, incompressible, nowhere gray.
+	rgb := make([]byte, 0, 300*300*3)
+	for i := 0; i < 300*300; i++ {
+		rgb = append(rgb, byte(uint32(i)*2654435761>>24), 0, byte(uint32(i)*40503>>12))
+	}
+	data := deflate(t, rgb)
+	content := "q 72 0 0 72 14 14 cm /Im Do Q"
+	pdf := buildPDF(0,
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Im 5 0 R >> >> /Contents 4 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		fmt.Sprintf("<< /Type /XObject /Subtype /Image /Width 300 /Height 300 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length %d >>\nstream\n%s\nendstream", len(data), data),
+	)
+	dir := t.TempDir()
+	input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+	writeFile(t, input, pdf)
+	// The printer preset keeps 300 dpi and the colors on its own; the flags must override it.
+	if err := run(t.Context(), []string{"--engine", "ghostscript", "--quality", "printer", "--dpi", "72", "--gray", "-o", output, input}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	result, err := api.ReadContext(t.Context(), bytes.NewReader(readFile(t, output)), model.NewStatelessConfiguration())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found int
+	for _, entry := range result.Table {
+		sd, ok := imageStream(entry)
+		if !ok {
+			continue
+		}
+		found++
+		cs, width := sd.NameEntry("ColorSpace"), sd.IntEntry("Width")
+		if cs == nil || *cs != "DeviceGray" || width == nil || *width > 100 {
+			t.Errorf("want a DeviceGray image at most 100 px wide, got %s", sd.Dict)
+		}
+	}
+	if found != 1 {
+		t.Fatalf("found %d images, want 1", found)
+	}
+}
+
 func TestImagesFlagNeedsPdfcpu(t *testing.T) {
 	for _, args := range [][]string{
 		{"--images", "--engine", "ghostscript", "in.pdf"},
