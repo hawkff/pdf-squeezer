@@ -6,15 +6,19 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	stdlog "log"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/log"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
@@ -36,6 +40,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	var output string
 	flags.StringVar(&output, "output", "", "output path (default: INPUT.squeezed.pdf)")
 	flags.StringVar(&output, "o", "", "output path (short form)")
+	var verbose, showVersion bool
+	flags.BoolVar(&verbose, "verbose", false, "report each step on stderr")
+	flags.BoolVar(&verbose, "V", false, "verbose (short form)")
+	flags.BoolVar(&showVersion, "version", false, "print the version and exit")
+	flags.BoolVar(&showVersion, "v", false, "version (short form)")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: pdf-squeezer [flags] input.pdf")
 		fmt.Fprintln(stderr, "\nOptimize with pdfcpu, or choose Ghostscript for lossy image compression.")
@@ -45,6 +54,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if showVersion {
+		v := "unknown"
+		if info, ok := debug.ReadBuildInfo(); ok {
+			v = info.Main.Version
+		}
+		fmt.Fprintln(stdout, v)
+		return nil
 	}
 	if flags.NArg() != 1 {
 		flags.Usage()
@@ -71,7 +88,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if output == "" {
 		output = strings.TrimSuffix(input, filepath.Ext(input)) + ".squeezed.pdf"
 	}
-	before, after, err := squeeze(ctx, input, output, *engine, *quality, stderr)
+	before, after, err := squeeze(ctx, input, output, *engine, *quality, stderr, verbose)
 	if err != nil {
 		return err
 	}
@@ -84,7 +101,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func squeeze(ctx context.Context, input, output, engine, quality string, stderr io.Writer) (int64, int64, error) {
+func squeeze(ctx context.Context, input, output, engine, quality string, stderr io.Writer, verbose bool) (int64, int64, error) {
+	logf := func(format string, args ...any) {
+		if verbose {
+			fmt.Fprintf(stderr, format+"\n", args...)
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return 0, 0, err
 	}
@@ -95,6 +117,7 @@ func squeeze(ctx context.Context, input, output, engine, quality string, stderr 
 	if !info.Mode().IsRegular() {
 		return 0, 0, errors.New("input must be a regular PDF file")
 	}
+	logf("input: %s (%d bytes)", input, info.Size())
 	if _, err := os.Lstat(output); err == nil {
 		return 0, 0, fmt.Errorf("output already exists: %s", output)
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -117,33 +140,43 @@ func squeeze(ctx context.Context, input, output, engine, quality string, stderr 
 		tmp.Close()
 		os.Remove(tmp.Name())
 	}()
+	logf("staging in %s", tmp.Name())
 
 	conf := model.NewStatelessConfiguration()
 	conf.Offline = true
 	conf.PreserveInfoDict = true
 	// api.Optimize always optimizes; this only stops api.Validate from re-optimizing the output.
 	conf.Optimize = false
+	if verbose {
+		// Surface pdfcpu's repair and skipped-object notices.
+		log.SetCLILogger(stdlog.New(stderr, "", 0))
+		defer log.DisableLoggers()
+	}
+	start := time.Now()
 	switch engine {
 	case "pdfcpu":
 		err = api.Optimize(ctx, in, tmp, conf, nil)
 	case "ghostscript":
-		err = ghostscript(ctx, in, tmp, quality, stderr)
+		err = ghostscript(ctx, in, tmp, quality, stderr, verbose)
 	default:
 		err = fmt.Errorf("unknown engine %q", engine)
 	}
 	if err != nil {
 		return 0, 0, fmt.Errorf("%s: %w", engine, err)
 	}
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		return 0, 0, err
-	}
-	if err := api.Validate(ctx, tmp, conf, nil); err != nil {
-		return 0, 0, fmt.Errorf("%s output: %w", engine, err)
-	}
 	compressed, err := tmp.Stat()
 	if err != nil {
 		return 0, 0, err
 	}
+	logf("%s: %d bytes in %s", engine, compressed.Size(), time.Since(start).Round(time.Millisecond))
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return 0, 0, err
+	}
+	start = time.Now()
+	if err := api.Validate(ctx, tmp, conf, nil); err != nil {
+		return 0, 0, fmt.Errorf("%s output: %w", engine, err)
+	}
+	logf("validated in %s", time.Since(start).Round(time.Millisecond))
 	source := tmp
 	if compressed.Size() >= info.Size() {
 		source = in
@@ -151,6 +184,7 @@ func squeeze(ctx context.Context, input, output, engine, quality string, stderr 
 	if _, err := source.Seek(0, io.SeekStart); err != nil {
 		return 0, 0, err
 	}
+	logf("writing %s", output)
 	written, err := writeNew(ctx, output, source)
 	return info.Size(), written, err
 }
@@ -166,7 +200,7 @@ func checkPDF(file *os.File) error {
 	return nil
 }
 
-func ghostscript(ctx context.Context, input, output *os.File, quality string, stderr io.Writer) error {
+func ghostscript(ctx context.Context, input, output *os.File, quality string, stderr io.Writer, verbose bool) error {
 	names := []string{"gs"}
 	if runtime.GOOS == "windows" {
 		names = []string{"gswin64c", "gswin32c", "gs"}
@@ -181,13 +215,19 @@ func ghostscript(ctx context.Context, input, output *os.File, quality string, st
 	if executable == "" {
 		return errors.New("Ghostscript not found in PATH; install it or use --engine pdfcpu")
 	}
-	cmd := exec.CommandContext(ctx, executable,
-		"-q", "-dSAFER", "-dBATCH", "-dNOPAUSE", "-dPDFSTOPONERROR",
-		"-sDEVICE=pdfwrite", "-dPDFSETTINGS=/"+quality,
-		"-sOutputFile=-", "-sstdout=%stderr", "-f", "-")
+	args := []string{"-q", "-dSAFER", "-dBATCH", "-dNOPAUSE", "-dPDFSTOPONERROR",
+		"-sDEVICE=pdfwrite", "-dPDFSETTINGS=/" + quality,
+		"-sOutputFile=-", "-sstdout=%stderr", "-f", "-"}
+	if verbose {
+		args = args[1:] // Let Ghostscript report its progress.
+	}
+	cmd := exec.CommandContext(ctx, executable, args...)
 	// Stream file contents, not user paths, to avoid Ghostscript filename syntax.
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = input, output, stderr
 	cmd.Env = append(os.Environ(), "GS_OPTIONS=")
+	if verbose {
+		fmt.Fprintln(stderr, "running", strings.Join(cmd.Args, " "))
+	}
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()

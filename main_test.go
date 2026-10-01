@@ -32,7 +32,7 @@ func TestEngines(t *testing.T) {
 			original := testPDF(64 * 1024)
 			writeFile(t, input, original)
 			var stdout, stderr bytes.Buffer
-			args := []string{"--engine", engine}
+			args := []string{"-V", "--engine", engine}
 			if engine == "ghostscript" {
 				args = append(args, "--quality", "screen")
 			}
@@ -56,6 +56,9 @@ func TestEngines(t *testing.T) {
 			}
 			if !strings.Contains(stdout.String(), "smaller, "+engine) {
 				t.Fatalf("missing size summary: %s", &stdout)
+			}
+			if !strings.Contains(stderr.String(), "input: ") || !strings.Contains(stderr.String(), engine+": ") {
+				t.Fatalf("missing verbose steps: %s", &stderr)
 			}
 			assertNoTemps(t, dir)
 			if path, err := exec.LookPath("pdftotext"); err == nil {
@@ -96,8 +99,22 @@ func TestRejectsInvalidArguments(t *testing.T) {
 			t.Errorf("accepted %q", args)
 		}
 	}
-	if err := run(t.Context(), []string{"--help"}, io.Discard, io.Discard); !errors.Is(err, flag.ErrHelp) {
-		t.Fatalf("help: %v", err)
+	for _, arg := range []string{"-h", "--help"} {
+		if err := run(t.Context(), []string{arg}, io.Discard, io.Discard); !errors.Is(err, flag.ErrHelp) {
+			t.Fatalf("%s: %v", arg, err)
+		}
+	}
+}
+
+func TestVersion(t *testing.T) {
+	for _, arg := range []string{"-v", "--version"} {
+		var stdout bytes.Buffer
+		if err := run(t.Context(), []string{arg}, &stdout, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		if v := strings.TrimSuffix(stdout.String(), "\n"); v == "" || strings.ContainsAny(v, " \n") {
+			t.Fatalf("%s printed %q", arg, stdout.String())
+		}
 	}
 }
 
