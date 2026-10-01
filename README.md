@@ -23,7 +23,7 @@ sudo apt-get install ghostscript
 ## Use
 
 ```sh
-# Lossless optimization, writes document.squeezed.pdf
+# Lossless optimization, writes document.squeezed.pdf next to the input
 pdf-squeezer document.pdf
 
 # Choose an output path
@@ -50,7 +50,7 @@ The CLI prints the input and output sizes. If compression would not make the PDF
 ## File safety and limitations
 
 - The CLI leaves the input unchanged and refuses to overwrite an existing output, including a symlink.
-- It stages compression in a temporary file beside the output, then creates the destination with exclusive access. It removes partial output after a reported write failure. A crash or power loss during the final copy can leave an incomplete destination. Remove that file before retrying.
+- The output directory must already exist. The CLI stages compression in a temporary file there, then creates the destination with exclusive access. It removes partial output after a reported write failure. A crash or power loss during the final copy can leave an incomplete destination. Remove that file before retrying.
 - Keep enough free disk space for the temporary PDF and the final copy. New files use owner-only permissions where the filesystem supports them.
 - Compression can invalidate digital signatures. Ghostscript can also change or discard forms, annotations, accessibility tags, attachments, and encryption. Keep originals and inspect the result before sharing it. Use another tool for signed or password-protected documents.
 - Both engines process files on your machine. The CLI does not upload PDFs. Keep Ghostscript updated before processing untrusted files.

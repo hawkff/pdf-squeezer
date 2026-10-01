@@ -22,6 +22,22 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
+const usage = `Usage: pdf-squeezer [flags] input.pdf
+
+Optimize with pdfcpu, or choose Ghostscript for lossy image compression.
+The input stays unchanged. Existing output files are never overwritten.
+The output directory must already exist; it also holds a temporary file
+during compression.
+
+Flags:
+  --engine NAME      pdfcpu (default) or ghostscript
+  -h, --help         print this help and exit
+  -o, --output PATH  output file (default: input.squeezed.pdf next to the input)
+  --quality PRESET   Ghostscript preset: screen, ebook (default), printer, prepress
+  -V, --verbose      report each step on stderr
+  -v, --version      print the version and exit
+`
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	err := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
@@ -35,23 +51,18 @@ func main() {
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("pdf-squeezer", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	engine := flags.String("engine", "pdfcpu", "compression engine: pdfcpu or ghostscript")
-	quality := flags.String("quality", "", "Ghostscript preset: screen, ebook (default), printer, prepress")
+	// Help text lives in usage: PrintDefaults would list short and long forms separately.
+	engine := flags.String("engine", "pdfcpu", "")
+	quality := flags.String("quality", "", "")
 	var output string
-	flags.StringVar(&output, "output", "", "output path (default: INPUT.squeezed.pdf)")
-	flags.StringVar(&output, "o", "", "output path (short form)")
+	flags.StringVar(&output, "output", "", "")
+	flags.StringVar(&output, "o", "", "")
 	var verbose, showVersion bool
-	flags.BoolVar(&verbose, "verbose", false, "report each step on stderr")
-	flags.BoolVar(&verbose, "V", false, "verbose (short form)")
-	flags.BoolVar(&showVersion, "version", false, "print the version and exit")
-	flags.BoolVar(&showVersion, "v", false, "version (short form)")
-	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: pdf-squeezer [flags] input.pdf")
-		fmt.Fprintln(stderr, "\nOptimize with pdfcpu, or choose Ghostscript for lossy image compression.")
-		fmt.Fprintln(stderr, "The input stays unchanged. Existing output files are never overwritten.")
-		fmt.Fprintln(stderr)
-		flags.PrintDefaults()
-	}
+	flags.BoolVar(&verbose, "verbose", false, "")
+	flags.BoolVar(&verbose, "V", false, "")
+	flags.BoolVar(&showVersion, "version", false, "")
+	flags.BoolVar(&showVersion, "v", false, "")
+	flags.Usage = func() { fmt.Fprint(stderr, usage) }
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
