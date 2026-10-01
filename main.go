@@ -121,6 +121,8 @@ func squeeze(ctx context.Context, input, output, engine, quality string, stderr 
 	conf := model.NewStatelessConfiguration()
 	conf.Offline = true
 	conf.PreserveInfoDict = true
+	// api.Optimize always optimizes; this only stops api.Validate from re-optimizing the output.
+	conf.Optimize = false
 	switch engine {
 	case "pdfcpu":
 		err = api.Optimize(ctx, in, tmp, conf, nil)
