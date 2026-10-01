@@ -46,7 +46,9 @@ Short flags: `-o` output file or directory, `-V` verbose, `-v` version, `-h` hel
 
 `--engine pdfcpu` is the default. It removes redundant PDF objects and compresses document structure without downsampling images. Already optimized PDFs may not shrink.
 
-`--engine ghostscript` rewrites the PDF and can downsample images. Choose `--quality screen` for low-resolution output, `ebook` for medium resolution, or `printer` / `prepress` for print-oriented output. The default is `ebook`. These presets change more than resolution and can reduce quality. `--quality` only applies to Ghostscript.
+`--engine ghostscript` rewrites the PDF and can downsample images. Choose `--quality screen` for low-resolution output, `ebook` for medium resolution, or `printer` / `prepress` for print-oriented output. The default is `ebook`. These presets change more than resolution and can reduce quality. Colors stay in their original color spaces. `--quality` only applies to Ghostscript.
+
+If Ghostscript cannot decode an image, it would normally leave the page blank. The CLI stops with an error instead, so a Ghostscript error on a file that other viewers open usually means that file needs `--engine pdfcpu`.
 
 The CLI prints the input and output sizes. If compression would not make the PDF smaller, it copies the original bytes to the output instead.
 

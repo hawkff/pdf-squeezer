@@ -211,6 +211,19 @@ func TestMissingGhostscript(t *testing.T) {
 	assertNoTemps(t, dir)
 }
 
+func TestGhostscriptRejectsDroppedImages(t *testing.T) {
+	requireGhostscript10(t)
+	dir := t.TempDir()
+	input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+	writeFile(t, input, brokenImagePDF())
+	err := run(t.Context(), []string{"--engine", "ghostscript", "-o", output, input}, io.Discard, io.Discard)
+	if err == nil {
+		t.Fatal("accepted output with a dropped image")
+	}
+	assertMissing(t, output)
+	assertNoTemps(t, dir)
+}
+
 func TestBrokenGhostscriptOutput(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses a POSIX shell stub")
@@ -268,13 +281,28 @@ func TestCanceled(t *testing.T) {
 
 func testPDF(padding int) []byte {
 	content := "BT /F1 12 Tf 20 100 Td (Squeeze this PDF.) Tj ET\n"
-	objects := []string{
+	return buildPDF(padding,
 		"<< /Type /Catalog /Pages 2 0 R >>",
 		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
 		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
 		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
 		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
-	}
+	)
+}
+
+// brokenImagePDF draws an image with an unknown color space. Ghostscript 10 skips it with a warning and writes a blank page.
+func brokenImagePDF() []byte {
+	content := "q 100 0 0 100 50 50 cm /Im1 Do Q\n"
+	return buildPDF(0,
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		"<< /Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceFoo /BitsPerComponent 8 /Length 16 >>\nstream\n0123456789abcdef\nendstream",
+	)
+}
+
+func buildPDF(padding int, objects ...string) []byte {
 	var pdf bytes.Buffer
 	pdf.WriteString("%PDF-1.4\n")
 	// Serialization whitespace can shrink without changing page content.
@@ -291,6 +319,26 @@ func testPDF(padding int) []byte {
 	}
 	fmt.Fprintf(&pdf, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objects)+1, xref)
 	return pdf.Bytes()
+}
+
+// requireGhostscript10 skips on Ghostscript 9, whose PDF interpreter stops or substitutes instead of skipping images.
+func requireGhostscript10(t *testing.T) {
+	t.Helper()
+	requireTool(t, "gs")
+	version, err := exec.Command("gs", "--version").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var major int
+	if _, err := fmt.Sscanf(string(version), "%d", &major); err != nil {
+		t.Fatalf("gs --version printed %q", version)
+	}
+	if major < 10 {
+		if os.Getenv("PDF_SQUEEZER_INTEGRATION") == "1" {
+			t.Fatalf("Ghostscript 10 or newer is required, found %s", version)
+		}
+		t.Skipf("Ghostscript %s does not skip images", strings.TrimSpace(string(version)))
+	}
 }
 
 func requireTool(t *testing.T, name string) {

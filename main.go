@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -242,25 +243,33 @@ func ghostscript(ctx context.Context, input, output *os.File, quality string, st
 	if executable == "" {
 		return errors.New("Ghostscript not found in PATH; install it or use --engine pdfcpu")
 	}
-	var quiet []string
-	if !verbose {
-		quiet = []string{"-q"}
-	}
-	cmd := exec.CommandContext(ctx, executable, append(quiet,
+	cmd := exec.CommandContext(ctx, executable,
 		"-dSAFER", "-dBATCH", "-dNOPAUSE", "-dPDFSTOPONERROR",
-		"-sDEVICE=pdfwrite", "-dPDFSETTINGS=/"+quality,
-		"-sOutputFile=-", "-sstdout=%stderr", "-f", "-")...)
+		// The presets convert colors to sRGB, which drops 16-bit ICC images with soft masks (iOS Photos exports).
+		"-sDEVICE=pdfwrite", "-dPDFSETTINGS=/"+quality, "-sColorConversionStrategy=LeaveColorUnchanged",
+		"-sOutputFile=-", "-sstdout=%stderr", "-f", "-")
 	// Stream file contents, not user paths, to avoid Ghostscript filename syntax.
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = input, output, stderr
-	cmd.Env = append(os.Environ(), "GS_OPTIONS=")
+	cmd.Stdin, cmd.Stdout = input, output
+	// Not -q: it would also hide the warning summary checked below.
+	var messages bytes.Buffer
+	cmd.Stderr = &messages
 	if verbose {
+		cmd.Stderr = io.MultiWriter(stderr, &messages)
 		fmt.Fprintln(stderr, "running", strings.Join(cmd.Args, " "))
 	}
+	cmd.Env = append(os.Environ(), "GS_OPTIONS=")
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if !verbose {
+			stderr.Write(messages.Bytes())
+		}
 		return err
+	}
+	// Ghostscript 10 skips an image it cannot decode, leaves the page blank, and exits 0.
+	if bytes.Contains(messages.Bytes(), []byte("recoverable image error")) {
+		return errors.New("Ghostscript skipped an image it could not decode, which leaves a blank page; try --engine pdfcpu")
 	}
 	return nil
 }
