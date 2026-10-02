@@ -62,9 +62,10 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Cross-compile
+        # The container's checkout is owned by another user, so Go cannot stamp VCS info here.
         run: |
           for target in $TARGETS; do
-            CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -trimpath -o /tmp/pdf-squeezer .
+            CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -trimpath -buildvcs=false -o /tmp/pdf-squeezer .
           done
 
   release:
