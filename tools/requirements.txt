@@ -1,0 +1,5 @@
+# Optional local PDF processing. The default Go engine does not use these packages.
+pikepdf==10.16.0
+Pillow==12.3.0
+PyMuPDF==1.28.2
+fonttools==4.66.1
