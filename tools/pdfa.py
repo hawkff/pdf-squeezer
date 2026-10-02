@@ -131,47 +131,90 @@ def strip_hint(category):
 
 
 def content_streams(pdf):
-    """Yield (owner, resources, owns_resources) for every reachable content stream."""
-    seen = set()
+    """Yield (owner, resources, owns_resources) for every content stream a viewer runs.
 
-    def visit(stream, resources):
-        if stream.objgen in seen:
-            return
-        seen.add(stream.objgen)
-        own = stream.get("/Resources")
-        own = own if isinstance(own, Dictionary) else None
-        effective = own if own is not None else resources
-        yield stream, effective, own is not None
-        yield from visit_resources(effective)
+    Streams are reached through the operators that invoke them, so unused
+    resources are skipped. Resource dictionaries become indirect on the way. A
+    stream without its own resources that is reached from a second, different
+    resource context is cloned for that context, so binding resources to it
+    never changes what another page draws.
+    """
+    bound = {}
 
-    def visit_resources(resources):
+    def visit(owner, resources, owns):
+        yield owner, resources, owns
         if not isinstance(resources, Dictionary):
             return
-        for xobject in (resources.get("/XObject") or {}).values():
-            if isinstance(xobject, Stream) and xobject.get("/Subtype") == Name.Form:
-                yield from visit(xobject, resources)
-        for pattern in (resources.get("/Pattern") or {}).values():
-            if isinstance(pattern, Stream):
-                yield from visit(pattern, resources)
-        for font in (resources.get("/Font") or {}).values():
-            if isinstance(font, Dictionary) and font.get("/Subtype") == Name.Type3:
-                glyph_resources = font.get("/Resources", resources)
-                for glyph in (font.get("/CharProcs") or {}).values():
-                    if isinstance(glyph, Stream):
-                        yield from visit(glyph, glyph_resources)
+        fonts, xobjects, patterns = (
+            resources.get(key) for key in ("/Font", "/XObject", "/Pattern")
+        )
+        for instruction in instructions(owner):
+            op, args = str(instruction.operator), instruction.operands
+            if op == "Do" and args and isinstance(xobjects, Dictionary):
+                target = xobjects.get(args[0])
+                if isinstance(target, Stream) and target.get("/Subtype") == Name.Form:
+                    yield from visit_stream(target, resources, xobjects, args[0])
+            elif op in ("scn", "SCN") and args and isinstance(patterns, Dictionary):
+                target = patterns.get(args[-1]) if isinstance(args[-1], Name) else None
+                if isinstance(target, Stream):
+                    yield from visit_stream(target, resources, patterns, args[-1])
+            elif op == "Tf" and args and isinstance(fonts, Dictionary):
+                font = fonts.get(args[0])
+                if isinstance(font, Dictionary) and font.get("/Subtype") == Name.Type3:
+                    procs = font.get("/CharProcs")
+                    glyph_resources = font.get("/Resources")
+                    if (
+                        isinstance(glyph_resources, Dictionary)
+                        and not glyph_resources.is_indirect
+                    ):
+                        font.Resources = pdf.make_indirect(glyph_resources)
+                        glyph_resources = font.Resources
+                    if not isinstance(glyph_resources, Dictionary):
+                        glyph_resources = resources
+                    for name, glyph in (
+                        procs.items() if isinstance(procs, Dictionary) else ()
+                    ):
+                        if isinstance(glyph, Stream):
+                            yield from visit_stream(glyph, glyph_resources, procs, name)
+
+    def visit_stream(stream, resources, container, name):
+        own = stream.get("/Resources")
+        if isinstance(own, Dictionary) and not own.is_indirect:
+            stream.Resources = pdf.make_indirect(own)
+            own = stream.Resources
+        owns = isinstance(own, Dictionary)
+        context = own if owns else resources
+        context_key = context.objgen if getattr(context, "is_indirect", False) else None
+        previous = bound.get(stream.objgen, False)
+        if previous is not False:
+            if owns or previous == context_key:
+                return
+            clone = pdf.make_stream(stream.read_raw_bytes())
+            for key, value in stream.items():
+                if key != "/Length":
+                    clone[key] = value
+            container[name] = clone
+            stream = clone
+        bound[stream.objgen] = context_key
+        yield from visit(stream, context, owns)
 
     for page in pdf.pages:
         resources = inherited(page.obj, "/Resources", Dictionary())
-        yield page, resources, "/Resources" in page.obj
-        yield from visit_resources(resources)
+        if not getattr(resources, "is_indirect", False):
+            resources = pdf.make_indirect(resources)
+        page.obj.Resources = resources
+        yield from visit(page, resources, True)
         for annot in page.obj.get("/Annots") or []:
-            if not isinstance(annot, Dictionary):
+            appearance = annot.get("/AP") if isinstance(annot, Dictionary) else None
+            if not isinstance(appearance, Dictionary):
                 continue
-            for state in (annot.get("/AP") or {}).values():
-                streams = state.values() if isinstance(state, Dictionary) else [state]
-                for stream in streams:
-                    if isinstance(stream, Stream):
-                        yield from visit(stream, resources)
+            for state_name, state in appearance.items():
+                if isinstance(state, Stream):
+                    yield from visit_stream(state, resources, appearance, state_name)
+                elif isinstance(state, Dictionary):
+                    for sub_name, stream in state.items():
+                        if isinstance(stream, Stream):
+                            yield from visit_stream(stream, resources, state, sub_name)
 
 
 def instructions(owner):
@@ -413,6 +456,9 @@ def strip_features(pdf, strip, problems):
                 continue
             subtype = pdf_name(annot.get("/Subtype"))
             where = f"{subtype or 'untyped'} annotation {objref(annot)}"
+            if annotation_category(subtype) in strip:
+                changed = True
+                continue
             if subtype not in ALLOWED_ANNOTATIONS:
                 category = (
                     "multimedia" if subtype in FORBIDDEN_ANNOTATIONS else "annotations"
@@ -462,6 +508,11 @@ def strip_features(pdf, strip, problems):
         for holder in [root, *(page.obj for page in pdf.pages)]:
             if "/AF" in holder:
                 del holder["/AF"]
+
+
+def annotation_category(subtype):
+    """The --strip category that removes an annotation, matching the Go CLI."""
+    return {"/Widget": "forms", "/Link": "links"}.get(subtype, "annotations")
 
 
 def form_fields(acroform):
@@ -535,20 +586,23 @@ def repair_structure(pdf, notes):
                         del obj[key]
     if recompressed:
         notes.append(f"re-encoded {recompressed} LZW streams with Flate")
-    # Share one indirect resource dictionary per page with the forms that borrow it.
-    for page in pdf.pages:
-        resources = inherited(page.obj, "/Resources", Dictionary())
-        if not getattr(resources, "is_indirect", False):
-            resources = pdf.make_indirect(resources)
-        page.obj.Resources = resources
-    for owner, resources, owns in content_streams(pdf):
+    # Traverse completely before binding: a stream reached from a second context
+    # must still look resource-less so that it gets cloned.
+    for owner, resources, owns in list(content_streams(pdf)):
         holder = owner.obj if isinstance(owner, pikepdf.Page) else owner
         if not owns and isinstance(resources, Dictionary):
             holder.Resources = resources
-        if isinstance(resources, Dictionary):
-            for state in (resources.get("/ExtGState") or {}).values():
-                if isinstance(state, Dictionary):
-                    repair_graphics_state(state)
+        if not isinstance(resources, Dictionary):
+            continue
+        for state in (resources.get("/ExtGState") or {}).values():
+            if isinstance(state, Dictionary):
+                repair_graphics_state(state)
+        # Font repairs address fonts by object number, so direct ones become indirect.
+        fonts = resources.get("/Font")
+        if isinstance(fonts, Dictionary):
+            for name, font in list(fonts.items()):
+                if isinstance(font, Dictionary) and not font.is_indirect:
+                    fonts[name] = pdf.make_indirect(font)
 
 
 def repair_graphics_state(state):
@@ -771,8 +825,9 @@ def repair_annotations(pdf, problems):
                     f"annotation {objref(annot)} has appearance states without a usable /AS; use --strip annotations or --flatten annotations"
                 )
     for annot in missing_appearances(pdf):
+        category = annotation_category(pdf_name(annot.get("/Subtype")))
         problems.append(
-            f"{annot.get('/Subtype')} annotation {objref(annot)} has no appearance stream and MuPDF cannot generate one; use --flatten annotations or --strip annotations"
+            f"{annot.get('/Subtype')} annotation {objref(annot)} has no appearance stream and MuPDF cannot generate one; use --flatten {category} or --strip {category}"
         )
 
 
@@ -816,7 +871,9 @@ def ensure_output_intent(pdf, options, notes):
     if existing is None:
         path = user_profile or options["srgb_icc"]
         with open(path, "rb") as f:
-            data = f.read(64 << 20)
+            data = f.read((64 << 20) + 1)
+        if len(data) > 64 << 20:
+            raise ConversionError("the output intent ICC profile exceeds 64 MiB")
         space, components = icc_header(data)
         profile = pdf.make_stream(data)
         profile.N = components
@@ -1680,6 +1737,42 @@ def repair_type1_widths(pdf, font, descriptor, program, data, codes, wanted, not
     )
 
 
+INVALID_UNICODE = {"0000", "FEFF", "FFFE"}
+
+
+def clean_to_unicode(text):
+    """Drop bfchar entries and trim bfranges that map to U+0000, U+FEFF, or U+FFFE.
+
+    Only the mapping sections change; codespace ranges and other CMap syntax stay.
+    """
+
+    def bfchar(match):
+        def entry(pair):
+            return "" if pair.group(2).upper() in INVALID_UNICODE else pair.group(0)
+
+        body = re.sub(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*", entry, match.group(2))
+        return match.group(1) + body + match.group(3)
+
+    def bfrange(match):
+        def entry(triple):
+            low, high, target = triple.groups()
+            if target.upper() not in INVALID_UNICODE:
+                return triple.group(0)
+            if int(low, 16) >= int(high, 16):
+                return ""
+            return f"<{int(low, 16) + 1:0{len(low)}X}> <{high}> <{int(target, 16) + 1:0{len(target)}X}>\n"
+
+        body = re.sub(
+            r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*",
+            entry,
+            match.group(2),
+        )
+        return match.group(1) + body + match.group(3)
+
+    text = re.sub(r"(beginbfchar)(.*?)(endbfchar)", bfchar, text, flags=re.DOTALL)
+    return re.sub(r"(beginbfrange)(.*?)(endbfrange)", bfrange, text, flags=re.DOTALL)
+
+
 def repair_to_unicode(font, notes):
     stream = font.get("/ToUnicode")
     if not isinstance(stream, Stream):
@@ -1688,13 +1781,7 @@ def repair_to_unicode(font, notes):
         text = stream.read_bytes().decode("latin-1")
     except pikepdf.PdfError:
         return
-    bad = re.compile(
-        r"<[0-9A-Fa-f]+>\s*<(?:0000|[Ff][Ee][Ff][Ff]|[Ff][Ff][Ff][Ee])>\s*\n?"
-    )
-    ranges = re.compile(
-        r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<(?:0000|[Ff][Ee][Ff][Ff]|[Ff][Ff][Ff][Ee])>\s*\n?"
-    )
-    fixed = ranges.sub("", bad.sub("", text))
+    fixed = clean_to_unicode(text)
     if fixed != text:
         stream.write(fixed.encode("latin-1"))
         notes.append(f"removed invalid Unicode mappings from {font.get('/BaseFont')}")

@@ -67,7 +67,7 @@ jobs:
             <com.izforge.izpack.panels.finish.FinishPanel id="finish"/>
           </AutomatedInstallation>
           EOF
-          verapdf-*/verapdf-install verapdf-auto.xml
+          verapdf-*/verapdf-install "$RUNNER_TEMP/verapdf-auto.xml"
           echo "$RUNNER_TEMP/verapdf" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/verapdf/verapdf" --version
       - name: Check formatting and Python lint

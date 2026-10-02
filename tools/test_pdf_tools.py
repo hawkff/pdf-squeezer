@@ -539,17 +539,24 @@ class PDFToolsTests(unittest.TestCase):
             "F1": simple_font(pdf, "Helvetica"),
             "F2": simple_font(pdf, "Times-Bold", Encoding=pikepdf.Name.WinAnsiEncoding),
             "F3": simple_font(pdf, "Symbol"),
+            # A direct font dictionary, which has no object number of its own.
+            "F4": pikepdf.Dictionary(
+                Type=pikepdf.Name.Font,
+                Subtype=pikepdf.Name.Type1,
+                BaseFont=pikepdf.Name.Courier,
+            ),
         }
         text_page(
             pdf,
             fonts,
-            b"BT /F1 18 Tf 10 70 Td (Hello, archive! \xe9) Tj /F2 18 Tf 0 -25 Td (Bold \xe9t\xe9) Tj /F3 18 Tf 0 -25 Td (abg) Tj ET",
+            b"BT /F1 18 Tf 10 70 Td (Hello, archive! \xe9) Tj /F2 18 Tf 0 -25 Td (Bold \xe9t\xe9) Tj"
+            b" /F3 18 Tf 0 -25 Td (abg) Tj /F4 12 Tf 0 -15 Td (mono) Tj ET",
         )
         pdf.save(self.source)
         before = rendered(self.source)
         self.convert_pdfa()
         with pikepdf.Pdf.open(self.output) as result:
-            for key in ("/F1", "/F2", "/F3"):
+            for key in ("/F1", "/F2", "/F3", "/F4"):
                 font = result.pages[0].Resources.Font[key]
                 descriptor = font.FontDescriptor
                 self.assertIn("/FontFile3", descriptor, key)
@@ -643,15 +650,23 @@ class PDFToolsTests(unittest.TestCase):
                 ),
             ]
         )
+        page.obj.Annots.append(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name.Annot,
+                Subtype=pikepdf.Name.Watermark,
+                Rect=[60, 60, 90, 90],
+                F=4,
+            )
+        )
         pdf.Root.AcroForm = pikepdf.Dictionary(
             Fields=pikepdf.Array(), XFA=pikepdf.Array()
         )
         pdf.save(self.source)
         with self.assertRaises(tools.pdfa.ConversionError) as caught:
             self.convert_pdfa()
-        for category in ("multimedia", "hidden", "actions", "xfa"):
+        for category in ("multimedia", "hidden", "actions", "xfa", "annotations"):
             self.assertIn(f"--strip {category}", str(caught.exception))
-        self.convert_pdfa(strip="actions,multimedia,hidden,xfa")
+        self.convert_pdfa(strip="actions,multimedia,hidden,xfa,annotations")
         with pikepdf.Pdf.open(self.output) as result:
             annots = list(result.pages[0].Annots)
             self.assertEqual([a.Subtype for a in annots], [pikepdf.Name.Link])
@@ -680,6 +695,54 @@ class PDFToolsTests(unittest.TestCase):
             self.assertEqual(len(result.attachments), 0)
             self.assertNotIn("pdfaid:conformance", result.open_metadata())
         self.assert_pdfa("4")
+
+    def test_pdfa4_clones_forms_shared_across_resource_contexts(self):
+        pdf = pikepdf.Pdf.new()
+        form = pdf.make_stream(b"q 40 0 0 40 0 0 cm /Im Do Q")
+        form.Type, form.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+        form.BBox = pikepdf.Array([0, 0, 40, 40])
+        unused = pdf.make_stream(b"BT /F9 12 Tf 10 10 Td (never drawn) Tj ET")
+        unused.Type, unused.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+        unused.BBox = pikepdf.Array([0, 0, 40, 40])
+        unused.Resources = pikepdf.Dictionary(
+            Font=pikepdf.Dictionary(F9=simple_font(pdf, "Verdana-Rare"))
+        )
+        for color in ((200, 30, 30), (30, 30, 200)):
+            page = pdf.add_blank_page(page_size=(100, 100))
+            page.obj.Resources = pikepdf.Dictionary(
+                XObject=pikepdf.Dictionary(
+                    Im=image_object(pdf, Image.new("RGB", (8, 8), color)),
+                    Fm=form,
+                    Unused=unused,
+                )
+            )
+            page.obj.Contents = pdf.make_stream(b"q 1 0 0 1 10 10 cm /Fm Do Q")
+        pdf.save(self.source)
+        before = rendered(self.source)
+        self.convert_pdfa()
+        self.assertEqual(before, rendered(self.output))
+        with pikepdf.Pdf.open(self.output) as result:
+            forms = [page.Resources.XObject.Fm for page in result.pages]
+            self.assertNotEqual(forms[0].objgen, forms[1].objgen)
+            for form, page in zip(forms, result.pages):
+                self.assertEqual(
+                    form.Resources.XObject.Im.objgen, page.Resources.XObject.Im.objgen
+                )
+        self.assert_pdfa("4")
+
+    def test_to_unicode_cleanup_keeps_codespace_and_valid_ranges(self):
+        cmap = (
+            "1 begincodespacerange\n<0000> <FFFE>\nendcodespacerange\n"
+            "2 beginbfchar\n<0041> <0000>\n<0042> <0043>\nendbfchar\n"
+            "2 beginbfrange\n<0050> <0052> <0000>\n<0060> <0060> <FEFF>\nendbfrange\n"
+        )
+        cleaned = tools.pdfa.clean_to_unicode(cmap)
+        self.assertIn("<0000> <FFFE>\nendcodespacerange", cleaned)
+        self.assertNotIn("<0041> <0000>", cleaned)
+        self.assertIn("<0042> <0043>", cleaned)
+        self.assertIn("<0051> <0052> <0001>", cleaned)
+        self.assertNotIn("<0050>", cleaned)
+        self.assertNotIn("<FEFF>", cleaned)
 
     def test_pdfa4_generates_appearances_and_shared_form_resources(self):
         pdf = pikepdf.Pdf.new()
