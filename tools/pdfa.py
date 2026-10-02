@@ -478,7 +478,7 @@ def device_color_families(pdf):
                     and xobject.get("/Subtype") == Name.Image
                 ):
                     family = color_family(xobject.get("/ColorSpace"), resources)
-                    if family:
+                    if family and family not in defaults:
                         families.add(family)
     return families
 
