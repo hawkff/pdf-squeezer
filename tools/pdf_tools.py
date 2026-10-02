@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Optional local PDF operations. Invoked by the Go CLI in a private directory."""
 
 import array
@@ -121,7 +120,7 @@ def placements(pdf, lossless=False):
     uses, streams, blocked = {}, {}, set()
     visits = 0
 
-    def walk(owner, resources, matrix, clip, active, depth=0):
+    def walk(owner, resources, matrix, clip, active, depth=0, borrowed=False):
         nonlocal visits
         visits += 1
         if depth > 64 or visits > 100000:
@@ -185,9 +184,16 @@ def placements(pdf, lossless=False):
                         intersect(clip, bounds(combined, box)),
                         active,
                         depth + 1,
+                        "/Resources" not in target,
                     )
                 elif subtype == pikepdf.Name.Image:
                     nr = target.objgen
+                    if borrowed:
+                        # A form without its own resources can draw different
+                        # images under one name on different pages, so the crop
+                        # rewrite could not bind the name reliably. Preserve them.
+                        blocked.add(nr)
+                        continue
                     w, h = int(target.Width), int(target.Height)
                     if w <= 0 or h <= 0:
                         blocked.add(nr)
@@ -481,7 +487,8 @@ def process_images(pdf, options):
         filters = obj.get("/Filter", pikepdf.Array())
         if not isinstance(filters, pikepdf.Array):
             filters = [filters]
-        encoded = any(str(f) in ("/DCTDecode", "/JPXDecode") for f in filters)
+        dct = any(str(f) == "/DCTDecode" for f in filters)
+        encoded = dct or any(str(f) == "/JPXDecode" for f in filters)
         if options["lossless"] and encoded:
             reason = "lossy original"
         if reason:
@@ -573,6 +580,16 @@ def process_images(pdf, options):
                     preserved.get("color model mismatch", 0) + 1
                 )
                 continue
+            if encoded:
+                # pikepdf applies /Decode to raw samples only, and Pillow loads
+                # CMYK JPEG samples inverted (Adobe convention). Flip so the
+                # samples match what a viewer shows, then drop /Decode.
+                flips = [inv != (dct and components == 4) for inv in inversions]
+                if any(flips) and not all(flips):
+                    preserved["mixed Decode"] = preserved.get("mixed Decode", 0) + 1
+                    continue
+                if all(flips):
+                    image = image.point(lambda value: 255 - value)
             image = image.crop(box)
             if mono:
                 full = mono_candidate(image, codecs)

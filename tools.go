@@ -127,11 +127,15 @@ func pythonPDF(ctx context.Context, operation, input, output string, opts option
 	if err != nil {
 		return errors.New("Python 3 is required for this operation; set PDF_SQUEEZER_PYTHON to a Python environment with the optional PDF tools")
 	}
-	script := filepath.Join(filepath.Dir(output), "pdf-tools.py")
-	if err := os.WriteFile(script, pythonSource, 0600); err != nil {
+	script, err := os.CreateTemp(filepath.Dir(output), "pdf-tools-*.py")
+	if err != nil {
 		return err
 	}
-	defer os.Remove(script)
+	defer os.Remove(script.Name())
+	_, err = script.Write(pythonSource)
+	if err = errors.Join(err, script.Close()); err != nil {
+		return err
+	}
 	request := map[string]any{
 		"dpi": opts.dpi, "gray_dpi": opts.grayDPI, "mono_dpi": opts.monoDPI, "threshold": opts.dpiThreshold,
 		"quality": opts.imageQuality, "clip": opts.clip, "extended": opts.extended, "lossless": opts.lossless,
@@ -149,7 +153,7 @@ func pythonPDF(ctx context.Context, operation, input, output string, opts option
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, path, "-I", script, operation, input, output)
+	cmd := exec.CommandContext(ctx, path, "-I", script.Name(), operation, input, output)
 	cmd.Stdin = bytes.NewReader(data)
 	var messages boundedBuffer
 	cmd.Stdout, cmd.Stderr = &messages, &messages

@@ -283,7 +283,9 @@ func reencode(ctx context.Context, job *imageJob, opts options) encoding {
 	var samples []byte
 	switch kind {
 	case "lossless":
-		if err := sd.DecodeWithLimit(min(maxImageBytes, expected+int64(h))); err != nil {
+		// pdfcpu applies the limit to every filter stage. Intermediate stages hold
+		// compressed data or predictor rows, so allow twice the final sample size.
+		if err := sd.DecodeWithLimit(min(maxImageBytes, 2*(expected+int64(h)))); err != nil {
 			return preserve("undecodable")
 		}
 		if int64(len(sd.Content)) != expected {

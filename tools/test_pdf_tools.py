@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Regression checks for the optional PDF operations; all documents are synthetic."""
 
 import hashlib
@@ -132,6 +131,37 @@ class PDFToolsTests(unittest.TestCase):
             self.assertLess(int(images[0].Width), 128)
             self.assertGreater(int(images[0].Width), 80)
 
+    def test_form_borrowing_page_resources_preserves_images(self):
+        pdf = pikepdf.Pdf.new()
+        form = pdf.make_stream(b"q 128 0 0 128 0 0 cm /Im Do Q")
+        form.Type, form.Subtype, form.BBox = (
+            pikepdf.Name.XObject,
+            pikepdf.Name.Form,
+            pikepdf.Array([0, 0, 128, 128]),
+        )
+        # One shared form, no /Resources of its own: /Im means a different
+        # image on each page, so neither image may be cropped.
+        for seed, x in ((19, -32), (23, -96)):
+            data = random.Random(seed).randbytes(128 * 128 * 3)
+            image = image_object(pdf, Image.frombytes("RGB", (128, 128), data))
+            page = pdf.add_blank_page(page_size=(64, 64))
+            page.obj.Resources = pikepdf.Dictionary(
+                XObject=pikepdf.Dictionary(Fm=form, Im=image)
+            )
+            page.obj.Contents = pdf.make_stream(
+                f"q 1 0 0 1 {x} -32 cm /Fm Do Q".encode()
+            )
+        pdf.save(self.source, compress_streams=False)
+        pdf.close()
+        before = rendered(self.source)
+        tools.transform(
+            self.source, self.output, options(clip=True, lossless=True, codecs="flate")
+        )
+        self.assertEqual(before, rendered(self.output))
+        with pikepdf.Pdf.open(self.output) as result:
+            widths = [int(page.Resources.XObject.Im.Width) for page in result.pages]
+            self.assertEqual(widths, [128, 128])
+
     def test_downsampling_accounts_for_largest_shared_placement(self):
         pdf = pikepdf.Pdf.new()
         image = image_object(
@@ -233,6 +263,38 @@ class PDFToolsTests(unittest.TestCase):
             self.assertEqual(
                 pdf.pages[0].Resources.XObject.Im.Filter, pikepdf.Name.FlateDecode
             )
+
+    def test_encoded_images_keep_decode_semantics(self):
+        for mode, fmt, decode in (
+            ("L", "JPEG", [1, 0]),
+            ("CMYK", "JPEG", None),
+            ("CMYK", "JPEG2000", [1, 0] * 4),
+        ):
+            with self.subTest(mode=mode, fmt=fmt, decode=decode):
+                image = Image.new(
+                    mode, (64, 64), 40 if mode == "L" else (200, 30, 100, 20)
+                )
+                buffer = io.BytesIO()
+                image.save(buffer, format=fmt)
+                self.save_image(image)
+                with pikepdf.Pdf.open(self.source, allow_overwriting_input=True) as pdf:
+                    stream = pdf.pages[0].Resources.XObject.Im
+                    stream.write(
+                        buffer.getvalue(),
+                        filter=pikepdf.Name.DCTDecode
+                        if fmt == "JPEG"
+                        else pikepdf.Name.JPXDecode,
+                    )
+                    if decode:
+                        stream.Decode = pikepdf.Array(decode)
+                    pdf.save(self.source)
+                before = rendered(self.source)
+                tools.transform(
+                    self.source,
+                    self.output,
+                    options(extended=True, codecs="flate", force=True),
+                )
+                self.assertEqual(before, rendered(self.output))
 
     def test_fractional_axis_aligned_crop(self):
         self.save_image(

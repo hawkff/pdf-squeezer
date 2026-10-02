@@ -484,7 +484,10 @@ func ghostscript(ctx context.Context, input, output *os.File, opts options, stde
 		// Font conversion must not also downsample or recompress page images.
 		args = append(args, "-dCompressFonts=true", "-dSubsetFonts=true", "-dEmbedAllFonts=true", "-dConvertFontsToCFF=true")
 		if opts.engine != "ghostscript" {
-			args = append(args, "-dDownsampleColorImages=false", "-dDownsampleGrayImages=false", "-dDownsampleMonoImages=false", "-dPassThroughJPEGImages=true", "-dPassThroughJPXImages=true")
+			// pdfwrite auto-filters images to DCT by default; keep lossless data lossless.
+			args = append(args, "-dDownsampleColorImages=false", "-dDownsampleGrayImages=false", "-dDownsampleMonoImages=false",
+				"-dAutoFilterColorImages=false", "-dAutoFilterGrayImages=false", "-dColorImageFilter=/FlateEncode", "-dGrayImageFilter=/FlateEncode",
+				"-dPassThroughJPEGImages=true", "-dPassThroughJPXImages=true")
 		}
 	}
 	if opts.engine == "ghostscript" {

@@ -343,6 +343,35 @@ func TestGhostscriptCompactFontPrograms(t *testing.T) {
 	t.Fatal("Ghostscript did not embed a compact font program")
 }
 
+func TestGhostscriptFontConversionKeepsImagesLossless(t *testing.T) {
+	requireTool(t, "gs")
+	dir := t.TempDir()
+	input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+	// pdfwrite only auto-selects DCT for large photographic images; use xorshift noise.
+	samples, x := make([]byte, 3*1024*1024), uint32(2463534242)
+	for i := range samples {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		samples[i] = byte(x)
+	}
+	content := "q 200 0 0 200 0 0 cm /Im Do Q\n"
+	writeFile(t, input, buildPDF(0,
+		"<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject << /Im 5 0 R >> >> /Contents 4 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		fmt.Sprintf("<< /Type /XObject /Subtype /Image /Width 1024 /Height 1024 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length %d >>\nstream\n%s\nendstream", len(samples), samples)))
+	// --timestamps now keeps the rewritten document even when it is larger.
+	if err := run(t.Context(), []string{"--convert-fonts-cff", "--timestamps", "now", "-o", output, input}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, filter := range firstImage(t, readContext(t, output, "")).FilterPipeline {
+		if filter.Name == "DCTDecode" {
+			t.Fatal("font conversion re-encoded a lossless image as JPEG")
+		}
+	}
+}
+
 func TestOptionsRejectConflicts(t *testing.T) {
 	for _, args := range [][]string{
 		{"--lossless", "--reduce-bit-depth"}, {"--lossless", "--dpi", "72"}, {"--lossless", "--image-codecs", "jpeg"},
