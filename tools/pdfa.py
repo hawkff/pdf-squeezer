@@ -442,22 +442,32 @@ def annotations(pdf):
                 yield page, annot
 
 
-def forbidden_action(action, depth=0):
-    """Describe why an action chain is not allowed, or return None."""
-    if not isinstance(action, Dictionary):
-        return None
-    if depth > 32:
-        return "action chain deeper than 32 links"
-    kind = pdf_name(action.get("/S"))
-    if kind not in ALLOWED_ACTIONS:
-        return f"{kind or 'untyped'} action"
-    if kind == "/Named" and pdf_name(action.get("/N")) not in ALLOWED_NAMED_ACTIONS:
-        return f"named action {action.get('/N')}"
-    chain = action.get("/Next")
-    for item in chain if isinstance(chain, Array) else [chain]:
-        reason = forbidden_action(item, depth + 1)
-        if reason:
-            return reason
+def forbidden_action(action):
+    """Describe why an action chain is not allowed, or return None.
+
+    Every action reachable through /Next is checked once; cycles are skipped.
+    """
+    pending, seen = [action], set()
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, Dictionary):
+            continue
+        if current.is_indirect:
+            if current.objgen in seen:
+                continue
+            seen.add(current.objgen)
+        if len(seen) > 100000:
+            return "action chain with more than 100000 links"
+        kind = pdf_name(current.get("/S"))
+        if kind not in ALLOWED_ACTIONS:
+            return f"{kind or 'untyped'} action"
+        if (
+            kind == "/Named"
+            and pdf_name(current.get("/N")) not in ALLOWED_NAMED_ACTIONS
+        ):
+            return f"named action {current.get('/N')}"
+        chain = current.get("/Next")
+        pending.extend(chain if isinstance(chain, Array) else [chain])
     return None
 
 
