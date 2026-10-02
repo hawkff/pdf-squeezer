@@ -58,7 +58,8 @@ Document:
   --metadata KEY=VALUE    set Title, Author, Subject, Keywords, Creator, Producer,
                           CreationDate or ModDate; repeatable; empty removes a key
   --strip LIST            thumbnails,alternates,threads,tags,output-intents,piece-info,
-                          metadata,links,annotations,forms,images; opt-in removals
+                          metadata,links,annotations,forms,images,actions,multimedia,
+                          hidden,xfa,attachments; opt-in removals
   --flatten LIST          forms,annotations,links or all; freezes appearances
   --subset-fonts          subset eligible embedded fonts
   --merge-fonts           merge compatible embedded TrueType subsets
@@ -76,6 +77,9 @@ Security and conversion:
   --mrc                   image-only layered PDF for scans; preserves fine dark text
   --render-dpi N          bitmap/MRC rendering resolution (default 200)
   --background-dpi N      MRC background resolution (default 72)
+  --pdfa4                 convert to PDF/A-4 (4f with attachments); veraPDF must confirm
+  --output-intent FILE    ICC profile for the PDF/A output intent (default: bundled sRGB)
+  --font-file NAME=PATH   font program for a non-embedded font; repeatable
 `
 
 type options struct {
@@ -88,10 +92,10 @@ type options struct {
 	subsetFonts, mergeFonts, cffFonts, removeStandardFonts       bool
 	passwordFile, encryptUserFile, encryptOwnerFile, permissions string
 	password, encryptUser, encryptOwner                          string
-	decrypt, bitmap, mrc                                         bool
-	extract                                                      string
+	decrypt, bitmap, mrc, pdfa4                                  bool
+	extract, outputIntent                                        string
 	renderDPI, backgroundDPI                                     int
-	metadata                                                     stringList
+	metadata, fontFiles                                          stringList
 }
 
 type stringList []string
@@ -126,7 +130,7 @@ func parseFlags(flags *flag.FlagSet, args []string) ([]string, error) {
 
 func profileFlag(name string) bool {
 	switch name {
-	case "o", "output", "profile", "save-profile", "password-file", "encrypt-user-file", "encrypt-owner-file", "metadata", "v", "version", "V", "verbose", "recursive", "collision", "extract":
+	case "o", "output", "profile", "save-profile", "password-file", "encrypt-user-file", "encrypt-owner-file", "metadata", "v", "version", "V", "verbose", "recursive", "collision", "extract", "output-intent", "font-file":
 		return false
 	}
 	return true
@@ -180,6 +184,9 @@ func parseOptions(ctx context.Context, args []string, stderr io.Writer) (options
 	f.BoolVar(&opts.mrc, "mrc", false, "")
 	f.IntVar(&opts.renderDPI, "render-dpi", 200, "")
 	f.IntVar(&opts.backgroundDPI, "background-dpi", 72, "")
+	f.BoolVar(&opts.pdfa4, "pdfa4", false, "")
+	f.StringVar(&opts.outputIntent, "output-intent", "", "")
+	f.Var(&opts.fontFiles, "font-file", "")
 	var profilePath, saveProfile string
 	var version bool
 	f.StringVar(&profilePath, "profile", "", "")
@@ -339,7 +346,7 @@ func (o *options) validate() error {
 	if o.imageCodecs == "" || !validList(o.imageCodecs, "flate,jpeg") || o.monoCodecs == "" || !validList(o.monoCodecs, "flate,ccitt,jbig2") {
 		return errors.New("invalid image or monochrome codec list")
 	}
-	if !validList(o.strip, "thumbnails,alternates,threads,tags,output-intents,piece-info,metadata,links,annotations,forms,images") {
+	if !validList(o.strip, "thumbnails,alternates,threads,tags,output-intents,piece-info,metadata,links,annotations,forms,images,actions,multimedia,hidden,xfa,attachments") {
 		return errors.New("invalid --strip list")
 	}
 	if !validList(o.flatten, "forms,annotations,links,all") {
@@ -397,6 +404,17 @@ func (o *options) validate() error {
 	if o.renderDPI < 36 || o.renderDPI > 1200 || o.backgroundDPI < 10 || o.backgroundDPI > o.renderDPI {
 		return errors.New("render DPI must be 36..1200; background DPI must be 10..render DPI")
 	}
+	if o.pdfa4 && (o.encryptOwnerFile != "" || o.privacy || listContains(o.strip, "metadata") || listContains(o.strip, "output-intents") || o.removeStandardFonts) {
+		return errors.New("PDF/A-4 requires metadata, color information, embedded fonts, and no encryption")
+	}
+	if !o.pdfa4 && (o.outputIntent != "" || len(o.fontFiles) > 0) {
+		return errors.New("--output-intent and --font-file require --pdfa4")
+	}
+	for _, setting := range o.fontFiles {
+		if name, file, ok := strings.Cut(setting, "="); !ok || name == "" || file == "" {
+			return errors.New("--font-file expects NAME=PATH")
+		}
+	}
 	if o.lossless && (o.engine != "pdfcpu" || o.reduceBits || o.gray || o.dpi > 0 || o.grayDPI > 0 || o.monoDPI > 0 || o.bitmap || o.mrc || o.cffFonts || listContains(o.imageCodecs, "jpeg")) {
 		return errors.New("--lossless conflicts with lossy transforms or JPEG encoding")
 	}
@@ -409,7 +427,7 @@ func (o *options) validate() error {
 	if o.engine == "ghostscript" && o.images {
 		return errors.New("--images and its encoding options require --engine pdfcpu")
 	}
-	if o.extract != "" && (o.images || o.engine != "pdfcpu" || o.gray || o.dpi != 0 || o.grayDPI != 0 || o.monoDPI != 0 || o.privacy || len(o.metadata) != 0 || o.strip != "" || o.flatten != "" || o.subsetFonts || o.mergeFonts || o.cffFonts || o.removeStandardFonts || o.bitmap || o.mrc || o.decrypt || o.encryptOwnerFile != "") {
+	if o.extract != "" && (o.images || o.engine != "pdfcpu" || o.gray || o.dpi != 0 || o.grayDPI != 0 || o.monoDPI != 0 || o.privacy || len(o.metadata) != 0 || o.strip != "" || o.flatten != "" || o.subsetFonts || o.mergeFonts || o.cffFonts || o.removeStandardFonts || o.bitmap || o.mrc || o.pdfa4 || o.decrypt || o.encryptOwnerFile != "") {
 		return errors.New("--extract cannot be combined with document transformations")
 	}
 	return nil
@@ -417,7 +435,17 @@ func (o *options) validate() error {
 
 // requiredOutput prevents a size fallback from undoing requested document changes.
 func (o options) requiredOutput() bool {
-	return o.privacy || len(o.metadata) > 0 || o.strip != "" || o.flatten != "" || o.gray || o.force || o.decrypt || o.encryptOwnerFile != "" || o.bitmap || o.mrc || o.timestamps == "now" || o.removeStandardFonts
+	return o.privacy || len(o.metadata) > 0 || o.strip != "" || o.flatten != "" || o.gray || o.force || o.decrypt || o.encryptOwnerFile != "" || o.bitmap || o.mrc || o.pdfa4 || o.timestamps == "now" || o.removeStandardFonts
+}
+
+// pythonStrip reports --strip categories that the Python tools implement.
+func (o options) pythonStrip() bool {
+	for _, category := range []string{"actions", "multimedia", "hidden", "xfa", "attachments"} {
+		if listContains(o.strip, category) {
+			return true
+		}
+	}
+	return false
 }
 
 func (o options) advancedImages() bool {

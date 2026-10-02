@@ -226,6 +226,9 @@ func squeeze(ctx context.Context, input, output string, opts options, stderr io.
 		return 0, 0, err
 	}
 	encrypted := pdf.Encrypt != nil
+	if encrypted && opts.pdfa4 && !opts.decrypt {
+		return 0, 0, errors.New("PDF/A-4 cannot preserve encryption; explicitly use --decrypt")
+	}
 	if encrypted && opts.privacy && !opts.decrypt && opts.encryptOwnerFile == "" {
 		return 0, 0, errors.New("--privacy on encrypted input requires --decrypt or new output encryption to replace its identifier")
 	}
@@ -272,7 +275,8 @@ func squeeze(ctx context.Context, input, output string, opts options, stderr io.
 		current, pdf = next, nil
 		return nil
 	}
-	if opts.inline || listContains(opts.strip, "images") {
+	// PDF/A-4 constrains inline images (length key, filters); XObjects avoid that.
+	if opts.inline || opts.pdfa4 || listContains(opts.strip, "images") {
 		err = apply("externalizing inline images", func(in, out string) error {
 			return qpdf(ctx, []string{"--externalize-inline-images", "--ii-min-bytes=0", in, out}, "", stderr)
 		})
@@ -298,7 +302,7 @@ func squeeze(ctx context.Context, input, output string, opts options, stderr io.
 			return 0, 0, err
 		}
 	}
-	if opts.advancedImages() || opts.flatten != "" || opts.mergeFonts || opts.subsetFonts || opts.bitmap || opts.mrc || opts.gray && opts.engine == "pdfcpu" {
+	if opts.advancedImages() || opts.flatten != "" || opts.mergeFonts || opts.subsetFonts || opts.bitmap || opts.mrc || opts.pythonStrip() || opts.gray && opts.engine == "pdfcpu" {
 		err = apply("processing advanced document features", func(in, out string) error { return pythonPDF(ctx, "transform", in, out, opts, stderr) })
 		if err != nil {
 			return 0, 0, err
@@ -377,6 +381,15 @@ func squeeze(ctx context.Context, input, output string, opts options, stderr io.
 			return errors.Join(err, out.Close())
 		})
 		if err != nil {
+			return 0, 0, err
+		}
+	}
+	if opts.pdfa4 {
+		err = apply("converting to PDF/A-4", func(in, out string) error { return pythonPDF(ctx, "pdfa4", in, out, opts, stderr) })
+		if err != nil {
+			return 0, 0, err
+		}
+		if err := validatePDFA(ctx, current, stderr); err != nil {
 			return 0, 0, err
 		}
 	}

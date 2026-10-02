@@ -6,6 +6,7 @@ import io
 import os
 import random
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -46,9 +47,45 @@ def options(**changes):
         "render_dpi": 200,
         "background_dpi": 72,
         "verbose": True,
+        "strip": "",
+        "font_files": {},
+        "output_intent": "",
+        "srgb_icc": str(Path(__file__).with_name("sRGB2014.icc")),
     }
     result.update(changes)
     return result
+
+
+def text_page(pdf, fonts, content, size=(200, 100)):
+    page = pdf.add_blank_page(page_size=size)
+    page.obj.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(**fonts))
+    page.obj.Contents = pdf.make_stream(content)
+    return page
+
+
+def simple_font(pdf, base_font, **extra):
+    return pdf.make_indirect(
+        pikepdf.Dictionary(
+            Type=pikepdf.Name.Font,
+            Subtype=pikepdf.Name.Type1,
+            BaseFont=pikepdf.Name("/" + base_font),
+            **extra,
+        )
+    )
+
+
+def fontconfig_file(family):
+    binary = shutil.which("fc-match")
+    if not binary:
+        return None
+    result = subprocess.run(
+        [binary, "-f", "%{family}|%{file}", family],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    matched, _, path = result.stdout.partition("|")
+    return path if family.lower() in matched.lower() else None
 
 
 def image_object(pdf, image):
@@ -416,6 +453,263 @@ class PDFToolsTests(unittest.TestCase):
         with pymupdf.open(self.output) as doc:
             self.assertFalse(doc.is_form_pdf)
             self.assertIn("VISIBLE", doc[0].get_text())
+
+    def convert_pdfa(self, **changes):
+        return tools.pdfa.convert(
+            self.source, self.output, options(**changes), lambda _: None
+        )
+
+    def assert_pdfa(self, flavour):
+        binary = shutil.which("verapdf")
+        if not binary:
+            if os.environ.get("PDF_SQUEEZER_INTEGRATION") == "1":
+                self.fail("veraPDF is required for integration tests")
+            return
+        report = subprocess.run(
+            [binary, "--format", "xml", "--flavour", flavour, self.output],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        self.assertIn('isCompliant="true"', report, report[:6000])
+
+    def test_pdfa4_structure_metadata_and_color(self):
+        pdf = pikepdf.Pdf.new()
+        image = image_object(pdf, Image.new("RGB", (8, 8), (10, 20, 30)))
+        image.Interpolate = True
+        group = pdf.make_indirect(
+            pikepdf.Dictionary(Type=pikepdf.Name.OCG, Name=pikepdf.String("Layer"))
+        )
+        page = pdf.add_blank_page(page_size=(100, 100))
+        page.obj.Resources = pikepdf.Dictionary(
+            ExtGState=pikepdf.Dictionary(
+                G=pikepdf.Dictionary(
+                    TR=pikepdf.Name.Identity, HTO=[0, 0], TR2=pikepdf.Name.Default
+                )
+            ),
+            XObject=pikepdf.Dictionary(Im=image),
+        )
+        page.obj.Contents = pdf.make_stream(
+            b"/G gs 0 0 1 rg 10 10 30 30 re f q 50 0 0 50 25 25 cm /Im Do Q"
+        )
+        pdf.Root.Requirements = pikepdf.Array()
+        pdf.Root.Version = pikepdf.Name("/1.7")
+        pdf.Root.OCProperties = pikepdf.Dictionary(
+            OCGs=pikepdf.Array([group]), D=pikepdf.Dictionary(Order=pikepdf.Array())
+        )
+        pdf.docinfo["/Title"] = "Example title"
+        pdf.docinfo["/Author"] = "Jane Example"
+        pdf.save(self.source)
+        self.assertEqual(self.convert_pdfa(), "4")
+        with pikepdf.Pdf.open(self.output) as result:
+            self.assertEqual(result.pdf_version, "2.0")
+            self.assertNotIn("/Info", result.trailer)
+            self.assertIn("/ID", result.trailer)
+            meta = result.open_metadata()
+            self.assertEqual(meta["pdfaid:part"], "4")
+            self.assertEqual(meta["pdfaid:rev"], "2020")
+            self.assertNotIn("pdfaid:conformance", meta)
+            self.assertEqual(meta["dc:title"], "Example title")
+            self.assertEqual(list(meta["dc:creator"]), ["Jane Example"])
+            intent = result.Root.OutputIntents[0]
+            self.assertEqual(intent.S, pikepdf.Name.GTS_PDFA1)
+            self.assertEqual(int(intent.DestOutputProfile.N), 3)
+            resources = result.pages[0].Resources
+            state = resources.ExtGState.G
+            self.assertNotIn("/TR", state)
+            self.assertNotIn("/HTO", state)
+            self.assertEqual(state.TR2, pikepdf.Name.Default)
+            self.assertFalse(resources.XObject.Im.Interpolate)
+            self.assertNotIn("/Requirements", result.Root)
+            self.assertNotIn("/Version", result.Root)
+            config = result.Root.OCProperties.D
+            self.assertEqual(str(config.Name), "Default")
+            self.assertEqual(
+                config.Order[0].objgen, result.Root.OCProperties.OCGs[0].objgen
+            )
+        self.assert_pdfa("4")
+
+    def test_pdfa4_embeds_standard_fonts(self):
+        if not fontconfig_file("Nimbus Sans") and not fontconfig_file(
+            "Liberation Sans"
+        ):
+            self.skipTest("no metric-compatible fonts are installed")
+        pdf = pikepdf.Pdf.new()
+        fonts = {
+            "F1": simple_font(pdf, "Helvetica"),
+            "F2": simple_font(pdf, "Times-Bold", Encoding=pikepdf.Name.WinAnsiEncoding),
+            "F3": simple_font(pdf, "Symbol"),
+        }
+        text_page(
+            pdf,
+            fonts,
+            b"BT /F1 18 Tf 10 70 Td (Hello, archive! \xe9) Tj /F2 18 Tf 0 -25 Td (Bold \xe9t\xe9) Tj /F3 18 Tf 0 -25 Td (abg) Tj ET",
+        )
+        pdf.save(self.source)
+        before = rendered(self.source)
+        self.convert_pdfa()
+        with pikepdf.Pdf.open(self.output) as result:
+            for key in ("/F1", "/F2", "/F3"):
+                font = result.pages[0].Resources.Font[key]
+                descriptor = font.FontDescriptor
+                self.assertIn("/FontFile3", descriptor, key)
+                self.assertEqual(descriptor.FontFile3.Subtype, pikepdf.Name.Type1C)
+                self.assertEqual(
+                    int(font.LastChar) - int(font.FirstChar) + 1, len(font.Widths)
+                )
+                self.assertTrue(
+                    str(font.BaseFont).startswith("/") and "+" in str(font.BaseFont)
+                )
+            self.assertEqual(
+                int(result.pages[0].Resources.Font.F3.FontDescriptor.Flags) & 4, 4
+            )
+        self.assertEqual(
+            [size for size, _ in before], [size for size, _ in rendered(self.output)]
+        )
+        self.assert_pdfa("4")
+
+    def test_pdfa4_font_widths_must_match_or_come_from_font_file(self):
+        liberation = fontconfig_file("Liberation Sans")
+        if not liberation:
+            self.skipTest("Liberation Sans is not installed")
+        pdf = pikepdf.Pdf.new()
+        font = simple_font(
+            pdf,
+            "Arial",
+            Encoding=pikepdf.Name.WinAnsiEncoding,
+            FirstChar=65,
+            LastChar=67,
+            Widths=pikepdf.Array([500, 500, 500]),
+        )
+        text_page(pdf, {"F1": font}, b"BT /F1 18 Tf 10 50 Td (ABC) Tj ET")
+        pdf.save(self.source)
+        with self.assertRaisesRegex(tools.pdfa.ConversionError, "--font-file"):
+            self.convert_pdfa()
+        self.convert_pdfa(font_files={"Arial": liberation})
+        with pikepdf.Pdf.open(self.output) as result:
+            font = result.pages[0].Resources.Font.F1
+            self.assertEqual(font.Subtype, pikepdf.Name.TrueType)
+            self.assertIn("/FontFile2", font.FontDescriptor)
+            self.assertEqual(font.Encoding.BaseEncoding, pikepdf.Name.WinAnsiEncoding)
+            self.assertNotEqual([int(w) for w in font.Widths], [500, 500, 500])
+        self.assert_pdfa("4")
+
+    def test_pdfa4_cmyk_needs_a_cmyk_output_intent(self):
+        self.save_image(
+            Image.new("RGB", (8, 8), (0, 0, 0)), b"0 0 0 1 k 10 10 40 40 re f", (64, 64)
+        )
+        with self.assertRaisesRegex(tools.pdfa.ConversionError, "--output-intent"):
+            self.convert_pdfa()
+        profiles = sorted(
+            Path("/usr/share/ghostscript").glob("*/iccprofiles/default_cmyk.icc")
+        )
+        if not profiles:
+            self.skipTest("no CMYK ICC profile is available")
+        self.convert_pdfa(output_intent=str(profiles[-1]))
+        with pikepdf.Pdf.open(self.output) as result:
+            self.assertEqual(int(result.Root.OutputIntents[0].DestOutputProfile.N), 4)
+            self.assertIn("/DefaultRGB", result.pages[0].Resources.ColorSpace)
+        self.assert_pdfa("4")
+
+    def test_pdfa4_forbidden_features_need_strip(self):
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page(page_size=(100, 100))
+        appearance = pdf.make_stream(b"1 0 0 RG 1 1 8 8 re S")
+        appearance.Type, appearance.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+        appearance.BBox = pikepdf.Array([0, 0, 10, 10])
+        page.obj.Annots = pikepdf.Array(
+            [
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name.Annot,
+                    Subtype=pikepdf.Name.Movie,
+                    Rect=[0, 0, 10, 10],
+                    F=4,
+                ),
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name.Annot,
+                    Subtype=pikepdf.Name.Square,
+                    Rect=[20, 20, 30, 30],
+                    F=2,
+                    AP=pikepdf.Dictionary(N=appearance),
+                ),
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name.Annot,
+                    Subtype=pikepdf.Name.Link,
+                    Rect=[40, 40, 50, 50],
+                    F=4,
+                    A=pikepdf.Dictionary(
+                        S=pikepdf.Name.Launch, F=pikepdf.String("calc.exe")
+                    ),
+                ),
+            ]
+        )
+        pdf.Root.AcroForm = pikepdf.Dictionary(
+            Fields=pikepdf.Array(), XFA=pikepdf.Array()
+        )
+        pdf.save(self.source)
+        with self.assertRaises(tools.pdfa.ConversionError) as caught:
+            self.convert_pdfa()
+        for category in ("multimedia", "hidden", "actions", "xfa"):
+            self.assertIn(f"--strip {category}", str(caught.exception))
+        self.convert_pdfa(strip="actions,multimedia,hidden,xfa")
+        with pikepdf.Pdf.open(self.output) as result:
+            annots = list(result.pages[0].Annots)
+            self.assertEqual([a.Subtype for a in annots], [pikepdf.Name.Link])
+            self.assertNotIn("/A", annots[0])
+            self.assertEqual(int(annots[0].F) & 4, 4)
+            self.assertNotIn("/XFA", result.Root.AcroForm)
+        self.assert_pdfa("4")
+
+    def test_pdfa4_attachments_select_4f(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page(page_size=(100, 100))
+        pdf.attachments["notes.txt"] = pikepdf.AttachedFileSpec(
+            pdf, b"hello", filename="notes.txt"
+        )
+        pdf.save(self.source)
+        self.assertEqual(self.convert_pdfa(), "4f")
+        with pikepdf.Pdf.open(self.output) as result:
+            self.assertEqual(result.open_metadata()["pdfaid:conformance"], "F")
+            spec = result.attachments["notes.txt"].obj
+            self.assertEqual(spec.AFRelationship, pikepdf.Name.Unspecified)
+            self.assertEqual(str(spec.UF), "notes.txt")
+            self.assertEqual(str(spec.EF.F.Subtype), "/text/plain")
+        self.assert_pdfa("4f")
+        self.assertEqual(self.convert_pdfa(strip="attachments"), "4")
+        with pikepdf.Pdf.open(self.output) as result:
+            self.assertEqual(len(result.attachments), 0)
+            self.assertNotIn("pdfaid:conformance", result.open_metadata())
+        self.assert_pdfa("4")
+
+    def test_pdfa4_generates_appearances_and_shared_form_resources(self):
+        pdf = pikepdf.Pdf.new()
+        image = image_object(pdf, Image.new("RGB", (8, 8), (200, 30, 30)))
+        form = pdf.make_stream(b"q 40 0 0 40 0 0 cm /Im Do Q")
+        form.Type, form.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+        form.BBox = pikepdf.Array([0, 0, 40, 40])
+        page = pdf.add_blank_page(page_size=(100, 100))
+        page.obj.Resources = pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(Im=image, Fm=form)
+        )
+        page.obj.Contents = pdf.make_stream(b"q 1 0 0 1 10 10 cm /Fm Do Q")
+        page.obj.Annots = pikepdf.Array(
+            [
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name.Annot,
+                    Subtype=pikepdf.Name.Square,
+                    Rect=[60, 60, 90, 90],
+                    C=pikepdf.Array([0, 0, 1]),
+                    F=4,
+                )
+            ]
+        )
+        pdf.save(self.source)
+        self.convert_pdfa()
+        with pikepdf.Pdf.open(self.output) as result:
+            page = result.pages[0]
+            self.assertIsInstance(page.Annots[0].AP.N, pikepdf.Stream)
+            self.assertIn("/Im", page.Resources.XObject.Fm.Resources.XObject)
+        self.assert_pdfa("4")
 
     def test_bitmap_and_mrc(self):
         with pymupdf.open() as doc:

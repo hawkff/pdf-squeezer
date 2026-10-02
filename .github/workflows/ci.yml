@@ -27,7 +27,7 @@ jobs:
       - name: Install PDF tools and test dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
-        run: apt-get update && apt-get install -y --no-install-recommends ghostscript qpdf poppler-utils gcc g++ make libc6-dev ca-certificates git cmake pkg-config libleptonica-dev jbig2dec python3 python3-venv fonts-dejavu-core
+        run: apt-get update && apt-get install -y --no-install-recommends ghostscript qpdf poppler-utils gcc g++ make libc6-dev ca-certificates git cmake pkg-config libleptonica-dev jbig2dec python3 python3-venv fonts-dejavu-core fontconfig fonts-urw-base35 fonts-liberation default-jre-headless curl unzip
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
@@ -46,6 +46,30 @@ jobs:
           cmake -S "$RUNNER_TEMP/jbig2enc" -B "$RUNNER_TEMP/jbig2enc/build" -DCMAKE_BUILD_TYPE=Release
           cmake --build "$RUNNER_TEMP/jbig2enc/build" -j4
           cmake --install "$RUNNER_TEMP/jbig2enc/build"
+      - name: Install veraPDF
+        # The IzPack installer needs an answer file; the GUI pack carries the CLI scripts.
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o verapdf-installer.zip https://software.verapdf.org/releases/verapdf-installer.zip
+          unzip -q verapdf-installer.zip
+          cat > verapdf-auto.xml <<EOF
+          <AutomatedInstallation langpack="eng">
+            <com.izforge.izpack.panels.htmlhello.HTMLHelloPanel id="welcome"/>
+            <com.izforge.izpack.panels.target.TargetPanel id="install_dir"><installpath>$RUNNER_TEMP/verapdf</installpath></com.izforge.izpack.panels.target.TargetPanel>
+            <com.izforge.izpack.panels.packs.PacksPanel id="sdk_pack_select">
+              <pack index="0" name="veraPDF GUI" selected="true"/>
+              <pack index="1" name="veraPDF Mac and *nix Scripts" selected="true"/>
+              <pack index="2" name="veraPDF Validation model" selected="false"/>
+              <pack index="3" name="veraPDF Documentation" selected="false"/>
+              <pack index="4" name="veraPDF Sample Plugins" selected="false"/>
+            </com.izforge.izpack.panels.packs.PacksPanel>
+            <com.izforge.izpack.panels.install.InstallPanel id="install"/>
+            <com.izforge.izpack.panels.finish.FinishPanel id="finish"/>
+          </AutomatedInstallation>
+          EOF
+          verapdf-*/verapdf-install verapdf-auto.xml
+          echo "$RUNNER_TEMP/verapdf" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/verapdf/verapdf" --version
       - name: Check formatting and Python lint
         run: |
           test -z "$(gofmt -l .)"

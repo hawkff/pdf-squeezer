@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -379,6 +380,8 @@ func TestOptionsRejectConflicts(t *testing.T) {
 		{"--strip", "forms", "--flatten", "forms"}, {"--privacy", "--metadata", "Title=test"},
 		{"--bitmap", "--mrc"}, {"--extract", "images", "--gray"},
 		{"--encrypt-user-file", "example.txt"}, {"--flatten", "all,links"},
+		{"--pdfa4", "--privacy"}, {"--pdfa4", "--strip", "output-intents"}, {"--output-intent", "profile.icc"},
+		{"--pdfa4", "--font-file", "Arial"}, {"--strip", "javascript"}, {"--extract", "text", "--pdfa4"},
 	} {
 		if _, _, _, err := parseOptions(t.Context(), append(args, "input.pdf"), io.Discard); err == nil {
 			t.Errorf("accepted %v", args)
@@ -386,10 +389,17 @@ func TestOptionsRejectConflicts(t *testing.T) {
 	}
 }
 
-func TestAdvancedCLI(t *testing.T) {
-	if os.Getenv("PDF_SQUEEZER_INTEGRATION") != "1" {
-		t.Skip("optional tool integration")
-	}
+// pdfa4PDF declares PDF/A-4 in XMP; the stub validator decides compliance.
+func pdfa4PDF() []byte {
+	xmp := `<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/" pdfaid:part="4" pdfaid:rev="2020"/></rdf:RDF></x:xmpmeta>`
+	return buildPDF(0,
+		"<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> >>",
+		fmt.Sprintf("<< /Type /Metadata /Subtype /XML /Length %d >>\nstream\n%s\nendstream", len(xmp), xmp))
+}
+
+func requirePythonTools(t *testing.T) {
+	t.Helper()
 	python := os.Getenv("PDF_SQUEEZER_PYTHON")
 	if python == "" {
 		python = "python3"
@@ -397,6 +407,131 @@ func TestAdvancedCLI(t *testing.T) {
 	if err := exec.Command(python, "-c", "import pikepdf, pymupdf, PIL, fontTools").Run(); err != nil {
 		t.Fatal("optional Python tools are required")
 	}
+}
+
+func TestPDFAValidationFailsClosed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX tool stub")
+	}
+	dir := t.TempDir()
+	document := filepath.Join(dir, "declared.pdf")
+	writeFile(t, document, pdfa4PDF())
+	failure := `<report><jobs><job><validationReport profileName="PDF/A-4 validation profile" isCompliant="false"><details>` +
+		`<rule specification="ISO 19005-4:2020" clause="6.2.10.4.1" testNumber="1" status="failed"><description>The font programs for all fonts used for rendering within a conforming file shall be embedded</description>` +
+		`<check status="failed"><context>root/document[0]/pages[0](3 0 obj PDPage)/contentStream[0](4 0 obj PDContentStream)/operators[3]/font[0](Helvetica)</context></check></rule>` +
+		`<rule specification="ISO 19005-4:2020" clause="6.1.3" testNumber="1" status="passed"><description>irrelevant</description></rule>` +
+		`</details></validationReport></job></jobs></report>`
+	for report, want := range map[string]string{
+		`<report><jobs><job><validationReport profileName="PDF/A-4 validation profile" isCompliant="true"/></job></jobs></report>`: "",
+		failure: "fonts 6.2.10.4.1-1",
+		`<report><jobs><job><validationReport profileName="PDF/A-2B validation profile" isCompliant="true"/></job></jobs></report>`: "did not confirm",
+		`<report/>`:  "exactly one",
+		`broken xml`: "veraPDF report",
+		``:           "no report",
+	} {
+		path := filepath.Join(dir, "verapdf")
+		writeFile(t, path, []byte("#!/bin/sh\nprintf '%s' '"+report+"'\n"))
+		if err := os.Chmod(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", dir)
+		err := validatePDFA(t.Context(), document, io.Discard)
+		if want == "" && err != nil {
+			t.Fatalf("compliant report rejected: %v", err)
+		}
+		if want != "" && (err == nil || !strings.Contains(err.Error(), want)) {
+			t.Fatalf("report %.60s: got %v, want %q", report, err, want)
+		}
+		if report == failure && !strings.Contains(err.Error(), "object 4 Helvetica") {
+			t.Fatalf("diagnostics lack the object: %v", err)
+		}
+	}
+	plain := filepath.Join(dir, "plain.pdf")
+	writeFile(t, plain, testPDF(0))
+	if err := validatePDFA(t.Context(), plain, io.Discard); err == nil || !strings.Contains(err.Error(), "declare") {
+		t.Fatalf("undeclared document accepted: %v", err)
+	}
+}
+
+func TestPDFA4FailsClosedWithoutTools(t *testing.T) {
+	dir := t.TempDir()
+	input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+	writeFile(t, input, testPDF(0))
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("PDF_SQUEEZER_PYTHON", "")
+	if err := run(t.Context(), []string{"--pdfa4", "-o", output, input}, io.Discard, io.Discard); err == nil {
+		t.Fatal("PDF/A-4 succeeded without its tools")
+	}
+	assertMissing(t, output)
+	assertNoTemps(t, dir)
+}
+
+func TestPDFA4Conversion(t *testing.T) {
+	if os.Getenv("PDF_SQUEEZER_INTEGRATION") != "1" {
+		t.Skip("optional tool integration")
+	}
+	requireTool(t, "verapdf")
+	requireTool(t, "qpdf")
+	requirePythonTools(t)
+	dir := t.TempDir()
+	input := filepath.Join(dir, "text.pdf")
+	writeFile(t, input, testPDF(0))
+	output := filepath.Join(dir, "text-a4.pdf")
+	var messages bytes.Buffer
+	if err := run(t.Context(), []string{"--pdfa4", "-V", "-o", output, input}, io.Discard, &messages); err != nil {
+		t.Fatalf("%v\n%s", err, &messages)
+	}
+	if !bytes.HasPrefix(readFile(t, output), []byte("%PDF-2.0")) {
+		t.Fatal("output is not PDF 2.0")
+	}
+	if flavour, err := pdfaFlavour(t.Context(), output); err != nil || flavour != "4" {
+		t.Fatalf("flavour %q, %v", flavour, err)
+	}
+	attached := filepath.Join(dir, "attached.pdf")
+	writeFile(t, attached, buildPDF(0,
+		"<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles << /Names [(note.txt) 4 0 R] >> >> >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> >>",
+		"<< /Type /Filespec /F (note.txt) /EF << /F 5 0 R >> >>",
+		"<< /Type /EmbeddedFile /Length 5 >>\nstream\nhello\nendstream"))
+	for _, c := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"attachments", []string{"--pdfa4"}, "4f"},
+		{"stripped", []string{"--pdfa4", "--strip", "attachments"}, "4"},
+	} {
+		out := filepath.Join(dir, c.name+".pdf")
+		messages.Reset()
+		if err := run(t.Context(), append(c.args, "-o", out, attached), io.Discard, &messages); err != nil {
+			t.Fatalf("%s: %v\n%s", c.name, err, &messages)
+		}
+		if flavour, err := pdfaFlavour(t.Context(), out); err != nil || flavour != c.want {
+			t.Fatalf("%s: flavour %q, %v", c.name, flavour, err)
+		}
+	}
+	cmyk := filepath.Join(dir, "cmyk.pdf")
+	content := "0 0 0 1 k 10 10 50 50 re f\n"
+	writeFile(t, cmyk, buildPDF(0,
+		"<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content)))
+	failed := filepath.Join(dir, "cmyk-a4.pdf")
+	messages.Reset()
+	err := run(t.Context(), []string{"--pdfa4", "-o", failed, cmyk}, io.Discard, &messages)
+	if err == nil || !strings.Contains(messages.String(), "--output-intent") {
+		t.Fatalf("DeviceCMYK without a CMYK intent: %v\n%s", err, &messages)
+	}
+	assertMissing(t, failed)
+	assertNoTemps(t, dir)
+}
+
+func TestAdvancedCLI(t *testing.T) {
+	if os.Getenv("PDF_SQUEEZER_INTEGRATION") != "1" {
+		t.Skip("optional tool integration")
+	}
+	requirePythonTools(t)
 	dir := t.TempDir()
 	input := filepath.Join(dir, "in.pdf")
 	writeFile(t, input, imagePDF(8, "DeviceRGB", "", bytes.Repeat([]byte{30, 80, 140}, 4096)))
