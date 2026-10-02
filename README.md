@@ -1,81 +1,202 @@
 # pdf-squeezer
 
-A PDF compressor written in Go.
+A PDF compressor written in Go. Default compression needs no external software. Optional local tools add image cropping, scan codecs, font optimization, and document conversion.
 
 ## Install
 
-Download a binary for Linux, macOS, or Windows from the [releases page](https://github.com/hawkff/pdf-squeezer/releases), or build from source with Go 1.26 or newer:
+Download a binary for Linux, macOS, or Windows from the [releases page](https://github.com/hawkff/pdf-squeezer/releases), or install with Go 1.26 or newer:
 
 ```sh
 go install github.com/hawkff/pdf-squeezer@latest
 ```
 
-The default engine, [pdfcpu](https://pdfcpu.io), needs no other software. For the Ghostscript engine, install a current, security-patched version and put `gs` on your `PATH`. On Windows, the CLI also looks for `gswin64c` and `gswin32c`.
-
-```sh
-# macOS
-brew install ghostscript
-
-# Debian / Ubuntu
-sudo apt-get install ghostscript
-```
-
 ## Use
 
 ```sh
-# Lossless optimization, writes document.squeezed.pdf next to the input
+# Structural optimization; writes document.squeezed.pdf next to the input
 pdf-squeezer document.pdf
 
-# Choose an output path
-pdf-squeezer -o smaller.pdf document.pdf
+# Choose an output file or existing directory
+pdf-squeezer document.pdf -o smaller.pdf
+pdf-squeezer document.pdf -o out/
 
-# Write document.squeezed.pdf into the current directory
-pdf-squeezer document.pdf -o .
+# Re-encode images, permitting lossy JPEG
+pdf-squeezer --images --image-quality 75 scan.pdf
 
-# Reduce image quality with Ghostscript
-pdf-squeezer --engine ghostscript --quality ebook -o smaller.pdf scan.pdf
+# Re-encode without discarding sample precision or recompressing JPEG
+pdf-squeezer --lossless document.pdf
 
-# Ghostscript with images resampled to 100 dpi, everything in grayscale
-pdf-squeezer --engine ghostscript --dpi 100 --gray scan.pdf
+# Multiple files, or PDFs in a directory tree
+pdf-squeezer first.pdf second.pdf -o out/
+pdf-squeezer --recursive documents/ -o out/
 
-# Re-encode images without Ghostscript
-pdf-squeezer --images document.pdf
-
-# Every PDF below the current directory, each output next to its original
-fd -e pdf -E '*.squeezed.pdf' -x pdf-squeezer {}
-
-# Drop document metadata as well
+# Strip identifying document metadata
 pdf-squeezer --privacy document.pdf
 
-# Report each step on stderr, including Ghostscript's own progress
-pdf-squeezer -V document.pdf
-
-pdf-squeezer --version
 pdf-squeezer --help
+pdf-squeezer --version
 ```
 
-Short flags: `-o` output file or directory, `-V` verbose, `-v` version, `-h` help. Flags may come before or after the filename. Use `--` before a filename that starts with a dash.
+Flags may come before or after filenames. Use `--` before a filename that starts with a dash. Short flags are `-o` output, `-V` verbose, `-v` version, and `-h` help.
 
-`--engine pdfcpu` is the default. It removes redundant PDF objects and compresses document structure without downsampling images. Already optimized PDFs may not shrink.
+The CLI leaves inputs unchanged and refuses to overwrite outputs, including symlinks. `--collision number` chooses a numbered name instead. Directory scans skip hidden files, symlinks, and generated `.squeezed.pdf` or `.squeezed.N.pdf` outputs. Batch output retains relative subdirectories beneath an existing output directory. A batch reports individual failures and returns a failing exit status if any input fails.
 
-`--engine ghostscript` rewrites the PDF and can downsample images. Choose `--quality screen` for low-resolution output, `ebook` for medium resolution, or `printer` / `prepress` for print-oriented output. The default is `ebook`. These presets change more than resolution and can reduce quality. Colors stay in their original color spaces unless `--gray` converts everything to grayscale. `--dpi N` resamples color and gray images that exceed 1.5 times N dpi down to N; monochrome images keep the preset's resolution because downsampling them costs legibility. `--quality`, `--dpi`, and `--gray` only apply to Ghostscript.
+Compression keeps the original bytes when the result would be no smaller. Explicit document changes, including privacy, metadata edits, grayscale, encryption, removals, flattening, and raster conversion, keep their result even when it is larger. `--force-recompression` also disables the size fallback. Unsupported or unsafe images remain untouched even with that flag.
 
-`--images` re-encodes images with the pdfcpu engine and no external software. It only touches 8- or 16-bit gray and RGB images stored losslessly or as a single JPEG. An RGB image whose pixels are all exactly gray becomes DeviceGray, a gray image holding only black and white becomes 1-bit, 16-bit samples become 8-bit, and each image then keeps the smaller of Flate with PNG predictors and JPEG at quality 75. The original bytes stay unless the re-encode saves at least 2% and 1 KiB. Image masks, images with `/Mask` or `/Decode` entries, indexed and CMYK images, soft masks (kept lossless), and anything with other filters are left byte for byte. Photos stored losslessly can come out as JPEG, so treat `--images` as lossy.
+## Image compression
 
-If Ghostscript cannot decode an image, it would normally leave the page blank. The CLI stops with an error instead, so a Ghostscript error on a file that other viewers open usually means that file needs `--engine pdfcpu`.
+`--images` handles supported 1-, 8-, and 16-bit image samples. It compares Flate compression with PNG predictors against JPEG, with configurable `--image-quality 1..100` and `--image-codecs flate,jpeg`. A native re-encode normally needs to save at least 2% and 1 KiB.
 
-The CLI prints the input and output sizes. If compression would not make the PDF smaller, it copies the original bytes to the output instead, unless `--privacy` is set.
+The lossy path can reduce exactly gray DeviceRGB samples to DeviceGray and exact black-and-white gray samples to 1-bit. It preserves ICC color spaces and avoids grayscale reclassification when the document overrides default color spaces. `--lossless` forbids JPEG re-encoding, color-space changes, downsampling, and bit-depth reduction. Existing JPEG data stays encoded in that mode.
 
-`--privacy` works with both engines. It empties the document information dictionary (title, author, subject, keywords, creator, producer, dates), removes XMP metadata streams, application piece info, and web capture information from every object, and gives the file a fresh identifier. Page content, annotations, form fields, and attachments stay as they are, so names in comments or embedded files remain. Check those separately.
+16-bit samples retain their precision unless `--reduce-bit-depth` permits an 8-bit conversion. Soft masks retain their precision regardless of that flag. Matte-backed images, explicit masks, indexed images, unsupported transfer functions, and unknown filters stay unchanged. The native pass handles identity and inversion `/Decode` arrays and lossless CMYK streams. Use `--extended-images` for supported JPEG 2000 and CMYK JPEG decoding through the optional tools.
 
-## File safety and limitations
+`--image-memory 512` sets the native image working-buffer budget in MiB. Workers share this budget and release decoded buffers after each job. It is an estimate, not a process-wide memory ceiling: the parsed document and encoded output also occupy memory. Images above the sample limit or working budget stay unchanged. `-V` reports progress and preservation reasons. Interrupting the CLI cancels processing and terminates optional tool process groups where supported.
 
-- The CLI leaves the input unchanged and refuses to overwrite an existing output, including a symlink.
-- The output directory must already exist. The CLI stages compression in a temporary file there, then creates the destination with exclusive access. It removes partial output after a reported write failure. A crash or power loss during the final copy can leave an incomplete destination. Remove that file before retrying.
-- Keep enough free disk space for the temporary PDF and the final copy. New files use owner-only permissions where the filesystem supports them.
-- Compression can invalidate digital signatures. Ghostscript can also change or discard forms, annotations, accessibility tags, attachments, and encryption. Keep originals and inspect the result before sharing it. Use another tool for signed or password-protected documents.
-- Both engines process files on your machine. The CLI does not upload PDFs. Keep Ghostscript updated before processing untrusted files.
+After image transformations, the CLI deduplicates equivalent streams. It compares decoded bytes for generalized lossless filters, retains encoding parameters for specialized image codecs, and keeps the smallest equivalent encoding. It also enables pdfcpu's duplicate-content-stream optimization.
+
+## Optional tools
+
+Nothing is installed automatically. A requested tool that is missing or fails stops that operation; the CLI does not silently select another engine.
+
+For the Python operations, create an environment and install `tools/requirements.txt` from this repository, or the release's `pdf-tools-requirements.txt`:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r tools/requirements.txt
+export PDF_SQUEEZER_PYTHON="$PWD/.venv/bin/python"
+```
+
+On Windows, set `PDF_SQUEEZER_PYTHON` to the environment's `Scripts\python.exe`. Otherwise the CLI looks for `python3` on `PATH`. The processing script is embedded in the Go binary; users do not need to copy it beside the executable.
+
+The optional dependencies have their own licenses. In particular, Ghostscript and PyMuPDF/MuPDF use AGPL or commercial licensing. They are separate installations, not bundled third-party binaries.
+
+### Placement-aware images and scan codecs
+
+```sh
+# Downsample according to displayed size, without Ghostscript
+pdf-squeezer --dpi 120 --gray-dpi 150 scan.pdf
+
+# Crop unused margins and include inline images
+pdf-squeezer --images --clip-images --inline-images document.pdf
+
+# Compare lossless monochrome codecs
+pdf-squeezer --images --mono-codecs flate,ccitt,jbig2 scan.pdf
+
+# Optional monochrome downsampling
+pdf-squeezer --mono-dpi 300 --mono-codecs flate,ccitt,jbig2 scan.pdf
+```
+
+These operations use pikepdf and Pillow. Inline-image externalization uses `qpdf`. CCITT Group 4 requires Pillow's libtiff support. JBIG2 requires [jbig2enc](https://github.com/agl/jbig2enc)'s `jbig2` executable. Its generic-region encoding is lossless; the CLI never enables lossy symbol substitution. Install `jbig2dec` as well to decode existing JBIG2 images through pikepdf.
+
+`--dpi` targets color and gray images; `--gray-dpi` overrides gray resolution. Monochrome resolution stays unchanged unless `--mono-dpi` is supplied. Images must exceed the target times `--dpi-threshold`, which defaults to 1.5, before downsampling. A shared image uses the most demanding placement across pages and nested forms, including `/UserUnit` and affine transforms.
+
+Cropping unions visible bounds across shared uses and adjusts drawing transforms. It retains a border for interpolation and only crops axis-aligned placements. Lossless mode additionally preserves images on fractional or downsampled display grids to avoid changing a viewer's sampling. It preserves images used in masks, annotation appearances, patterns, or unanalysed forms rather than guessing their placement. Complex clipping paths use conservative bounding boxes. Downsampling remains lossy; inspect fine text before sharing scans.
+
+For monochrome images, the codec comparison may retain full resolution when a smaller lossless encoding costs no more than 3.5 times the downsampled candidate. This favors small-text legibility over minimum byte count.
+
+### Ghostscript
+
+Install a current, security-patched Ghostscript and put `gs` on `PATH`. Windows also supports `gswin64c` and `gswin32c`.
+
+```sh
+pdf-squeezer --engine ghostscript --quality ebook scan.pdf
+pdf-squeezer --engine ghostscript --dpi 100 --gray scan.pdf
+```
+
+Presets are `screen`, `ebook`, `printer`, and `prepress`. The default is `ebook`. They change more than image resolution. Colors retain their original color spaces unless `--gray` requests conversion. With the pdfcpu engine, `--gray` uses the optional Python tools and also converts text and vectors.
+
+If Ghostscript reports an image-decoding failure that would leave a blank page, the CLI rejects its output. Try the pdfcpu engine for that file.
+
+### Fonts and flattening
+
+```sh
+pdf-squeezer --subset-fonts --merge-fonts document.pdf
+pdf-squeezer --flatten forms,annotations document.pdf
+pdf-squeezer --flatten links document.pdf
+pdf-squeezer --convert-fonts-cff document.pdf
+```
+
+Font subsetting uses MuPDF. Font merging uses fontTools and combines compatible retained-glyph-ID TrueType subsets without rewriting text. It preserves each font's character mapping and excludes incompatible programs and unsupported consumers. It is not a general merger for every font format.
+
+`--convert-fonts-cff` rewrites through Ghostscript's PDF writer with compact font programs. This is a document rewrite, not a byte-preserving font patch. `--remove-standard-fonts` is a separate opt-in option for eligible embedded copies of the standard PDF fonts; it makes rendering depend on viewer-provided substitutes.
+
+Flattening freezes selected form fields, annotations, or links into page content. `--flatten all` selects every category. A visible link border without a usable appearance stream causes an error rather than disappearing. Comments, attached annotation data, and editability may be lost. Flattening is not redaction and does not securely remove underlying page content.
+
+## Profiles and document controls
+
+```sh
+pdf-squeezer --images --image-quality 70 --save-profile web.profile.json
+pdf-squeezer --profile web.profile.json document.pdf
+
+# Explicit flags override profile values
+pdf-squeezer --profile web.profile.json --image-quality 85 document.pdf
+
+pdf-squeezer --metadata 'Title=Public report' --metadata 'Author=' document.pdf
+pdf-squeezer --strip thumbnails,alternates,piece-info document.pdf
+pdf-squeezer --timestamps now document.pdf
+```
+
+Profiles are versioned JSON. They contain settings and optional metadata, never input/output paths, password files, or password values. They use this app's format, not another application's exported profile format. A profile may request destructive transformations, so inspect profiles before using them.
+
+`--metadata KEY=VALUE` is repeatable. Supported keys are `Title`, `Author`, `Subject`, `Keywords`, `Creator`, `Producer`, `CreationDate`, and `ModDate`. An empty value removes that key. Dates use `D:YYYYMMDDhhmmssZ`. Editing these fields removes XMP copies that could retain contradictory values.
+
+`--timestamps preserve` retains existing document dates and the input's filesystem modification time. It is the default. `--timestamps now` updates document creation/modification dates and leaves the output with its new filesystem timestamp. The CLI does not promise portable filesystem birth-time preservation.
+
+`--privacy` empties the document information dictionary, removes XMP metadata, application piece information, and web-capture information, and creates a fresh document identifier. Page content, comments, form values, and attachments can still contain personal information. Check those separately.
+
+`--strip` accepts a comma-separated list:
+
+- `thumbnails`, `alternates`, `threads`, `piece-info`, or `metadata`. Here `metadata` means XMP; use `--privacy` to clear document information too.
+- `tags` removes accessibility structure and reading-order information.
+- `output-intents` removes document color/output-intent information.
+- `links`, `annotations`, or `forms` removes those objects rather than flattening their appearances.
+- `images` removes image drawing objects, including externalized inline images.
+
+None of these removals is enabled by default. Do not remove accessibility tags or color information merely to save a few bytes.
+
+## Passwords and encryption
+
+```sh
+pdf-squeezer --password-file reader-password.txt protected.pdf
+pdf-squeezer --password-file owner-password.txt --decrypt protected.pdf
+pdf-squeezer --encrypt-user-file reader-password.txt \
+  --encrypt-owner-file owner-password.txt --permissions print document.pdf
+```
+
+Password files contain one line. Password values never enter command arguments or saved profiles. New encryption uses AES-256 and requires a nonempty owner password different from the user password. Permissions are `all`, `print`, or `none`; PDF viewers determine how they enforce restrictions.
+
+Encrypted inputs require qpdf. The CLI uses private decrypted working copies, then preserves the input's encryption unless `--decrypt` or new output encryption was requested. For a fresh identifier, `--privacy` on encrypted input requires explicit decryption or new encryption. Protect the working filesystem as well as the final document.
+
+## Extraction and raster output
+
+```sh
+pdf-squeezer --extract images -o extracted-images document.pdf
+pdf-squeezer --extract images --inline-images -o extracted-images document.pdf
+pdf-squeezer --extract text -o document.txt document.pdf
+
+pdf-squeezer --bitmap --render-dpi 200 document.pdf
+pdf-squeezer --mrc --render-dpi 300 --background-dpi 72 scan.pdf
+```
+
+Image extraction creates a new directory with object-number-based filenames. For a single input, its `-o` directory must not exist. Native extraction handles supported image XObjects; `--inline-images` includes inline images through qpdf. Text extraction uses MuPDF and creates UTF-8 text with page separators.
+
+Bitmap output replaces pages with rendered images. MRC output separates a high-resolution dark-text mask from a lower-resolution JPEG background. Its luminance threshold suits document scans, not photographs or complex artwork. Both modes discard searchable text, vector objects, interactive fields, links, tags, and attachments. They are opt-in and are not redaction tools.
+
+## File safety
+
+- All output is staged and validated before exclusive destination creation. Inputs and existing outputs are never replaced or moved to Trash.
+- A crash during the final copy can leave an incomplete new destination. Remove it before retrying. A reported write failure removes partial output.
+- Temporary working files and output use private permissions where the filesystem supports them. Keep enough space for intermediates and the final copy.
+- Compression invalidates digital signatures. Ghostscript, font rewriting, flattening, and rasterization can change document features. Keep originals and inspect results.
+- Default compression and the open-source processing tools run locally. Keep PDF parsers and optional tools patched before processing untrusted documents.
+
+## Development
+
+CI runs on Namespace. It runs Go tests with the race detector, `go vet`, formatting checks, Python lint checks, and synthetic render-comparison tests. It cross-compiles standalone binaries for the supported targets.
+
+The tests cover shared-image cropping and DPI, masks and scan codecs, CMYK/JPEG 2000, font merging/subsetting, flattening and raster output. A missing optional dependency must fail without publishing an output.
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE) for this repository's code. Separately installed tools retain their own licenses.

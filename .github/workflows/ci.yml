@@ -24,20 +24,41 @@ jobs:
     container: ubuntu:24.04
     timeout-minutes: 15
     steps:
-      - name: Install Ghostscript, PDF text tools, and a C compiler for the race detector
+      - name: Install PDF tools and test dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
-        run: apt-get update && apt-get install -y --no-install-recommends ghostscript poppler-utils gcc libc6-dev ca-certificates
+        run: apt-get update && apt-get install -y --no-install-recommends ghostscript qpdf poppler-utils gcc g++ make libc6-dev ca-certificates git cmake pkg-config libleptonica-dev jbig2dec python3 python3-venv fonts-dejavu-core
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
-      - name: Check formatting
-        run: test -z "$(gofmt -l .)"
+      - name: Install optional Python tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pdf-tools"
+          "$RUNNER_TEMP/pdf-tools/bin/pip" install -r tools/requirements.txt ruff==0.16.10
+          echo "$RUNNER_TEMP/pdf-tools/bin" >> "$GITHUB_PATH"
+      - name: Install lossless JBIG2 encoder
+        run: |
+          git init "$RUNNER_TEMP/jbig2enc"
+          git -C "$RUNNER_TEMP/jbig2enc" remote add origin https://github.com/agl/jbig2enc.git
+          git -C "$RUNNER_TEMP/jbig2enc" fetch --depth 1 origin d0dfca46216c98f11312a9c9f15615ed490cd7b3
+          git -C "$RUNNER_TEMP/jbig2enc" checkout --detach FETCH_HEAD
+          cmake -S "$RUNNER_TEMP/jbig2enc" -B "$RUNNER_TEMP/jbig2enc/build" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/jbig2enc/build" -j4
+          cmake --install "$RUNNER_TEMP/jbig2enc/build"
+      - name: Check formatting and Python lint
+        run: |
+          test -z "$(gofmt -l .)"
+          ruff check tools
+          ruff format --check tools
       - name: Test both engines
         env:
           PDF_SQUEEZER_INTEGRATION: "1"
         run: go test -race ./...
+      - name: Compare PDF rendering and optional operations
+        env:
+          PDF_SQUEEZER_INTEGRATION: "1"
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
       - name: Vet
         run: go vet ./...
       - name: Cross-compile
@@ -69,6 +90,7 @@ jobs:
             [ "${target%/*}" = windows ] && name="$name.exe"
             CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -trimpath -ldflags="-s -w" -o "$RUNNER_TEMP/dist/$name" .
           done
+          cp tools/requirements.txt "$RUNNER_TEMP/dist/pdf-tools-requirements.txt"
           cd "$RUNNER_TEMP/dist"
           test "$(./pdf-squeezer_linux_amd64 --version)" = "$GITHUB_REF_NAME"
           sha256sum * > checksums.txt
