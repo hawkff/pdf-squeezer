@@ -113,7 +113,22 @@ def rendered(path):
         ]
 
 
-def rendered_samples(path):
+def rendered_samples(path, isolate_pages=False):
+    """Pixels per page. isolate_pages renders each page from a one-page copy, which
+    sidesteps MuPDF caching a resource-less Type 3 font with the first page's
+    resources."""
+    if isolate_pages:
+        samples = []
+        with pikepdf.Pdf.open(path) as source:
+            for index in range(len(source.pages)):
+                single = pikepdf.Pdf.new()
+                single.pages.append(source.pages[index])
+                buffer = io.BytesIO()
+                single.save(buffer)
+                with pymupdf.open(stream=buffer.getvalue(), filetype="pdf") as doc:
+                    pixmap = doc[0].get_pixmap(alpha=False)
+                    samples.append((pixmap.width, pixmap.height, bytes(pixmap.samples)))
+        return samples
     with pymupdf.open(path) as doc:
         pixmaps = [page.get_pixmap(alpha=False) for page in doc]
         return [(p.width, p.height, bytes(p.samples)) for p in pixmaps]
@@ -473,9 +488,12 @@ class PDFToolsTests(unittest.TestCase):
             self.source, self.output, options(**changes), lambda _: None
         )
 
-    def assert_rendering_close(self, before, after, mean_limit=2.0, changed_limit=0.02):
+    def assert_rendering_close(
+        self, before, after, mean_limit=2.0, changed_limit=0.02, isolate_pages=False
+    ):
         """Pages must match within anti-aliasing noise: same size, few changed pixels."""
-        pages_before, pages_after = rendered_samples(before), rendered_samples(after)
+        pages_before = rendered_samples(before, isolate_pages)
+        pages_after = rendered_samples(after, isolate_pages)
         self.assertEqual(len(pages_before), len(pages_after))
         for (width, height, a), (width_after, height_after, b) in zip(
             pages_before, pages_after
@@ -810,6 +828,61 @@ class PDFToolsTests(unittest.TestCase):
             for form, page in zip(forms, result.pages):
                 self.assertEqual(
                     form.Resources.XObject.Im.objgen, page.Resources.XObject.Im.objgen
+                )
+        self.assert_pdfa("4")
+
+    def test_pdfa4_keeps_shared_containers_private_per_context(self):
+        if not fontconfig_file("Nimbus Sans") and not fontconfig_file(
+            "Liberation Sans"
+        ):
+            self.skipTest("no metric-compatible fonts are installed")
+        pdf = pikepdf.Pdf.new()
+        # One indirect XObject dictionary shared by both pages holds a form that
+        # borrows /F1, which each page binds to a different font.
+        form = pdf.make_stream(b"BT /F1 24 Tf 5 5 Td (Ag) Tj ET")
+        form.Type, form.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+        form.BBox = pikepdf.Array([0, 0, 80, 40])
+        xobjects = pdf.make_indirect(pikepdf.Dictionary(Fm=form))
+        # One Type 3 font without resources whose glyph draws with the page's /F1.
+        glyph = pdf.make_stream(b"100 0 d0 BT /F1 80 Tf 10 10 Td (A) Tj ET")
+        type3 = pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name.Font,
+                Subtype=pikepdf.Name.Type3,
+                FontBBox=pikepdf.Array([0, 0, 100, 100]),
+                FontMatrix=pikepdf.Array([0.01, 0, 0, 0.01, 0, 0]),
+                CharProcs=pikepdf.Dictionary(square=glyph),
+                Encoding=pikepdf.Dictionary(
+                    Type=pikepdf.Name.Encoding,
+                    Differences=pikepdf.Array([97, pikepdf.Name.square]),
+                ),
+                FirstChar=97,
+                LastChar=97,
+                Widths=pikepdf.Array([100]),
+            )
+        )
+        for base_font in ("Helvetica", "Courier"):
+            page = pdf.add_blank_page(page_size=(120, 120))
+            page.obj.Resources = pikepdf.Dictionary(
+                XObject=xobjects,
+                Font=pikepdf.Dictionary(F1=simple_font(pdf, base_font), T3=type3),
+            )
+            page.obj.Contents = pdf.make_stream(
+                b"q 1 0 0 1 10 70 cm /Fm Do Q BT /T3 40 Tf 10 10 Td (a) Tj ET"
+            )
+        pdf.save(self.source)
+        self.convert_pdfa()
+        self.assert_rendering_close(self.source, self.output, isolate_pages=True)
+        with pikepdf.Pdf.open(self.output) as result:
+            forms = [page.Resources.XObject.Fm for page in result.pages]
+            self.assertNotEqual(forms[0].objgen, forms[1].objgen)
+            fonts = [page.Resources.Font.T3 for page in result.pages]
+            self.assertNotEqual(fonts[0].objgen, fonts[1].objgen)
+            for page, form, font in zip(result.pages, forms, fonts):
+                expected = page.Resources.Font.F1.objgen
+                self.assertEqual(form.Resources.Font.F1.objgen, expected)
+                self.assertEqual(
+                    font.CharProcs.square.Resources.Font.F1.objgen, expected
                 )
         self.assert_pdfa("4")
 

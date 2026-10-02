@@ -135,65 +135,109 @@ def content_streams(pdf):
 
     Streams are reached through the operators that invoke them, so unused
     resources are skipped. Resource dictionaries become indirect on the way. A
-    stream without its own resources that is reached from a second, different
-    resource context is cloned for that context, so binding resources to it
+    stream (or Type 3 font) without its own resources that is reached from a
+    second, different resource context is cloned for that context, and the
+    name is rebound in a container owned by that context, so binding resources
     never changes what another page draws.
     """
-    bound = {}
+    bound, type3_bound = {}, {}
+
+    def context_key(resources):
+        return resources.objgen if getattr(resources, "is_indirect", False) else None
+
+    def own_container(resources, key):
+        """A resource sub-dictionary, copied into these resources if it is shared."""
+        container = resources.get(key)
+        if isinstance(container, Dictionary) and container.is_indirect:
+            resources[key] = Dictionary(container)
+            container = resources[key]
+        return container if isinstance(container, Dictionary) else None
 
     def visit(owner, resources, owns):
         yield owner, resources, owns
         if not isinstance(resources, Dictionary):
             return
-        xobjects, patterns = resources.get("/XObject"), resources.get("/Pattern")
         for instruction in instructions(owner):
             op, args = str(instruction.operator), instruction.operands
-            if op == "Do" and args and isinstance(xobjects, Dictionary):
-                target = xobjects.get(args[0])
+            if op == "Do" and args:
+                xobjects = resources.get("/XObject")
+                target = (
+                    xobjects.get(args[0]) if isinstance(xobjects, Dictionary) else None
+                )
                 if isinstance(target, Stream) and target.get("/Subtype") == Name.Form:
-                    yield from visit_stream(target, resources, xobjects, args[0])
-            elif op in ("scn", "SCN") and args and isinstance(patterns, Dictionary):
-                target = patterns.get(args[-1]) if isinstance(args[-1], Name) else None
+                    yield from visit_stream(target, resources, "/XObject", args[0])
+            elif op in ("scn", "SCN") and args and isinstance(args[-1], Name):
+                patterns = resources.get("/Pattern")
+                target = (
+                    patterns.get(args[-1]) if isinstance(patterns, Dictionary) else None
+                )
                 if isinstance(target, Stream):
-                    yield from visit_stream(target, resources, patterns, args[-1])
+                    yield from visit_stream(target, resources, "/Pattern", args[-1])
             elif op in ("Tf", "gs") and args:
                 font = selected_font(resources, op, args[0])
                 if isinstance(font, Dictionary) and font.get("/Subtype") == Name.Type3:
-                    procs = font.get("/CharProcs")
-                    glyph_resources = font.get("/Resources")
-                    if (
-                        isinstance(glyph_resources, Dictionary)
-                        and not glyph_resources.is_indirect
-                    ):
-                        font.Resources = pdf.make_indirect(glyph_resources)
-                        glyph_resources = font.Resources
-                    if not isinstance(glyph_resources, Dictionary):
-                        glyph_resources = resources
-                    for name, glyph in (
-                        procs.items() if isinstance(procs, Dictionary) else ()
-                    ):
-                        if isinstance(glyph, Stream):
-                            yield from visit_stream(glyph, glyph_resources, procs, name)
+                    yield from visit_type3(font, resources, op, args[0])
 
-    def visit_stream(stream, resources, container, name):
+    def visit_type3(font, resources, op, name):
+        # Glyph procedures take their resources from the font. A font without
+        # any borrows the context's and is bound to it here; a second, different
+        # context gets its own copy of the font so its glyph clones stay private.
+        key = font.objgen if font.is_indirect else None
+        previous = type3_bound.get(key, False) if key else False
+        own = font.get("/Resources")
+        if previous is not False:
+            if previous != context_key(resources):
+                font = clone_type3(font, resources, op, name)
+            own = font.Resources
+        elif isinstance(own, Dictionary):
+            if not own.is_indirect:
+                font.Resources = pdf.make_indirect(own)
+                own = font.Resources
+        else:
+            if key:
+                type3_bound[key] = context_key(resources)
+            font.Resources = resources
+            own = resources
+        procs = font.get("/CharProcs")
+        if isinstance(procs, Dictionary) and procs.is_indirect:
+            font.CharProcs = Dictionary(procs)
+            procs = font.CharProcs
+        for glyph_name, glyph in procs.items() if isinstance(procs, Dictionary) else ():
+            if isinstance(glyph, Stream):
+                yield from visit_stream(glyph, own, None, glyph_name, procs)
+
+    def clone_type3(font, resources, op, name):
+        copy = pdf.make_indirect(Dictionary(font))
+        copy.Resources = resources
+        if op == "Tf":
+            own_container(resources, "/Font")[name] = copy
+        else:
+            states = own_container(resources, "/ExtGState")
+            states[name] = Dictionary(states[name])
+            states[name].Font = Array([copy, states[name].Font[1]])
+        return copy
+
+    def visit_stream(stream, resources, key, name, container=None):
         own = stream.get("/Resources")
         if isinstance(own, Dictionary) and not own.is_indirect:
             stream.Resources = pdf.make_indirect(own)
             own = stream.Resources
         owns = isinstance(own, Dictionary)
         context = own if owns else resources
-        context_key = context.objgen if getattr(context, "is_indirect", False) else None
         previous = bound.get(stream.objgen, False)
         if previous is not False:
-            if owns or previous == context_key:
+            if owns or previous == context_key(context):
                 return
             clone = pdf.make_stream(stream.read_raw_bytes())
-            for key, value in stream.items():
-                if key != "/Length":
-                    clone[key] = value
-            container[name] = clone
+            for entry, value in stream.items():
+                if entry != "/Length":
+                    clone[entry] = value
+            holder = (
+                container if container is not None else own_container(resources, key)
+            )
+            holder[name] = clone
             stream = clone
-        bound[stream.objgen] = context_key
+        bound[stream.objgen] = context_key(context)
         yield from visit(stream, context, owns)
 
     for page in pdf.pages:
@@ -208,11 +252,15 @@ def content_streams(pdf):
                 continue
             for state_name, state in appearance.items():
                 if isinstance(state, Stream):
-                    yield from visit_stream(state, resources, appearance, state_name)
+                    yield from visit_stream(
+                        state, resources, None, state_name, appearance
+                    )
                 elif isinstance(state, Dictionary):
                     for sub_name, stream in state.items():
                         if isinstance(stream, Stream):
-                            yield from visit_stream(stream, resources, state, sub_name)
+                            yield from visit_stream(
+                                stream, resources, None, sub_name, state
+                            )
 
 
 def selected_font(resources, op, name):
@@ -419,16 +467,19 @@ def device_color_families(pdf):
             if family and family not in defaults:
                 families.add(family)
         if isinstance(resources, Dictionary):
+            # Images and shadings listed in reachable resources; orphans do not count.
             for shading in (resources.get("/Shading") or {}).values():
                 family = color_family(shading.get("/ColorSpace"), resources)
                 if family and family not in defaults:
                     families.add(family)
-    for obj in pdf.objects:
-        image = isinstance(obj, Stream) and obj.get("/Subtype") == Name.Image
-        if image or (isinstance(obj, Dictionary) and "/ShadingType" in obj):
-            family = color_family(obj.get("/ColorSpace"), None)
-            if family:
-                families.add(family)
+            for xobject in (resources.get("/XObject") or {}).values():
+                if (
+                    isinstance(xobject, Stream)
+                    and xobject.get("/Subtype") == Name.Image
+                ):
+                    family = color_family(xobject.get("/ColorSpace"), resources)
+                    if family:
+                        families.add(family)
     return families
 
 
@@ -763,9 +814,14 @@ def file_specifications(pdf):
     specs, seen = [], set()
 
     def add(spec):
-        if isinstance(spec, Dictionary) and "/EF" in spec and spec.objgen not in seen:
+        if not isinstance(spec, Dictionary) or "/EF" not in spec:
+            return
+        # Direct specifications cannot be reached twice; indirect ones can.
+        if spec.is_indirect:
+            if spec.objgen in seen:
+                return
             seen.add(spec.objgen)
-            specs.append(spec)
+        specs.append(spec)
 
     names = pdf.Root.get("/Names")
     if isinstance(names, Dictionary) and "/EmbeddedFiles" in names:
