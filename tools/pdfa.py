@@ -424,7 +424,7 @@ def color_family(space, resources, depth=0):
         if name == "/Pattern":
             return None
         named = (resources.get("/ColorSpace") or {}).get(name) if resources else None
-        return color_family(named, None, depth + 1) if named is not None else None
+        return color_family(named, resources, depth + 1) if named is not None else None
     if isinstance(space, Array) and len(space) > 0:
         kind = pdf_name(space[0])
         if kind in ("/Indexed", "/I") and len(space) > 1:
