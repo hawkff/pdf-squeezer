@@ -251,7 +251,7 @@ def font_usage(pdf):
     caller's font and rendering mode; patterns, glyphs, and appearances start
     with none.
     """
-    used, visited, budget = {}, set(), [200000]
+    used, visited, budget, truncated = {}, set(), [200000], []
 
     def record(font, text, render_mode):
         if font is None or not font.is_indirect or render_mode == 3:
@@ -279,7 +279,10 @@ def font_usage(pdf):
     def walk(owner, resources, font, render_mode, depth):
         holder = owner.obj if isinstance(owner, pikepdf.Page) else owner
         state = (holder.objgen, font.objgen if font is not None else None, render_mode)
-        if depth > 64 or state in visited:
+        if depth > 64:
+            truncated.append(state)
+            return
+        if state in visited:
             return
         visited.add(state)
         xobjects = (
@@ -355,7 +358,7 @@ def font_usage(pdf):
                 for stream in streams:
                     if isinstance(stream, Stream):
                         walk(stream, stream.get("/Resources", resources), None, 0, 1)
-    return None if budget[0] <= 0 else used
+    return None if budget[0] <= 0 or truncated else used
 
 
 def color_family(space, resources, depth=0):
@@ -441,8 +444,10 @@ def annotations(pdf):
 
 def forbidden_action(action, depth=0):
     """Describe why an action chain is not allowed, or return None."""
-    if not isinstance(action, Dictionary) or depth > 32:
+    if not isinstance(action, Dictionary):
         return None
+    if depth > 32:
+        return "action chain deeper than 32 links"
     kind = pdf_name(action.get("/S"))
     if kind not in ALLOWED_ACTIONS:
         return f"{kind or 'untyped'} action"
@@ -1489,7 +1494,7 @@ def repair_embedded_cid_font(descendant, key, program, cids, notes):
         program.Subtype = (
             Name.OpenType if program.read_bytes()[:4] == b"OTTO" else Name.CIDFontType0C
         )
-    if cids is None or not cids or key != "/FontFile2":
+    if cids == set() or key != "/FontFile2":
         return
     try:
         tt = load_font_file(io.BytesIO(program.read_bytes()))
@@ -1497,6 +1502,8 @@ def repair_embedded_cid_font(descendant, key, program, cids, notes):
         return
     scale = 1000 / tt["head"].unitsPerEm
     order = tt.getGlyphOrder()
+    if cids is None:
+        cids = range(len(order))  # usage unknown: align every glyph
     widths, default = cid_widths(descendant)
     mapping = descendant.get("/CIDToGIDMap", Name.Identity)
     table = mapping.read_bytes() if isinstance(mapping, Stream) else None
@@ -1913,7 +1920,8 @@ def clean_to_unicode(text):
 
     def section(text, kind, entry, fix):
         def rewrite(match):
-            body = entry.sub(fix, match.group(3))
+            # Comments carry no mappings; drop them so they are neither counted nor parsed.
+            body = entry.sub(fix, re.sub(r"%[^\r\n]*", "", match.group(3)))
             count = len(entry.findall(body))
             if count == 0:
                 return ""

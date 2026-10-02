@@ -818,7 +818,7 @@ class PDFToolsTests(unittest.TestCase):
             "1 begincodespacerange\n<0000> <FFFE>\nendcodespacerange\n"
             "3 beginbfchar\n<0041> <0000>\n<0042> <0043>\n<0000> <0041>\nendbfchar\n"
             "3 beginbfrange\n<0050> <0052> <0000>\n<0060> <0060> <FEFF>\n"
-            "<0070> <0071> [<0041> <0042>]\n<0080> <0081> [<0000> <0043>]\nendbfrange\n"
+            "<0070> <0071> [<0041> <0042>]\n<0080> <0081> [<0000> % old <0042>\n<0043>]\nendbfrange\n"
         )
         cleaned = tools.pdfa.clean_to_unicode(cmap)
         self.assertIn("<0000> <FFFE>\nendcodespacerange", cleaned)
