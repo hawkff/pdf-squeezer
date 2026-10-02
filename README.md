@@ -1,6 +1,6 @@
 # pdf-squeezer
 
-A PDF compressor written in Go. Default compression needs no external software. Optional local tools add image cropping, scan codecs, font optimization, and document conversion.
+A PDF compressor and PDF/A-4 converter written in Go. Default compression needs no external software. Optional local tools add image cropping, scan codecs, font optimization, and archival conversion.
 
 ## Install
 
@@ -33,6 +33,9 @@ pdf-squeezer --recursive documents/ -o out/
 # Strip identifying document metadata
 pdf-squeezer --privacy document.pdf
 
+# Convert to PDF/A-4, verified by veraPDF
+pdf-squeezer --pdfa4 report.pdf
+
 pdf-squeezer --help
 pdf-squeezer --version
 ```
@@ -41,7 +44,7 @@ Flags may come before or after filenames. Use `--` before a filename that starts
 
 The CLI leaves inputs unchanged and refuses to overwrite outputs, including symlinks. `--collision number` chooses a numbered name instead. Directory scans skip hidden files, symlinks, and generated `.squeezed.pdf` or `.squeezed.N.pdf` outputs. Batch output retains relative subdirectories beneath an existing output directory. A batch reports individual failures and returns a failing exit status if any input fails.
 
-Compression keeps the original bytes when the result would be no smaller. Explicit document changes, including privacy, metadata edits, grayscale, encryption, removals, flattening, and raster conversion, keep their result even when it is larger. `--force-recompression` also disables the size fallback. Unsupported or unsafe images remain untouched even with that flag.
+Compression keeps the original bytes when the result would be no smaller. Explicit document changes, including privacy, metadata edits, grayscale, encryption, removals, flattening, raster conversion, and PDF/A-4 conversion, keep their result even when it is larger. `--force-recompression` also disables the size fallback. Unsupported or unsafe images remain untouched even with that flag.
 
 ## Image compression
 
@@ -69,7 +72,7 @@ export PDF_SQUEEZER_PYTHON="$PWD/.venv/bin/python"
 
 On Windows, set `PDF_SQUEEZER_PYTHON` to the environment's `Scripts\python.exe`. Otherwise the CLI looks for `python3` on `PATH`. The processing script is embedded in the Go binary; users do not need to copy it beside the executable.
 
-The optional dependencies have their own licenses. In particular, Ghostscript and PyMuPDF/MuPDF use AGPL or commercial licensing. They are separate installations, not bundled third-party binaries.
+The optional dependencies have their own licenses. In particular, Ghostscript and PyMuPDF/MuPDF use AGPL or commercial licensing, and veraPDF is GPL/MPL. They are separate installations, not bundled third-party binaries. The binary does embed the ICC sRGB profile `sRGB2014.icc`, which the International Color Consortium distributes without restriction.
 
 ### Placement-aware images and scan codecs
 
@@ -152,8 +155,13 @@ Profiles are versioned JSON. They contain settings and optional metadata, never 
 - `output-intents` removes document color/output-intent information.
 - `links`, `annotations`, or `forms` removes those objects rather than flattening their appearances.
 - `images` removes image drawing objects, including externalized inline images.
+- `actions` removes actions that PDF/A forbids (Launch, Sound, Movie, ResetForm, ImportData, Hide, Rendition, Trans, SetOCGState, GoTo3DView, non-navigation named actions), actions on form fields, and page or document event actions. GoTo, URI, SubmitForm, and JavaScript actions stay.
+- `multimedia` removes Sound, Screen, Movie, 3D, and RichMedia annotations.
+- `hidden` removes hidden and no-view annotations.
+- `xfa` removes XFA form data; the AcroForm fields stay.
+- `attachments` removes embedded files and file attachment annotations.
 
-None of these removals is enabled by default. Do not remove accessibility tags or color information merely to save a few bytes.
+The last five categories use the optional Python tools. None of these removals is enabled by default. Do not remove accessibility tags or color information merely to save a few bytes.
 
 ## Passwords and encryption
 
@@ -167,6 +175,34 @@ pdf-squeezer --encrypt-user-file reader-password.txt \
 Password files contain one line. Password values never enter command arguments or saved profiles. New encryption uses AES-256 and requires a nonempty owner password different from the user password. Permissions are `all`, `print`, or `none`; PDF viewers determine how they enforce restrictions.
 
 Encrypted inputs require qpdf. The CLI uses private decrypted working copies, then preserves the input's encryption unless `--decrypt` or new output encryption was requested. For a fresh identifier, `--privacy` on encrypted input requires explicit decryption or new encryption. Protect the working filesystem as well as the final document.
+
+## PDF/A-4
+
+```sh
+pdf-squeezer --pdfa4 report.pdf
+pdf-squeezer --pdfa4 --output-intent ISOcoated_v2.icc brochure.pdf
+pdf-squeezer --pdfa4 --font-file 'Verdana=/path/to/verdana.ttf' slides.pdf
+pdf-squeezer --pdfa4 --strip actions,hidden form.pdf
+pdf-squeezer --pdfa4 --images --image-quality 80 scan.pdf
+```
+
+`--pdfa4` converts the compressed document to PDF/A-4 (ISO 19005-4) and publishes it only after [veraPDF](https://verapdf.org/) confirms compliance. Documents with embedded files become PDF/A-4f. Ghostscript cannot produce PDF/A-4, so the conversion is this project's own code on top of pikepdf, fontTools, and MuPDF.
+
+It requires the Python tools, qpdf, veraPDF with a Java runtime on `PATH`, and fontconfig with metric-compatible fonts for the standard 14 fonts: the URW Base35 family (`fonts-urw-base35`) or Liberation (`fonts-liberation`).
+
+The converter repairs what it can without changing page content:
+
+- PDF 2.0 header, file identifier, XMP identification, document information moved into XMP, and PDF 2.0 deprecations such as LZW streams, transfer functions, halftone settings, image alternates, OPI, reference XObjects, and interpolation flags.
+- Resources inherited by form XObjects, annotation appearances, patterns, and Type 3 glyphs become explicit.
+- Missing appearance streams for annotations and form fields are generated with MuPDF.
+- Non-embedded Helvetica, Times, Courier, Symbol, ZapfDingbats, and their Arial, Times New Roman, and Courier New aliases are embedded from a metric-compatible font. The document's glyph widths must match; otherwise supply a font with `--font-file NAME=PATH`. A supplied font keeps the document's widths: its glyph advances are set to them, so text does not move. Composite (Type 0) fonts need the original TrueType file through `--font-file`, because their glyph identifiers only match that file.
+- Embedded fonts get consistent widths (font programs are patched, so layout does not change), TrueType cmap subtables, symbolic encoding rules, CIDToGIDMap entries, and valid ToUnicode mappings. Fonts and glyphs count as used only when drawn, including through forms, patterns, Type 3 glyphs, and appearance streams; text in rendering mode 3 does not require embedding.
+- An output intent is added. The bundled sRGB profile covers DeviceGray and DeviceRGB content. DeviceCMYK content needs a CMYK ICC profile through `--output-intent`; the converter then adds a DefaultRGB color space for any RGB content.
+- Optional content configurations, permissions, and embedded file specifications (MIME type, names, `AFRelationship`) are normalized.
+
+It refuses to guess. Forbidden features stop the conversion with the object number and the `--strip` category that removes them: forbidden actions, multimedia annotations, hidden annotations, XFA data, or attachments for a plain PDF/A-4. Unavailable fonts, mismatched widths, and ambiguous color conversions produce errors that name the font or the profile to supply. When veraPDF still rejects the result, the diagnostics list each failed rule with its clause, the affected objects, and the option that resolves it. Nothing is flattened, rasterized, or discarded to pass validation; `-V` reports every repair.
+
+PDF/A forbids encryption and requires metadata, color information, and embedded fonts, so `--pdfa4` rejects output encryption, `--privacy`, `--strip metadata`, `--strip output-intents`, and `--remove-standard-fonts`. Encrypted input needs `--decrypt`. Known limits: non-Identity CMaps and CFF-based CIDFonts without embedded programs, glyphs missing from embedded fonts, and JPEG 2000 streams that violate PDF/A constraints are reported, not repaired.
 
 ## Extraction and raster output
 
@@ -188,14 +224,14 @@ Bitmap output replaces pages with rendered images. MRC output separates a high-r
 - All output is staged and validated before exclusive destination creation. Inputs and existing outputs are never replaced or moved to Trash.
 - A crash during the final copy can leave an incomplete new destination. Remove it before retrying. A reported write failure removes partial output.
 - Temporary working files and output use private permissions where the filesystem supports them. Keep enough space for intermediates and the final copy.
-- Compression invalidates digital signatures. Ghostscript, font rewriting, flattening, and rasterization can change document features. Keep originals and inspect results.
+- Compression invalidates digital signatures. Ghostscript, font rewriting, flattening, rasterization, and PDF/A-4 conversion can change document features. Keep originals and inspect results.
 - Default compression and the open-source processing tools run locally. Keep PDF parsers and optional tools patched before processing untrusted documents.
 
 ## Development
 
 CI runs on Namespace. It runs Go tests with the race detector, `go vet`, formatting checks, Python lint checks, and synthetic render-comparison tests. It cross-compiles standalone binaries for the supported targets.
 
-The tests cover shared-image cropping and DPI, masks and scan codecs, CMYK/JPEG 2000, font merging/subsetting, flattening and raster output. A missing optional dependency must fail without publishing an output.
+The tests cover shared-image cropping and DPI, masks and scan codecs, CMYK/JPEG 2000, font merging/subsetting, flattening and raster output, and PDF/A-4 conversion of fonts, color, attachments, annotations, and forbidden features, each verified with veraPDF. A missing optional dependency or a noncompliant validator report must fail without publishing an output.
 
 ## License
 

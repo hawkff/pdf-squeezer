@@ -14,6 +14,9 @@ import tempfile
 import zlib
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pdfa  # sibling module next to this script
+
 MAX_SAMPLES = 256 << 20
 FULL_RESOLUTION_SIZE_RATIO = 3.5
 IDENTITY = (1, 0, 0, 1, 0, 0)
@@ -78,17 +81,7 @@ def visible(r):
     return r[2] > r[0] and r[3] > r[1]
 
 
-def inherited(obj, key, default=None):
-    seen = set()
-    for _ in range(100):
-        if key in obj:
-            return obj[key]
-        identity = obj.objgen
-        if identity in seen or "/Parent" not in obj:
-            return default
-        seen.add(identity)
-        obj = obj.Parent
-    raise ValueError("page inheritance exceeds depth limit")
+inherited = pdfa.inherited
 
 
 def collect_images(obj, found, seen=None, depth=0):
@@ -1102,6 +1095,9 @@ def transform(source, output, options):
             or options["mono_codecs"] != "flate"
         ):
             process_images(pdf, options)
+        strip = [s for s in options.get("strip", "").split(",") if s]
+        if any(category in pdfa.STRIP_CATEGORIES for category in strip):
+            pdfa.strip_features(pdf, strip, None)
         if options["merge_fonts"]:
             merge_fonts(pdf, options["verbose"])
         if options["flatten"] == "all" or "links" in options["flatten"].split(","):
@@ -1171,6 +1167,8 @@ def main():
         with pikepdf.Pdf.open(source) as pdf:
             process_images(pdf, options)
             pdf.save(output, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+    elif operation == "pdfa4":
+        pdfa.convert(source, output, options, message)
     elif operation == "text":
         extract_text(source, output, options)
     else:
@@ -1184,6 +1182,9 @@ if __name__ == "__main__":
         message(
             f"Missing optional module {exc.name}. Install tools/requirements.txt in PDF_SQUEEZER_PYTHON's environment."
         )
+        sys.exit(1)
+    except pdfa.ConversionError as exc:
+        message(f"PDF/A-4: {exc}")
         sys.exit(1)
     except Exception as exc:  # noqa: BLE001 -- redact exceptions at the process boundary
         # Do not include tracebacks or input options, which may contain passwords.

@@ -6,6 +6,7 @@ import io
 import os
 import random
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -46,9 +47,45 @@ def options(**changes):
         "render_dpi": 200,
         "background_dpi": 72,
         "verbose": True,
+        "strip": "",
+        "font_files": {},
+        "output_intent": "",
+        "srgb_icc": str(Path(__file__).with_name("sRGB2014.icc")),
     }
     result.update(changes)
     return result
+
+
+def text_page(pdf, fonts, content, size=(200, 100)):
+    page = pdf.add_blank_page(page_size=size)
+    page.obj.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(**fonts))
+    page.obj.Contents = pdf.make_stream(content)
+    return page
+
+
+def simple_font(pdf, base_font, **extra):
+    return pdf.make_indirect(
+        pikepdf.Dictionary(
+            Type=pikepdf.Name.Font,
+            Subtype=pikepdf.Name.Type1,
+            BaseFont=pikepdf.Name("/" + base_font),
+            **extra,
+        )
+    )
+
+
+def fontconfig_file(family):
+    binary = shutil.which("fc-match")
+    if not binary:
+        return None
+    result = subprocess.run(
+        [binary, "-f", "%{family}|%{file}", family],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    matched, _, path = result.stdout.partition("|")
+    return path if family.lower() in matched.lower() else None
 
 
 def image_object(pdf, image):
@@ -74,6 +111,35 @@ def rendered(path):
             )
             for page in doc
         ]
+
+
+def rendered_samples(path, isolate_pages=False):
+    """Pixels per page. isolate_pages renders each page from a one-page copy, which
+    sidesteps MuPDF caching a resource-less Type 3 font with the first page's
+    resources."""
+    if isolate_pages:
+        samples = []
+        with pikepdf.Pdf.open(path) as source:
+            for index in range(len(source.pages)):
+                single = pikepdf.Pdf.new()
+                single.pages.append(source.pages[index])
+                buffer = io.BytesIO()
+                single.save(buffer)
+                with pymupdf.open(stream=buffer.getvalue(), filetype="pdf") as doc:
+                    pixmap = doc[0].get_pixmap(alpha=False)
+                    samples.append((pixmap.width, pixmap.height, bytes(pixmap.samples)))
+        return samples
+    with pymupdf.open(path) as doc:
+        pixmaps = [page.get_pixmap(alpha=False) for page in doc]
+        return [(p.width, p.height, bytes(p.samples)) for p in pixmaps]
+
+
+def embedded_program(font):
+    from fontTools.ttLib import TTFont
+
+    descriptor = font.FontDescriptor
+    key = "/FontFile2" if "/FontFile2" in descriptor else "/FontFile3"
+    return TTFont(io.BytesIO(descriptor[key].read_bytes()))
 
 
 class PDFToolsTests(unittest.TestCase):
@@ -416,6 +482,460 @@ class PDFToolsTests(unittest.TestCase):
         with pymupdf.open(self.output) as doc:
             self.assertFalse(doc.is_form_pdf)
             self.assertIn("VISIBLE", doc[0].get_text())
+
+    def convert_pdfa(self, **changes):
+        return tools.pdfa.convert(
+            self.source, self.output, options(**changes), lambda _: None
+        )
+
+    def assert_rendering_close(
+        self, before, after, mean_limit=2.0, changed_limit=0.02, isolate_pages=False
+    ):
+        """Pages must match within anti-aliasing noise: same size, few changed pixels."""
+        pages_before = rendered_samples(before, isolate_pages)
+        pages_after = rendered_samples(after, isolate_pages)
+        self.assertEqual(len(pages_before), len(pages_after))
+        for (width, height, a), (width_after, height_after, b) in zip(
+            pages_before, pages_after
+        ):
+            self.assertEqual((width, height), (width_after, height_after))
+            diffs = [abs(x - y) for x, y in zip(a, b)]
+            self.assertLess(sum(diffs) / len(diffs), mean_limit)
+            self.assertLess(sum(1 for d in diffs if d > 64) / len(diffs), changed_limit)
+
+    def assert_pdfa(self, flavour):
+        binary = shutil.which("verapdf")
+        if not binary:
+            if os.environ.get("PDF_SQUEEZER_INTEGRATION") == "1":
+                self.fail("veraPDF is required for integration tests")
+            return
+        report = subprocess.run(
+            [binary, "--format", "xml", "--flavour", flavour, self.output],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        self.assertIn('isCompliant="true"', report, report[:6000])
+
+    def test_pdfa4_structure_metadata_and_color(self):
+        pdf = pikepdf.Pdf.new()
+        image = image_object(pdf, Image.new("RGB", (8, 8), (10, 20, 30)))
+        image.Interpolate = True
+        group = pdf.make_indirect(
+            pikepdf.Dictionary(Type=pikepdf.Name.OCG, Name=pikepdf.String("Layer"))
+        )
+        page = pdf.add_blank_page(page_size=(100, 100))
+        page.obj.Resources = pikepdf.Dictionary(
+            ExtGState=pikepdf.Dictionary(
+                G=pikepdf.Dictionary(
+                    TR=pikepdf.Name.Identity, HTO=[0, 0], TR2=pikepdf.Name.Default
+                )
+            ),
+            XObject=pikepdf.Dictionary(Im=image),
+        )
+        page.obj.Contents = pdf.make_stream(
+            b"/G gs 0 0 1 rg 10 10 30 30 re f q 50 0 0 50 25 25 cm /Im Do Q"
+        )
+        pdf.Root.Requirements = pikepdf.Array()
+        pdf.Root.Version = pikepdf.Name("/1.7")
+        pdf.Root.OCProperties = pikepdf.Dictionary(
+            OCGs=pikepdf.Array([group]), D=pikepdf.Dictionary(Order=pikepdf.Array())
+        )
+        pdf.docinfo["/Title"] = "Example title"
+        pdf.docinfo["/Author"] = "Jane Example"
+        pdf.save(self.source)
+        self.assertEqual(self.convert_pdfa(), "4")
+        with pikepdf.Pdf.open(self.output) as result:
+            self.assertEqual(result.pdf_version, "2.0")
+            self.assertNotIn("/Info", result.trailer)
+            self.assertIn("/ID", result.trailer)
+            meta = result.open_metadata()
+            self.assertEqual(meta["pdfaid:part"], "4")
+            self.assertEqual(meta["pdfaid:rev"], "2020")
+            self.assertNotIn("pdfaid:conformance", meta)
+            self.assertEqual(meta["dc:title"], "Example title")
+            self.assertEqual(list(meta["dc:creator"]), ["Jane Example"])
+            intent = result.Root.OutputIntents[0]
+            self.assertEqual(intent.S, pikepdf.Name.GTS_PDFA1)
+            self.assertEqual(int(intent.DestOutputProfile.N), 3)
+            resources = result.pages[0].Resources
+            state = resources.ExtGState.G
+            self.assertNotIn("/TR", state)
+            self.assertNotIn("/HTO", state)
+            self.assertEqual(state.TR2, pikepdf.Name.Default)
+            self.assertFalse(resources.XObject.Im.Interpolate)
+            self.assertNotIn("/Requirements", result.Root)
+            self.assertNotIn("/Version", result.Root)
+            config = result.Root.OCProperties.D
+            self.assertEqual(str(config.Name), "Default")
+            self.assertEqual(
+                config.Order[0].objgen, result.Root.OCProperties.OCGs[0].objgen
+            )
+        self.assert_pdfa("4")
+
+    def test_pdfa4_embeds_standard_fonts(self):
+        if not fontconfig_file("Nimbus Sans") and not fontconfig_file(
+            "Liberation Sans"
+        ):
+            self.skipTest("no metric-compatible fonts are installed")
+        pdf = pikepdf.Pdf.new()
+        fonts = {
+            "F1": simple_font(pdf, "Helvetica"),
+            "F2": simple_font(pdf, "Times-Bold", Encoding=pikepdf.Name.WinAnsiEncoding),
+            "F3": simple_font(pdf, "Symbol"),
+            # A direct font dictionary, which has no object number of its own.
+            "F4": pikepdf.Dictionary(
+                Type=pikepdf.Name.Font,
+                Subtype=pikepdf.Name.Type1,
+                BaseFont=pikepdf.Name.Courier,
+            ),
+        }
+        # The form draws with the font the page selected; it has no Tf of its own.
+        form = pdf.make_stream(b"BT 0 0 Td (zq) Tj ET")
+        form.Type, form.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+        form.BBox = pikepdf.Array([0, 0, 200, 100])
+        page = text_page(
+            pdf,
+            fonts,
+            b"BT /F1 18 Tf 10 70 Td (Hello, archive! \xe9) Tj /F2 18 Tf 0 -25 Td (Bold \xe9t\xe9) Tj"
+            b" /F3 18 Tf 0 -25 Td (abg) Tj /F4 12 Tf 0 -15 Td (mono) Tj ET"
+            b" BT /F1 12 Tf ET q 1 0 0 1 150 10 cm /Fm Do Q",
+        )
+        page.obj.Resources.XObject = pikepdf.Dictionary(Fm=form)
+        pdf.save(self.source)
+        self.convert_pdfa()
+        with pikepdf.Pdf.open(self.output) as result:
+            for key in ("/F1", "/F2", "/F3", "/F4"):
+                font = result.pages[0].Resources.Font[key]
+                descriptor = font.FontDescriptor
+                self.assertIn("/FontFile3", descriptor, key)
+                self.assertEqual(descriptor.FontFile3.Subtype, pikepdf.Name.Type1C)
+                self.assertEqual(
+                    int(font.LastChar) - int(font.FirstChar) + 1, len(font.Widths)
+                )
+                self.assertTrue(
+                    str(font.BaseFont).startswith("/") and "+" in str(font.BaseFont)
+                )
+            self.assertEqual(
+                int(result.pages[0].Resources.Font.F3.FontDescriptor.Flags) & 4, 4
+            )
+            helvetica = result.pages[0].Resources.Font.F1
+            for code in (ord("z"), ord("q")):
+                self.assertGreater(
+                    int(helvetica.Widths[code - int(helvetica.FirstChar)]), 0
+                )
+        self.assert_rendering_close(self.source, self.output)
+        self.assert_pdfa("4")
+
+    def test_pdfa4_font_widths_must_match_or_come_from_font_file(self):
+        liberation = fontconfig_file("Liberation Sans")
+        if not liberation:
+            self.skipTest("Liberation Sans is not installed")
+        pdf = pikepdf.Pdf.new()
+        font = simple_font(
+            pdf,
+            "Arial",
+            Encoding=pikepdf.Name.WinAnsiEncoding,
+            FirstChar=65,
+            LastChar=67,
+            Widths=pikepdf.Array([500, 500, 500]),
+        )
+        text_page(pdf, {"F1": font}, b"BT /F1 18 Tf 10 50 Td (ABC) Tj ET")
+        pdf.save(self.source)
+        with self.assertRaisesRegex(tools.pdfa.ConversionError, "--font-file"):
+            self.convert_pdfa()
+        self.convert_pdfa(font_files={"Arial": liberation})
+        with pikepdf.Pdf.open(self.output) as result:
+            font = result.pages[0].Resources.Font.F1
+            self.assertEqual(font.Subtype, pikepdf.Name.TrueType)
+            self.assertIn("/FontFile2", font.FontDescriptor)
+            self.assertEqual(font.Encoding.BaseEncoding, pikepdf.Name.WinAnsiEncoding)
+            # The document's layout wins: its widths stay and the program is bent to them.
+            self.assertEqual([int(w) for w in font.Widths], [500, 500, 500])
+            program = embedded_program(font)
+            scale = 1000 / program["head"].unitsPerEm
+            for name in ("A", "B", "C"):
+                self.assertAlmostEqual(program["hmtx"][name][0] * scale, 500, delta=1)
+        self.assert_pdfa("4")
+
+    def test_pdfa4_aligns_embedded_font_widths_without_moving_text(self):
+        from fontTools.ttLib import TTFont
+
+        liberation = fontconfig_file("Liberation Sans")
+        if not liberation:
+            self.skipTest("Liberation Sans is not installed")
+        tt = TTFont(liberation)
+        tools.pdfa.subset_font(tt, [".notdef", "A", "B", "C"])
+        buffer = io.BytesIO()
+        tt.save(buffer)
+        scale = 1000 / tt["head"].unitsPerEm
+        real = [round(tt["hmtx"][name][0] * scale) for name in ("A", "B", "C")]
+        pdf = pikepdf.Pdf.new()
+        program = pdf.make_stream(buffer.getvalue())
+        program.Length1 = len(buffer.getvalue())
+        descriptor = tools.pdfa.descriptor_for(pdf, tt, "LiberationSans", False, False)
+        descriptor.FontFile2 = program
+        font = pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name.Font,
+                Subtype=pikepdf.Name.TrueType,
+                BaseFont=pikepdf.Name.LiberationSans,
+                FontDescriptor=descriptor,
+                Encoding=pikepdf.Name.WinAnsiEncoding,
+                FirstChar=65,
+                LastChar=67,
+                Widths=pikepdf.Array([w + 50 for w in real]),
+            )
+        )
+        text_page(pdf, {"F1": font}, b"BT /F1 24 Tf 10 40 Td (ABC) Tj ET")
+        pdf.save(self.source)
+        self.convert_pdfa()
+        self.assert_rendering_close(self.source, self.output)
+        with pikepdf.Pdf.open(self.output) as result:
+            font = result.pages[0].Resources.Font.F1
+            self.assertEqual([int(w) for w in font.Widths], [w + 50 for w in real])
+            program = embedded_program(font)
+            scale = 1000 / program["head"].unitsPerEm
+            for name, width in zip(("A", "B", "C"), real):
+                self.assertAlmostEqual(
+                    program["hmtx"][name][0] * scale, width + 50, delta=1
+                )
+        self.assert_pdfa("4")
+
+    def test_pdfa4_cmyk_needs_a_cmyk_output_intent(self):
+        self.save_image(
+            Image.new("RGB", (8, 8), (0, 0, 0)), b"0 0 0 1 k 10 10 40 40 re f", (64, 64)
+        )
+        with self.assertRaisesRegex(tools.pdfa.ConversionError, "--output-intent"):
+            self.convert_pdfa()
+        profiles = sorted(
+            Path("/usr/share/ghostscript").glob("*/iccprofiles/default_cmyk.icc")
+        )
+        if not profiles:
+            self.skipTest("no CMYK ICC profile is available")
+        self.convert_pdfa(output_intent=str(profiles[-1]))
+        with pikepdf.Pdf.open(self.output) as result:
+            self.assertEqual(int(result.Root.OutputIntents[0].DestOutputProfile.N), 4)
+            self.assertIn("/DefaultRGB", result.pages[0].Resources.ColorSpace)
+        self.assert_pdfa("4")
+
+    def test_pdfa4_forbidden_features_need_strip(self):
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page(page_size=(100, 100))
+        appearance = pdf.make_stream(b"1 0 0 RG 1 1 8 8 re S")
+        appearance.Type, appearance.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+        appearance.BBox = pikepdf.Array([0, 0, 10, 10])
+        page.obj.Annots = pikepdf.Array(
+            [
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name.Annot,
+                    Subtype=pikepdf.Name.Movie,
+                    Rect=[0, 0, 10, 10],
+                    F=4,
+                ),
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name.Annot,
+                    Subtype=pikepdf.Name.Square,
+                    Rect=[20, 20, 30, 30],
+                    F=2,
+                    AP=pikepdf.Dictionary(N=appearance),
+                ),
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name.Annot,
+                    Subtype=pikepdf.Name.Link,
+                    Rect=[40, 40, 50, 50],
+                    F=4,
+                    A=pikepdf.Dictionary(
+                        S=pikepdf.Name.Launch, F=pikepdf.String("calc.exe")
+                    ),
+                ),
+            ]
+        )
+        page.obj.Annots.append(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name.Annot,
+                Subtype=pikepdf.Name.Watermark,
+                Rect=[60, 60, 90, 90],
+                F=4,
+            )
+        )
+        pdf.Root.AcroForm = pikepdf.Dictionary(
+            Fields=pikepdf.Array(), XFA=pikepdf.Array()
+        )
+        pdf.save(self.source)
+        with self.assertRaises(tools.pdfa.ConversionError) as caught:
+            self.convert_pdfa()
+        for category in ("multimedia", "hidden", "actions", "xfa", "annotations"):
+            self.assertIn(f"--strip {category}", str(caught.exception))
+        self.convert_pdfa(strip="actions,multimedia,hidden,xfa,annotations")
+        with pikepdf.Pdf.open(self.output) as result:
+            annots = list(result.pages[0].Annots)
+            self.assertEqual([a.Subtype for a in annots], [pikepdf.Name.Link])
+            self.assertNotIn("/A", annots[0])
+            self.assertEqual(int(annots[0].F) & 4, 4)
+            self.assertNotIn("/XFA", result.Root.AcroForm)
+        self.assert_pdfa("4")
+
+    def test_pdfa4_attachments_select_4f(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page(page_size=(100, 100))
+        pdf.attachments["notes.txt"] = pikepdf.AttachedFileSpec(
+            pdf, b"hello", filename="notes.txt"
+        )
+        pdf.save(self.source)
+        self.assertEqual(self.convert_pdfa(), "4f")
+        with pikepdf.Pdf.open(self.output) as result:
+            self.assertEqual(result.open_metadata()["pdfaid:conformance"], "F")
+            spec = result.attachments["notes.txt"].obj
+            self.assertEqual(spec.AFRelationship, pikepdf.Name.Unspecified)
+            self.assertEqual(str(spec.UF), "notes.txt")
+            self.assertEqual(str(spec.EF.F.Subtype), "/text/plain")
+        self.assert_pdfa("4f")
+        self.assertEqual(self.convert_pdfa(strip="attachments"), "4")
+        with pikepdf.Pdf.open(self.output) as result:
+            self.assertEqual(len(result.attachments), 0)
+            self.assertNotIn("pdfaid:conformance", result.open_metadata())
+        self.assert_pdfa("4")
+
+    def test_pdfa4_clones_forms_shared_across_resource_contexts(self):
+        pdf = pikepdf.Pdf.new()
+        form = pdf.make_stream(b"q 40 0 0 40 0 0 cm /Im Do Q")
+        form.Type, form.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+        form.BBox = pikepdf.Array([0, 0, 40, 40])
+        unused = pdf.make_stream(b"BT /F9 12 Tf 10 10 Td (never drawn) Tj ET")
+        unused.Type, unused.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+        unused.BBox = pikepdf.Array([0, 0, 40, 40])
+        unused.Resources = pikepdf.Dictionary(
+            Font=pikepdf.Dictionary(F9=simple_font(pdf, "Verdana-Rare"))
+        )
+        for color in ((200, 30, 30), (30, 30, 200)):
+            page = pdf.add_blank_page(page_size=(100, 100))
+            page.obj.Resources = pikepdf.Dictionary(
+                XObject=pikepdf.Dictionary(
+                    Im=image_object(pdf, Image.new("RGB", (8, 8), color)),
+                    Fm=form,
+                    Unused=unused,
+                )
+            )
+            page.obj.Contents = pdf.make_stream(b"q 1 0 0 1 10 10 cm /Fm Do Q")
+        pdf.save(self.source)
+        before = rendered(self.source)
+        self.convert_pdfa()
+        self.assertEqual(before, rendered(self.output))
+        with pikepdf.Pdf.open(self.output) as result:
+            forms = [page.Resources.XObject.Fm for page in result.pages]
+            self.assertNotEqual(forms[0].objgen, forms[1].objgen)
+            for form, page in zip(forms, result.pages):
+                self.assertEqual(
+                    form.Resources.XObject.Im.objgen, page.Resources.XObject.Im.objgen
+                )
+        self.assert_pdfa("4")
+
+    def test_pdfa4_keeps_shared_containers_private_per_context(self):
+        if not fontconfig_file("Nimbus Sans") and not fontconfig_file(
+            "Liberation Sans"
+        ):
+            self.skipTest("no metric-compatible fonts are installed")
+        pdf = pikepdf.Pdf.new()
+        # One indirect XObject dictionary shared by both pages holds a form that
+        # borrows /F1, which each page binds to a different font.
+        form = pdf.make_stream(b"BT /F1 24 Tf 5 5 Td (Ag) Tj ET")
+        form.Type, form.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+        form.BBox = pikepdf.Array([0, 0, 80, 40])
+        xobjects = pdf.make_indirect(pikepdf.Dictionary(Fm=form))
+        # One Type 3 font without resources whose glyph draws with the page's /F1.
+        glyph = pdf.make_stream(b"100 0 d0 BT /F1 80 Tf 10 10 Td (A) Tj ET")
+        type3 = pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name.Font,
+                Subtype=pikepdf.Name.Type3,
+                FontBBox=pikepdf.Array([0, 0, 100, 100]),
+                FontMatrix=pikepdf.Array([0.01, 0, 0, 0.01, 0, 0]),
+                CharProcs=pikepdf.Dictionary(square=glyph),
+                Encoding=pikepdf.Dictionary(
+                    Type=pikepdf.Name.Encoding,
+                    Differences=pikepdf.Array([97, pikepdf.Name.square]),
+                ),
+                FirstChar=97,
+                LastChar=97,
+                Widths=pikepdf.Array([100]),
+            )
+        )
+        for base_font in ("Helvetica", "Courier"):
+            page = pdf.add_blank_page(page_size=(120, 120))
+            page.obj.Resources = pikepdf.Dictionary(
+                XObject=xobjects,
+                Font=pikepdf.Dictionary(F1=simple_font(pdf, base_font), T3=type3),
+            )
+            page.obj.Contents = pdf.make_stream(
+                b"q 1 0 0 1 10 70 cm /Fm Do Q BT /T3 40 Tf 10 10 Td (a) Tj ET"
+            )
+        pdf.save(self.source)
+        self.convert_pdfa()
+        self.assert_rendering_close(self.source, self.output, isolate_pages=True)
+        with pikepdf.Pdf.open(self.output) as result:
+            forms = [page.Resources.XObject.Fm for page in result.pages]
+            self.assertNotEqual(forms[0].objgen, forms[1].objgen)
+            fonts = [page.Resources.Font.T3 for page in result.pages]
+            self.assertNotEqual(fonts[0].objgen, fonts[1].objgen)
+            for page, form, font in zip(result.pages, forms, fonts):
+                expected = page.Resources.Font.F1.objgen
+                self.assertEqual(form.Resources.Font.F1.objgen, expected)
+                self.assertEqual(
+                    font.CharProcs.square.Resources.Font.F1.objgen, expected
+                )
+        self.assert_pdfa("4")
+
+    def test_to_unicode_cleanup_keeps_codespace_and_valid_ranges(self):
+        cmap = (
+            "1 begincodespacerange\n<0000> <FFFE>\nendcodespacerange\n"
+            "3 beginbfchar\n<0041> <0000>\n<0042> <0043>\n<0000> <0041>\nendbfchar\n"
+            "3 beginbfrange\n<0050> <0052> <0000>\n<0060> <0060> <FEFF>\n"
+            "<0070> <0071> [<0041> <0042>]\n<0080> <0081> [<0000> % old <0042>\n<0043>]\nendbfrange\n"
+        )
+        cleaned = tools.pdfa.clean_to_unicode(cmap)
+        self.assertIn("<0000> <FFFE>\nendcodespacerange", cleaned)
+        self.assertNotIn("<0041> <0000>", cleaned)
+        self.assertIn("<0042> <0043>", cleaned)
+        self.assertIn("<0000> <0041>", cleaned)
+        self.assertIn("2 beginbfchar", cleaned)
+        self.assertIn("<0051> <0052> <0001>", cleaned)
+        self.assertNotIn("<0050>", cleaned)
+        self.assertNotIn("<FEFF>", cleaned)
+        self.assertIn("<0070> <0071> [<0041> <0042>]", cleaned)
+        self.assertNotIn("<0080>", cleaned)
+        self.assertIn("<0081> <0081> <0043>", cleaned)
+        self.assertIn("3 beginbfrange", cleaned)
+
+    def test_pdfa4_generates_appearances_and_shared_form_resources(self):
+        pdf = pikepdf.Pdf.new()
+        image = image_object(pdf, Image.new("RGB", (8, 8), (200, 30, 30)))
+        form = pdf.make_stream(b"q 40 0 0 40 0 0 cm /Im Do Q")
+        form.Type, form.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+        form.BBox = pikepdf.Array([0, 0, 40, 40])
+        page = pdf.add_blank_page(page_size=(100, 100))
+        page.obj.Resources = pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(Im=image, Fm=form)
+        )
+        page.obj.Contents = pdf.make_stream(b"q 1 0 0 1 10 10 cm /Fm Do Q")
+        page.obj.Annots = pikepdf.Array(
+            [
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name.Annot,
+                    Subtype=pikepdf.Name.Square,
+                    Rect=[60, 60, 90, 90],
+                    C=pikepdf.Array([0, 0, 1]),
+                    F=4,
+                )
+            ]
+        )
+        pdf.save(self.source)
+        self.convert_pdfa()
+        with pikepdf.Pdf.open(self.output) as result:
+            page = result.pages[0]
+            self.assertIsInstance(page.Annots[0].AP.N, pikepdf.Stream)
+            self.assertIn("/Im", page.Resources.XObject.Fm.Resources.XObject)
+        self.assert_pdfa("4")
 
     def test_bitmap_and_mrc(self):
         with pymupdf.open() as doc:
