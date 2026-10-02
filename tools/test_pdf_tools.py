@@ -818,7 +818,7 @@ class PDFToolsTests(unittest.TestCase):
             "1 begincodespacerange\n<0000> <FFFE>\nendcodespacerange\n"
             "3 beginbfchar\n<0041> <0000>\n<0042> <0043>\n<0000> <0041>\nendbfchar\n"
             "3 beginbfrange\n<0050> <0052> <0000>\n<0060> <0060> <FEFF>\n"
-            "<0070> <0071> [<0041> <0042>]\nendbfrange\n"
+            "<0070> <0071> [<0041> <0042>]\n<0080> <0081> [<0000> <0043>]\nendbfrange\n"
         )
         cleaned = tools.pdfa.clean_to_unicode(cmap)
         self.assertIn("<0000> <FFFE>\nendcodespacerange", cleaned)
@@ -830,7 +830,9 @@ class PDFToolsTests(unittest.TestCase):
         self.assertNotIn("<0050>", cleaned)
         self.assertNotIn("<FEFF>", cleaned)
         self.assertIn("<0070> <0071> [<0041> <0042>]", cleaned)
-        self.assertIn("2 beginbfrange", cleaned)
+        self.assertNotIn("<0080>", cleaned)
+        self.assertIn("<0081> <0081> <0043>", cleaned)
+        self.assertIn("3 beginbfrange", cleaned)
 
     def test_pdfa4_generates_appearances_and_shared_form_resources(self):
         pdf = pikepdf.Pdf.new()

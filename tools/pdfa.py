@@ -1044,7 +1044,7 @@ def user_font_file(name, family, options):
     plain = name.lower().replace(" ", "")
     stem = re.sub(r"(ps)?(mt)?$", "", re.split(r"[-,]", plain)[0])
     for key, path in (options.get("font_files") or {}).items():
-        if key.lower().replace(" ", "") in (plain, stem, family):
+        if key.lower().replace(" ", "") in (plain, stem, family.replace(" ", "")):
             return path
     return None
 
@@ -1891,12 +1891,24 @@ def clean_to_unicode(text):
 
     def bfrange_entry(match):
         low, high, target = match.groups()
-        if not target.startswith("<") or not invalid(target):
-            return match.group(0)
         low_value, high_value = int(low.strip("<>"), 16), int(high.strip("<>"), 16)
+        width = len(low) - 2
+        if target.startswith("["):
+            # One destination per code: keep the valid ones as single-code ranges.
+            elements = re.findall(HEX, target)
+            if not any(invalid(element) for element in elements):
+                return match.group(0)
+            kept = []
+            for offset, element in enumerate(elements):
+                code = low_value + offset
+                if code <= high_value and not invalid(element):
+                    kept.append(f"<{code:0{width}X}> <{code:0{width}X}> {element}\n")
+            return "".join(kept)
+        if not invalid(target):
+            return match.group(0)
         if low_value >= high_value:
             return ""
-        width, target_value = len(low) - 2, int(target.strip("<>"), 16)
+        target_value = int(target.strip("<>"), 16)
         return f"<{low_value + 1:0{width}X}> {high} <{target_value + 1:0{len(target) - 2}X}>\n"
 
     def section(text, kind, entry, fix):
