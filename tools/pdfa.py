@@ -145,9 +145,7 @@ def content_streams(pdf):
         yield owner, resources, owns
         if not isinstance(resources, Dictionary):
             return
-        fonts, xobjects, patterns = (
-            resources.get(key) for key in ("/Font", "/XObject", "/Pattern")
-        )
+        xobjects, patterns = resources.get("/XObject"), resources.get("/Pattern")
         for instruction in instructions(owner):
             op, args = str(instruction.operator), instruction.operands
             if op == "Do" and args and isinstance(xobjects, Dictionary):
@@ -158,8 +156,8 @@ def content_streams(pdf):
                 target = patterns.get(args[-1]) if isinstance(args[-1], Name) else None
                 if isinstance(target, Stream):
                     yield from visit_stream(target, resources, patterns, args[-1])
-            elif op == "Tf" and args and isinstance(fonts, Dictionary):
-                font = fonts.get(args[0])
+            elif op in ("Tf", "gs") and args:
+                font = selected_font(resources, op, args[0])
                 if isinstance(font, Dictionary) and font.get("/Subtype") == Name.Type3:
                     procs = font.get("/CharProcs")
                     glyph_resources = font.get("/Resources")
@@ -217,6 +215,24 @@ def content_streams(pdf):
                             yield from visit_stream(stream, resources, state, sub_name)
 
 
+def selected_font(resources, op, name):
+    """The font a Tf operand or a gs operand's ExtGState /Font entry selects."""
+    if not isinstance(resources, Dictionary):
+        return None
+    if op == "Tf":
+        font = (resources.get("/Font") or {}).get(name)
+        return font if isinstance(font, Dictionary) else None
+    state = (resources.get("/ExtGState") or {}).get(name)
+    entry = state.get("/Font") if isinstance(state, Dictionary) else None
+    if (
+        isinstance(entry, Array)
+        and len(entry) == 2
+        and isinstance(entry[0], Dictionary)
+    ):
+        return entry[0]
+    return None
+
+
 def instructions(owner):
     try:
         return [
@@ -229,9 +245,13 @@ def instructions(owner):
 def font_usage(pdf):
     """Codes or CIDs drawn with each font outside rendering mode 3.
 
-    A value of None means usage could not be determined, so every code counts.
+    A font's value of None means its usage could not be determined, so every
+    code counts. The whole result is None when the document is too large to
+    walk, which callers treat the same way for every font. Forms inherit the
+    caller's font and rendering mode; patterns, glyphs, and appearances start
+    with none.
     """
-    used = {}
+    used, visited, budget = {}, set(), [200000]
 
     def record(font, text, render_mode):
         if font is None or not font.is_indirect or render_mode == 3:
@@ -256,19 +276,48 @@ def font_usage(pdf):
             current.update(codes)
             used[key] = current
 
-    for owner, resources, _ in content_streams(pdf):
-        fonts = resources.get("/Font") if isinstance(resources, Dictionary) else None
-        font, render_mode, stack = None, 0, []
+    def walk(owner, resources, font, render_mode, depth):
+        holder = owner.obj if isinstance(owner, pikepdf.Page) else owner
+        state = (holder.objgen, font.objgen if font is not None else None, render_mode)
+        if depth > 64 or state in visited:
+            return
+        visited.add(state)
+        xobjects = (
+            resources.get("/XObject") if isinstance(resources, Dictionary) else None
+        )
+        patterns = (
+            resources.get("/Pattern") if isinstance(resources, Dictionary) else None
+        )
+        stack = []
         for instruction in instructions(owner):
+            budget[0] -= 1
+            if budget[0] <= 0:
+                return
             op, args = str(instruction.operator), instruction.operands
             if op == "q":
                 stack.append((font, render_mode))
             elif op == "Q" and stack:
                 font, render_mode = stack.pop()
-            elif op == "Tf" and len(args) == 2:
-                font = fonts.get(args[0]) if isinstance(fonts, Dictionary) else None
-                if font is not None and not isinstance(font, Dictionary):
-                    font = None
+            elif op in ("Tf", "gs") and args:
+                chosen = selected_font(resources, op, args[0])
+                if chosen is not None or op == "Tf":
+                    font = chosen
+                if (
+                    isinstance(chosen, Dictionary)
+                    and chosen.get("/Subtype") == Name.Type3
+                ):
+                    procs = chosen.get("/CharProcs")
+                    for glyph in (
+                        procs.values() if isinstance(procs, Dictionary) else ()
+                    ):
+                        if isinstance(glyph, Stream):
+                            walk(
+                                glyph,
+                                chosen.get("/Resources", resources),
+                                None,
+                                0,
+                                depth + 1,
+                            )
             elif op == "Tr" and len(args) == 1:
                 render_mode = int(args[0])
             elif op in ("Tj", "'", '"') and args:
@@ -277,7 +326,36 @@ def font_usage(pdf):
                 for value in args[0]:
                     if isinstance(value, String):
                         record(font, value, render_mode)
-    return used
+            elif op == "Do" and args and isinstance(xobjects, Dictionary):
+                target = xobjects.get(args[0])
+                if isinstance(target, Stream) and target.get("/Subtype") == Name.Form:
+                    walk(
+                        target,
+                        target.get("/Resources", resources),
+                        font,
+                        render_mode,
+                        depth + 1,
+                    )
+            elif op in ("scn", "SCN") and args and isinstance(patterns, Dictionary):
+                target = patterns.get(args[-1]) if isinstance(args[-1], Name) else None
+                if isinstance(target, Stream):
+                    walk(
+                        target, target.get("/Resources", resources), None, 0, depth + 1
+                    )
+
+    for page in pdf.pages:
+        resources = inherited(page.obj, "/Resources", Dictionary())
+        walk(page, resources, None, 0, 0)
+        for annot in page.obj.get("/Annots") or []:
+            appearance = annot.get("/AP") if isinstance(annot, Dictionary) else None
+            if not isinstance(appearance, Dictionary):
+                continue
+            for state in appearance.values():
+                streams = state.values() if isinstance(state, Dictionary) else [state]
+                for stream in streams:
+                    if isinstance(stream, Stream):
+                        walk(stream, stream.get("/Resources", resources), None, 0, 1)
+    return None if budget[0] <= 0 else used
 
 
 def color_family(space, resources, depth=0):
@@ -505,9 +583,8 @@ def strip_features(pdf, strip, problems):
         names = root.get("/Names")
         if isinstance(names, Dictionary) and "/EmbeddedFiles" in names:
             del names["/EmbeddedFiles"]
-        for holder in [root, *(page.obj for page in pdf.pages)]:
-            if "/AF" in holder:
-                del holder["/AF"]
+        for holder in list(associated_file_holders(pdf)):
+            del holder["/AF"]
 
 
 def annotation_category(subtype):
@@ -675,18 +752,31 @@ def file_specifications(pdf):
             seen.add(spec.objgen)
             specs.append(spec)
 
-    root = pdf.Root
-    names = root.get("/Names")
+    names = pdf.Root.get("/Names")
     if isinstance(names, Dictionary) and "/EmbeddedFiles" in names:
         for spec in pikepdf.NameTree(names.EmbeddedFiles).values():
             add(spec)
-    for holder in [root, *(page.obj for page in pdf.pages)]:
-        for spec in holder.get("/AF") or []:
+    for holder in associated_file_holders(pdf):
+        files = holder.AF
+        for spec in files if isinstance(files, Array) else [files]:
             add(spec)
     for _, annot in annotations(pdf):
         if annot.get("/Subtype") == Name.FileAttachment:
             add(annot.get("/FS"))
     return specs
+
+
+def associated_file_holders(pdf):
+    """Objects carrying /AF: catalog, pages, XObjects, structure elements, annotations."""
+    seen = set()
+    for holder in [pdf.Root, *(page.obj for page in pdf.pages), *pdf.objects]:
+        if (
+            isinstance(holder, (Dictionary, Stream))
+            and "/AF" in holder
+            and holder.objgen not in seen
+        ):
+            seen.add(holder.objgen)
+            yield holder
 
 
 def repair_embedded_files(pdf, notes):
@@ -951,9 +1041,10 @@ def fontconfig_match(family, bold, italic):
 
 def user_font_file(name, family, options):
     """A --font-file entry matching the full name, its family stem, or the family key."""
-    stem = re.sub(r"(ps)?(mt)?$", "", re.split(r"[-,]", name.lower())[0])
+    plain = name.lower().replace(" ", "")
+    stem = re.sub(r"(ps)?(mt)?$", "", re.split(r"[-,]", plain)[0])
     for key, path in (options.get("font_files") or {}).items():
-        if key.lower().replace(" ", "") in (name.lower(), stem, family):
+        if key.lower().replace(" ", "") in (plain, stem, family):
             return path
     return None
 
@@ -1138,15 +1229,35 @@ def embed_simple_font(pdf, font, codes, options, notes):
     }
     first, last = int(font.get("/FirstChar", 0)), int(font.get("/LastChar", -1))
     existing = font.get("/Widths")
-    if isinstance(existing, Array) and last >= first and not user_supplied:
-        mismatched = [
-            code
-            for code, width in widths.items()
-            if first <= code <= last and abs(float(existing[code - first]) - width) > 1
-        ]
-        if mismatched:
+    if isinstance(existing, Array) and last >= first:
+        document = {
+            code: float(existing[code - first])
+            for code in mapping
+            if first <= code <= last and code - first < len(existing)
+        }
+        mismatched = {
+            code: width
+            for code, width in document.items()
+            if abs(width - widths[code]) > 1
+        }
+        if mismatched and not user_supplied:
             raise ConversionError(
-                f"the document's widths for {name} differ from the metric-compatible substitute at {len(mismatched)} codes (first: {mismatched[:5]}); pass --font-file '{name}=/path/to/the/original/font'"
+                f"the document's widths for {name} differ from the metric-compatible substitute at {len(mismatched)} codes (first: {sorted(mismatched)[:5]}); pass --font-file '{name}=/path/to/the/original/font'"
+            )
+        if mismatched:
+            # The document's widths define the layout; bend the program to them.
+            targets = {}
+            for code, width in mismatched.items():
+                glyph = mapping[code]
+                if targets.get(glyph, width) != width:
+                    raise ConversionError(
+                        f"{path} draws glyph {glyph} for codes with different widths in {name}; the document was laid out for another font"
+                    )
+                targets[glyph] = width
+            align_program_widths(tt, targets)
+            widths.update(mismatched)
+            notes.append(
+                f"aligned {len(targets)} glyph widths of {path.rsplit('/', 1)[-1]} to {name}"
             )
     subset_font(tt, sorted(set(mapping.values()) | {".notdef"}))
     stream, key, subtype = program_stream(pdf, tt)
@@ -1198,6 +1309,26 @@ def embed_simple_font(pdf, font, codes, options, notes):
     font.FirstChar, font.LastChar = span.start, span.stop - 1
     font.Widths = Array([widths.get(code, 0) for code in span])
     notes.append(f"embedded {path.rsplit('/', 1)[-1]} for {name}")
+
+
+def align_program_widths(tt, targets):
+    """Set advance widths (in 1/1000 em) of glyphs in a fontTools font."""
+    from fontTools.pens.basePen import NullPen
+
+    scale = tt["head"].unitsPerEm / 1000
+    if "CFF " in tt:
+        cff = tt["CFF "].cff
+        top = cff[0]
+        for glyph, width in targets.items():
+            if glyph in top.CharStrings:
+                charstring = top.CharStrings[glyph]
+                charstring.draw(NullPen())
+                top.CharStrings[glyph] = charstring_with_width(
+                    charstring, round(width * scale), top.Private, cff.GlobalSubrs
+                )
+    for glyph, width in targets.items():
+        if glyph in tt["hmtx"].metrics:
+            tt["hmtx"][glyph] = (round(width * scale), tt["hmtx"][glyph][1])
 
 
 def differences_array(mapping):
@@ -1323,9 +1454,9 @@ def repair_fonts(pdf, options, notes):
             Name.CIDFontType2,
         ):
             continue
-        if obj.objgen not in usage:
+        if usage is not None and obj.objgen not in usage:
             continue  # not drawn, or drawn only in rendering mode 3
-        used = usage[obj.objgen]  # None: every code may be drawn
+        used = usage[obj.objgen] if usage is not None else None  # None: every code
         if subtype == Name.Type0:
             descendants = obj.get("/DescendantFonts") or []
             descendant = (
@@ -1740,37 +1871,47 @@ def repair_type1_widths(pdf, font, descriptor, program, data, codes, wanted, not
 INVALID_UNICODE = {"0000", "FEFF", "FFFE"}
 
 
+HEX = r"<[0-9A-Fa-f]+>"
+BFCHAR_ENTRY = re.compile(rf"({HEX})\s*({HEX})\s*")
+BFRANGE_ENTRY = re.compile(rf"({HEX})\s*({HEX})\s*({HEX}|\[[^\]]*\])\s*")
+
+
 def clean_to_unicode(text):
     """Drop bfchar entries and trim bfranges that map to U+0000, U+FEFF, or U+FFFE.
 
-    Only the mapping sections change; codespace ranges and other CMap syntax stay.
+    Only the mapping sections change and their entry counts are recomputed;
+    codespace ranges and other CMap syntax stay.
     """
 
-    def bfchar(match):
-        def entry(pair):
-            return "" if pair.group(2).upper() in INVALID_UNICODE else pair.group(0)
+    def invalid(token):
+        return token.strip("<>").upper() in INVALID_UNICODE
 
-        body = re.sub(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*", entry, match.group(2))
-        return match.group(1) + body + match.group(3)
+    def bfchar_entry(match):
+        return "" if invalid(match.group(2)) else match.group(0)
 
-    def bfrange(match):
-        def entry(triple):
-            low, high, target = triple.groups()
-            if target.upper() not in INVALID_UNICODE:
-                return triple.group(0)
-            if int(low, 16) >= int(high, 16):
+    def bfrange_entry(match):
+        low, high, target = match.groups()
+        if not target.startswith("<") or not invalid(target):
+            return match.group(0)
+        low_value, high_value = int(low.strip("<>"), 16), int(high.strip("<>"), 16)
+        if low_value >= high_value:
+            return ""
+        width, target_value = len(low) - 2, int(target.strip("<>"), 16)
+        return f"<{low_value + 1:0{width}X}> {high} <{target_value + 1:0{len(target) - 2}X}>\n"
+
+    def section(text, kind, entry, fix):
+        def rewrite(match):
+            body = entry.sub(fix, match.group(3))
+            count = len(entry.findall(body))
+            if count == 0:
                 return ""
-            return f"<{int(low, 16) + 1:0{len(low)}X}> <{high}> <{int(target, 16) + 1:0{len(target)}X}>\n"
+            return f"{count}{match.group(2)}{body}{match.group(4)}"
 
-        body = re.sub(
-            r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*",
-            entry,
-            match.group(2),
-        )
-        return match.group(1) + body + match.group(3)
+        pattern = re.compile(rf"(\d+)(\s+begin{kind}\s*)(.*?)(end{kind})", re.DOTALL)
+        return pattern.sub(rewrite, text)
 
-    text = re.sub(r"(beginbfchar)(.*?)(endbfchar)", bfchar, text, flags=re.DOTALL)
-    return re.sub(r"(beginbfrange)(.*?)(endbfrange)", bfrange, text, flags=re.DOTALL)
+    text = section(text, "bfchar", BFCHAR_ENTRY, bfchar_entry)
+    return section(text, "bfrange", BFRANGE_ENTRY, bfrange_entry)
 
 
 def repair_to_unicode(font, notes):

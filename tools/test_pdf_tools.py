@@ -113,6 +113,20 @@ def rendered(path):
         ]
 
 
+def rendered_samples(path):
+    with pymupdf.open(path) as doc:
+        pixmaps = [page.get_pixmap(alpha=False) for page in doc]
+        return [(p.width, p.height, bytes(p.samples)) for p in pixmaps]
+
+
+def embedded_program(font):
+    from fontTools.ttLib import TTFont
+
+    descriptor = font.FontDescriptor
+    key = "/FontFile2" if "/FontFile2" in descriptor else "/FontFile3"
+    return TTFont(io.BytesIO(descriptor[key].read_bytes()))
+
+
 class PDFToolsTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -459,6 +473,18 @@ class PDFToolsTests(unittest.TestCase):
             self.source, self.output, options(**changes), lambda _: None
         )
 
+    def assert_rendering_close(self, before, after, mean_limit=2.0, changed_limit=0.02):
+        """Pages must match within anti-aliasing noise: same size, few changed pixels."""
+        pages_before, pages_after = rendered_samples(before), rendered_samples(after)
+        self.assertEqual(len(pages_before), len(pages_after))
+        for (width, height, a), (width_after, height_after, b) in zip(
+            pages_before, pages_after
+        ):
+            self.assertEqual((width, height), (width_after, height_after))
+            diffs = [abs(x - y) for x, y in zip(a, b)]
+            self.assertLess(sum(diffs) / len(diffs), mean_limit)
+            self.assertLess(sum(1 for d in diffs if d > 64) / len(diffs), changed_limit)
+
     def assert_pdfa(self, flavour):
         binary = shutil.which("verapdf")
         if not binary:
@@ -546,14 +572,19 @@ class PDFToolsTests(unittest.TestCase):
                 BaseFont=pikepdf.Name.Courier,
             ),
         }
-        text_page(
+        # The form draws with the font the page selected; it has no Tf of its own.
+        form = pdf.make_stream(b"BT 0 0 Td (zq) Tj ET")
+        form.Type, form.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+        form.BBox = pikepdf.Array([0, 0, 200, 100])
+        page = text_page(
             pdf,
             fonts,
             b"BT /F1 18 Tf 10 70 Td (Hello, archive! \xe9) Tj /F2 18 Tf 0 -25 Td (Bold \xe9t\xe9) Tj"
-            b" /F3 18 Tf 0 -25 Td (abg) Tj /F4 12 Tf 0 -15 Td (mono) Tj ET",
+            b" /F3 18 Tf 0 -25 Td (abg) Tj /F4 12 Tf 0 -15 Td (mono) Tj ET"
+            b" BT /F1 12 Tf ET q 1 0 0 1 150 10 cm /Fm Do Q",
         )
+        page.obj.Resources.XObject = pikepdf.Dictionary(Fm=form)
         pdf.save(self.source)
-        before = rendered(self.source)
         self.convert_pdfa()
         with pikepdf.Pdf.open(self.output) as result:
             for key in ("/F1", "/F2", "/F3", "/F4"):
@@ -570,9 +601,12 @@ class PDFToolsTests(unittest.TestCase):
             self.assertEqual(
                 int(result.pages[0].Resources.Font.F3.FontDescriptor.Flags) & 4, 4
             )
-        self.assertEqual(
-            [size for size, _ in before], [size for size, _ in rendered(self.output)]
-        )
+            helvetica = result.pages[0].Resources.Font.F1
+            for code in (ord("z"), ord("q")):
+                self.assertGreater(
+                    int(helvetica.Widths[code - int(helvetica.FirstChar)]), 0
+                )
+        self.assert_rendering_close(self.source, self.output)
         self.assert_pdfa("4")
 
     def test_pdfa4_font_widths_must_match_or_come_from_font_file(self):
@@ -598,7 +632,56 @@ class PDFToolsTests(unittest.TestCase):
             self.assertEqual(font.Subtype, pikepdf.Name.TrueType)
             self.assertIn("/FontFile2", font.FontDescriptor)
             self.assertEqual(font.Encoding.BaseEncoding, pikepdf.Name.WinAnsiEncoding)
-            self.assertNotEqual([int(w) for w in font.Widths], [500, 500, 500])
+            # The document's layout wins: its widths stay and the program is bent to them.
+            self.assertEqual([int(w) for w in font.Widths], [500, 500, 500])
+            program = embedded_program(font)
+            scale = 1000 / program["head"].unitsPerEm
+            for name in ("A", "B", "C"):
+                self.assertAlmostEqual(program["hmtx"][name][0] * scale, 500, delta=1)
+        self.assert_pdfa("4")
+
+    def test_pdfa4_aligns_embedded_font_widths_without_moving_text(self):
+        from fontTools.ttLib import TTFont
+
+        liberation = fontconfig_file("Liberation Sans")
+        if not liberation:
+            self.skipTest("Liberation Sans is not installed")
+        tt = TTFont(liberation)
+        tools.pdfa.subset_font(tt, [".notdef", "A", "B", "C"])
+        buffer = io.BytesIO()
+        tt.save(buffer)
+        scale = 1000 / tt["head"].unitsPerEm
+        real = [round(tt["hmtx"][name][0] * scale) for name in ("A", "B", "C")]
+        pdf = pikepdf.Pdf.new()
+        program = pdf.make_stream(buffer.getvalue())
+        program.Length1 = len(buffer.getvalue())
+        descriptor = tools.pdfa.descriptor_for(pdf, tt, "LiberationSans", False, False)
+        descriptor.FontFile2 = program
+        font = pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name.Font,
+                Subtype=pikepdf.Name.TrueType,
+                BaseFont=pikepdf.Name.LiberationSans,
+                FontDescriptor=descriptor,
+                Encoding=pikepdf.Name.WinAnsiEncoding,
+                FirstChar=65,
+                LastChar=67,
+                Widths=pikepdf.Array([w + 50 for w in real]),
+            )
+        )
+        text_page(pdf, {"F1": font}, b"BT /F1 24 Tf 10 40 Td (ABC) Tj ET")
+        pdf.save(self.source)
+        self.convert_pdfa()
+        self.assert_rendering_close(self.source, self.output)
+        with pikepdf.Pdf.open(self.output) as result:
+            font = result.pages[0].Resources.Font.F1
+            self.assertEqual([int(w) for w in font.Widths], [w + 50 for w in real])
+            program = embedded_program(font)
+            scale = 1000 / program["head"].unitsPerEm
+            for name, width in zip(("A", "B", "C"), real):
+                self.assertAlmostEqual(
+                    program["hmtx"][name][0] * scale, width + 50, delta=1
+                )
         self.assert_pdfa("4")
 
     def test_pdfa4_cmyk_needs_a_cmyk_output_intent(self):
@@ -733,16 +816,21 @@ class PDFToolsTests(unittest.TestCase):
     def test_to_unicode_cleanup_keeps_codespace_and_valid_ranges(self):
         cmap = (
             "1 begincodespacerange\n<0000> <FFFE>\nendcodespacerange\n"
-            "2 beginbfchar\n<0041> <0000>\n<0042> <0043>\nendbfchar\n"
-            "2 beginbfrange\n<0050> <0052> <0000>\n<0060> <0060> <FEFF>\nendbfrange\n"
+            "3 beginbfchar\n<0041> <0000>\n<0042> <0043>\n<0000> <0041>\nendbfchar\n"
+            "3 beginbfrange\n<0050> <0052> <0000>\n<0060> <0060> <FEFF>\n"
+            "<0070> <0071> [<0041> <0042>]\nendbfrange\n"
         )
         cleaned = tools.pdfa.clean_to_unicode(cmap)
         self.assertIn("<0000> <FFFE>\nendcodespacerange", cleaned)
         self.assertNotIn("<0041> <0000>", cleaned)
         self.assertIn("<0042> <0043>", cleaned)
+        self.assertIn("<0000> <0041>", cleaned)
+        self.assertIn("2 beginbfchar", cleaned)
         self.assertIn("<0051> <0052> <0001>", cleaned)
         self.assertNotIn("<0050>", cleaned)
         self.assertNotIn("<FEFF>", cleaned)
+        self.assertIn("<0070> <0071> [<0041> <0042>]", cleaned)
+        self.assertIn("2 beginbfrange", cleaned)
 
     def test_pdfa4_generates_appearances_and_shared_form_resources(self):
         pdf = pikepdf.Pdf.new()

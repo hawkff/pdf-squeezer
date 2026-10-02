@@ -47,10 +47,12 @@ jobs:
           cmake --build "$RUNNER_TEMP/jbig2enc/build" -j4
           cmake --install "$RUNNER_TEMP/jbig2enc/build"
       - name: Install veraPDF
-        # The IzPack installer needs an answer file; the GUI pack carries the CLI scripts.
+        # Pinned release with its checksum. The IzPack installer needs an answer
+        # file; the GUI pack carries the CLI scripts.
         run: |
           cd "$RUNNER_TEMP"
-          curl -fsSL -o verapdf-installer.zip https://software.verapdf.org/releases/verapdf-installer.zip
+          curl -fsSL -o verapdf-installer.zip https://software.verapdf.org/releases/1.30/verapdf-greenfield-1.30.2-installer.zip
+          echo "6cc6341cb1af644044054b81f00a6590a7918abb18f762243de115258bcad838  verapdf-installer.zip" | sha256sum -c -
           unzip -q verapdf-installer.zip
           cat > verapdf-auto.xml <<EOF
           <AutomatedInstallation langpack="eng">
