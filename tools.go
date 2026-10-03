@@ -161,7 +161,7 @@ func pythonPDF(ctx context.Context, operation, input, output string, opts option
 		"flatten": opts.flatten, "subset_fonts": opts.subsetFonts, "merge_fonts": opts.mergeFonts,
 		"bitmap": opts.bitmap, "mrc": opts.mrc, "render_dpi": opts.renderDPI, "background_dpi": opts.backgroundDPI,
 		"verbose": opts.verbose, "strip": opts.strip, "font_files": fontFiles, "output_intent": opts.outputIntent,
-		"srgb_icc": filepath.Join(dir, "sRGB2014.icc"),
+		"srgb_icc": filepath.Join(dir, "sRGB2014.icc"), "pdfa": opts.pdfa, "object_streams": !opts.classicXref,
 	}
 	if operation == "text" {
 		request["password"] = opts.password
@@ -178,8 +178,60 @@ func pythonPDF(ctx context.Context, operation, input, output string, opts option
 	return toolError(ctx, "PDF tools", cmd.Run(), &messages, stderr, opts.password)
 }
 
-// pdfaFlavour reads the PDF/A identification the converter wrote into the XMP.
-func pdfaFlavour(ctx context.Context, path string) (string, error) {
+// pdfaIdentification reads the PDF/A part and conformance a document declares in
+// its XMP, as veraPDF flavour names: "2b", "4", "4f". Undeclared documents give "".
+func pdfaIdentification(pdf *model.Context) (string, error) {
+	metadata, _, err := pdf.DereferenceStreamDict(pdf.RootDict["Metadata"])
+	if err != nil || metadata == nil {
+		return "", nil
+	}
+	if err := metadata.Decode(); err != nil {
+		return "", err
+	}
+	part := xmpProperty(metadata.Content, "part")
+	conformance := strings.ToLower(xmpProperty(metadata.Content, "conformance"))
+	switch {
+	case part == "":
+		return "", nil
+	case part == "4" && listContains(",e,f", conformance):
+		return part + conformance, nil
+	case listContains("1,2,3", part) && listContains("a,b,u", conformance):
+		return part + conformance, nil
+	}
+	return "", fmt.Errorf("unsupported PDF/A identification part %q conformance %q", part, conformance)
+}
+
+// xmpProperty finds a PDF/A identification property by namespace and local
+// name, whether it is written as an attribute or as an element, with any prefix.
+func xmpProperty(xmp []byte, name string) string {
+	const pdfaid = "http://www.aiim.org/pdfa/ns/id/"
+	decoder := xml.NewDecoder(bytes.NewReader(xmp))
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return ""
+		}
+		element, ok := token.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		for _, attr := range element.Attr {
+			if attr.Name.Space == pdfaid && attr.Name.Local == name {
+				return strings.TrimSpace(attr.Value)
+			}
+		}
+		if element.Name.Space == pdfaid && element.Name.Local == name {
+			var value string
+			if err := decoder.DecodeElement(&value, &element); err != nil {
+				return ""
+			}
+			return strings.TrimSpace(value)
+		}
+	}
+}
+
+// declaredFlavour reads the identification from a file on disk.
+func declaredFlavour(ctx context.Context, path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -189,89 +241,81 @@ func pdfaFlavour(ctx context.Context, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	metadata, _, err := pdf.DereferenceStreamDict(pdf.RootDict["Metadata"])
-	if err != nil || metadata == nil {
-		return "", errors.New("converted document does not declare PDF/A-4: no XMP metadata")
-	}
-	if err := metadata.Decode(); err != nil {
-		return "", err
-	}
-	xmp := metadata.Content
-	if !pdfaProperty.MatchString(string(xmp)) {
-		return "", errors.New("converted document does not declare PDF/A-4")
-	}
-	if pdfaConformanceF.Match(xmp) {
-		return "4f", nil
-	}
-	return "4", nil
+	return pdfaIdentification(pdf)
 }
 
-var (
-	// XMP properties appear as attributes or as elements that may carry an xmlns.
-	pdfaProperty     = regexp.MustCompile(`pdfaid:part\s*=\s*"4"|<pdfaid:part(?:\s[^>]*)?>\s*4\s*</pdfaid:part>`)
-	pdfaConformanceF = regexp.MustCompile(`pdfaid:conformance\s*=\s*"F"|<pdfaid:conformance(?:\s[^>]*)?>\s*F\s*</pdfaid:conformance>`)
-	veraObject       = regexp.MustCompile(`\((\d+) \d+ obj [A-Za-z]+\)|\(([^()]+)\)$`)
-)
+var veraObject = regexp.MustCompile(`\((\d+) \d+ obj [A-Za-z]+\)|\(([^()]+)\)$`)
 
 // veraPDF clause families, longest prefix first. Hints name the option that resolves them.
 var pdfaCategories = []struct{ prefix, category, hint string }{
 	{"6.2.10", "fonts", "embed the font in the source document or pass --font-file NAME=PATH"},
+	{"6.2.11", "fonts", "embed the font in the source document or pass --font-file NAME=PATH"},
 	{"6.2.3", "color", "pass --output-intent with a valid ICC output or display profile"},
 	{"6.2.4", "color", "pass --output-intent with an ICC profile for the color spaces the document uses"},
 	{"6.2.9", "color", "pass --output-intent with an ICC profile for the color spaces the document uses"},
 	{"6.2", "graphics", "the converter should repair this; report it with the object numbers"},
 	{"6.3", "annotations", "use --flatten annotations, or --strip annotations, hidden, or multimedia"},
 	{"6.4", "forms", "use --strip xfa or --strip actions"},
-	{"6.6", "actions", "use --strip actions"},
+	{"6.5", "actions", "use --strip actions"},
+	{"6.6", "actions or metadata", "use --strip actions; metadata should be repaired by the converter, report it"},
 	{"6.7", "metadata", "the converter should repair this; report it with the object numbers"},
+	{"6.8", "attachments", "use --strip attachments, or --pdfa 3b for arbitrary attachments"},
 	{"6.9", "attachments", "use --strip attachments, or embed only PDF/A attachments"},
 	{"6.1", "structure", "the converter should repair this; report it with the object numbers"},
 	{"6", "structure", "the converter should repair this; report it with the object numbers"},
 }
 
 type veraReport struct {
-	Validations []struct {
-		Profile   string `xml:"profileName,attr"`
-		Compliant bool   `xml:"isCompliant,attr"`
-		Rules     []struct {
-			Clause      string `xml:"clause,attr"`
-			Test        string `xml:"testNumber,attr"`
-			Status      string `xml:"status,attr"`
-			Description string `xml:"description"`
-			Checks      []struct {
-				Status  string `xml:"status,attr"`
-				Context string `xml:"context"`
-			} `xml:"check"`
-		} `xml:"details>rule"`
-	} `xml:"jobs>job>validationReport"`
+	Jobs []struct {
+		Item struct {
+			Name string `xml:"name"`
+		} `xml:"item"`
+		Validation *struct {
+			Profile   string `xml:"profileName,attr"`
+			Compliant bool   `xml:"isCompliant,attr"`
+			Rules     []struct {
+				Clause      string `xml:"clause,attr"`
+				Test        string `xml:"testNumber,attr"`
+				Status      string `xml:"status,attr"`
+				Description string `xml:"description"`
+				Checks      []struct {
+					Status  string `xml:"status,attr"`
+					Context string `xml:"context"`
+				} `xml:"check"`
+			} `xml:"details>rule"`
+		} `xml:"validationReport"`
+	} `xml:"jobs>job"`
 }
 
-// validatePDFA runs veraPDF against the flavour the converter declared and turns
-// failed rules into diagnostics grouped by what resolves them.
-func validatePDFA(ctx context.Context, path string, stderr io.Writer) error {
-	flavour, err := pdfaFlavour(ctx, path)
-	if err != nil {
-		return err
-	}
+// validatePDFA runs veraPDF once over every path with one flavour and returns an
+// error per path: nil for compliant files, diagnostics grouped by what resolves
+// them otherwise. The second result reports a failure to run or read veraPDF.
+func validatePDFA(ctx context.Context, flavour string, paths []string, stderr io.Writer) (map[string]error, error) {
 	binary, err := exec.LookPath("verapdf")
 	if err != nil {
-		return errors.New("PDF/A-4 requires veraPDF on PATH; output was not published")
+		return nil, errors.New("PDF/A validation requires veraPDF on PATH")
 	}
-	args := []string{"--format", "xml", "--flavour", flavour, "--maxfailuresdisplayed", "3", path}
+	absolute := make([]string, len(paths))
+	for i, path := range paths {
+		if absolute[i], err = filepath.Abs(path); err != nil {
+			return nil, err
+		}
+	}
+	args := append([]string{"--format", "xml", "--flavour", flavour, "--maxfailuresdisplayed", "3"}, absolute...)
 	if runtime.GOOS == "windows" && strings.EqualFold(filepath.Ext(binary), ".bat") {
 		// Launch the installed CLI jar directly: cmd.exe would reinterpret paths
 		// containing shell metacharacters or environment-variable expansions.
 		resolved, err := filepath.EvalSymlinks(binary)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		jars, err := filepath.Glob(filepath.Join(filepath.Dir(resolved), "bin", "cli-*.jar"))
 		if err != nil || len(jars) != 1 {
-			return errors.New("cannot locate veraPDF's CLI jar next to its Windows launcher")
+			return nil, errors.New("cannot locate veraPDF's CLI jar next to its Windows launcher")
 		}
 		binary, err = exec.LookPath("java")
 		if err != nil {
-			return errors.New("veraPDF requires Java on PATH")
+			return nil, errors.New("veraPDF requires Java on PATH")
 		}
 		args = append([]string{"-jar", jars[0]}, args...)
 	}
@@ -281,68 +325,88 @@ func validatePDFA(ctx context.Context, path string, stderr io.Writer) error {
 	configureCommand(cmd)
 	// veraPDF exits nonzero for noncompliant files; the report decides.
 	runErr := cmd.Run()
+	var kept bytes.Buffer
+	for _, line := range bytes.SplitAfter(messages.Bytes(), []byte("\n")) {
+		// JVM banners such as "Picked up JAVA_TOOL_OPTIONS" are not diagnostics.
+		if !bytes.HasPrefix(line, []byte("Picked up ")) {
+			kept.Write(line)
+		}
+	}
+	messages.data = kept
 	if len(report.Bytes()) == 0 {
 		if err := toolError(ctx, "veraPDF", runErr, &messages, stderr); err != nil {
-			return err
+			return nil, err
 		}
-		return errors.New("veraPDF produced no report; output was not published")
+		return nil, errors.New("veraPDF produced no report")
 	}
 	if err := toolError(ctx, "veraPDF", nil, &messages, stderr); err != nil {
-		return err
+		return nil, err
 	}
 	if report.truncated {
-		return errors.New("veraPDF report exceeded its size limit")
+		return nil, errors.New("veraPDF report exceeded its size limit")
 	}
 	var parsed veraReport
 	if err := xml.Unmarshal(report.Bytes(), &parsed); err != nil {
-		return fmt.Errorf("veraPDF report: %w", err)
+		return nil, fmt.Errorf("veraPDF report: %w", err)
 	}
-	if len(parsed.Validations) != 1 {
-		return errors.New("veraPDF must report exactly one validation result")
-	}
-	result := parsed.Validations[0]
 	wantProfile := "PDF/A-" + strings.ToUpper(flavour)
-	if result.Compliant && strings.Contains(strings.ToUpper(result.Profile), wantProfile) {
-		return nil
-	}
-	lines := []string{fmt.Sprintf("veraPDF did not confirm %s compliance; output was not published", wantProfile)}
-	for _, rule := range result.Rules {
-		if rule.Status != "failed" {
+	results := map[string]error{}
+	for _, job := range parsed.Jobs {
+		if job.Validation == nil {
 			continue
 		}
-		category, hint := "structure", pdfaCategories[len(pdfaCategories)-1].hint
-		for _, c := range pdfaCategories {
-			if rule.Clause == c.prefix || strings.HasPrefix(rule.Clause, c.prefix+".") {
-				category, hint = c.category, c.hint
-				break
-			}
+		result := job.Validation
+		if result.Compliant && strings.Contains(strings.ToUpper(result.Profile), wantProfile) {
+			results[job.Item.Name] = nil
+			continue
 		}
-		var objects []string
-		for _, check := range rule.Checks {
-			// Keep the innermost object number and the trailing label, e.g. "object 14 Helvetica".
-			var object, label string
-			for _, m := range veraObject.FindAllStringSubmatch(check.Context, -1) {
-				if m[1] != "" {
-					object = "object " + m[1]
-				} else {
-					label = m[2]
+		lines := []string{fmt.Sprintf("veraPDF did not confirm %s compliance; output was not published", wantProfile)}
+		for _, rule := range result.Rules {
+			if rule.Status != "failed" {
+				continue
+			}
+			category, hint := "structure", pdfaCategories[len(pdfaCategories)-1].hint
+			for _, c := range pdfaCategories {
+				if rule.Clause == c.prefix || strings.HasPrefix(rule.Clause, c.prefix+".") {
+					category, hint = c.category, c.hint
+					break
 				}
 			}
-			if text := strings.TrimSpace(object + " " + label); text != "" {
-				objects = append(objects, text)
+			var objects []string
+			for _, check := range rule.Checks {
+				// Keep the innermost object number and the trailing label, e.g. "object 14 Helvetica".
+				var object, label string
+				for _, m := range veraObject.FindAllStringSubmatch(check.Context, -1) {
+					if m[1] != "" {
+						object = "object " + m[1]
+					} else {
+						label = m[2]
+					}
+				}
+				if text := strings.TrimSpace(object + " " + label); text != "" {
+					objects = append(objects, text)
+				}
 			}
+			description := strings.Join(strings.Fields(rule.Description), " ")
+			if len(description) > 160 {
+				description = description[:157] + "..."
+			}
+			line := fmt.Sprintf("  %s %s-%s: %s", category, rule.Clause, rule.Test, description)
+			if len(objects) > 0 {
+				line += " [" + strings.Join(objects, "; ") + "]"
+			}
+			lines = append(lines, line, "    "+hint)
 		}
-		description := strings.Join(strings.Fields(rule.Description), " ")
-		if len(description) > 160 {
-			description = description[:157] + "..."
-		}
-		line := fmt.Sprintf("  %s %s-%s: %s", category, rule.Clause, rule.Test, description)
-		if len(objects) > 0 {
-			line += " [" + strings.Join(objects, "; ") + "]"
-		}
-		lines = append(lines, line, "    "+hint)
+		results[job.Item.Name] = errors.New(strings.Join(lines, "\n"))
 	}
-	return errors.New(strings.Join(lines, "\n"))
+	for i, path := range paths {
+		if _, ok := results[absolute[i]]; !ok {
+			results[path] = errors.New("veraPDF did not report on this file")
+		} else if absolute[i] != path {
+			results[path] = results[absolute[i]]
+		}
+	}
+	return results, nil
 }
 
 func extract(ctx context.Context, input, output string, opts options, stderr io.Writer) (err error) {

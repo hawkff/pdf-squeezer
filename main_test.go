@@ -456,8 +456,8 @@ func assertMissing(t *testing.T, path string) {
 
 func assertNoTemps(t *testing.T, dir string) {
 	t.Helper()
-	paths, err := filepath.Glob(filepath.Join(dir, ".pdf-squeezer-*.pdf"))
+	paths, err := filepath.Glob(filepath.Join(dir, ".pdf-squeezer-*"))
 	if err != nil || len(paths) != 0 {
-		t.Fatalf("temporary files remain: %v, err = %v", paths, err)
+		t.Fatalf("staging directories remain: %v, err = %v", paths, err)
 	}
 }

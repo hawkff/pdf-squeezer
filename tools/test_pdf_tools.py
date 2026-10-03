@@ -51,6 +51,8 @@ def options(**changes):
         "font_files": {},
         "output_intent": "",
         "srgb_icc": str(Path(__file__).with_name("sRGB2014.icc")),
+        "pdfa": "4",
+        "object_streams": True,
     }
     result.update(changes)
     return result
@@ -885,6 +887,98 @@ class PDFToolsTests(unittest.TestCase):
                     font.CharProcs.square.Resources.Font.F1.objgen, expected
                 )
         self.assert_pdfa("4")
+
+    def test_pdfa2b_and_3b_levels(self):
+        if not fontconfig_file("Nimbus Sans") and not fontconfig_file(
+            "Liberation Sans"
+        ):
+            self.skipTest("no metric-compatible fonts are installed")
+        pdf = pikepdf.Pdf.new()
+        text_page(
+            pdf,
+            {"F1": simple_font(pdf, "Helvetica")},
+            b"BT /F1 18 Tf 10 50 Td (Level) Tj ET",
+        )
+        pdf.Root.OpenAction = pikepdf.Dictionary(
+            S=pikepdf.Name.JavaScript, JS=pikepdf.String("app.alert(1)")
+        )
+        pdf.docinfo["/Title"] = "Example title"
+        with pdf.open_metadata(
+            set_pikepdf_as_editor=False, update_docinfo=False
+        ) as meta:
+            meta["pdfx:Custom"] = "custom value"
+        pdf.save(self.source)
+        # JavaScript is allowed in PDF/A-4 and forbidden in PDF/A-2 and PDF/A-3.
+        self.assertEqual(self.convert_pdfa(), "4")
+        with self.assertRaisesRegex(tools.pdfa.ConversionError, "--strip actions"):
+            self.convert_pdfa(pdfa="2b")
+        self.assertEqual(self.convert_pdfa(pdfa="2b", strip="actions"), "2b")
+        with pikepdf.Pdf.open(self.output) as result:
+            self.assertEqual(result.pdf_version, "1.7")
+            self.assertEqual(str(result.docinfo["/Title"]), "Example title")
+            meta = result.open_metadata()
+            self.assertEqual(meta["pdfaid:part"], "2")
+            self.assertEqual(meta["pdfaid:conformance"], "B")
+            self.assertNotIn("pdfaid:rev", meta)
+            self.assertNotIn("pdfx:Custom", meta)
+            self.assertEqual(meta["dc:title"], "Example title")
+            self.assertNotIn("/OpenAction", result.Root)
+        self.assert_pdfa("2b")
+        # Attachments: refused for 2b, associated files for 3b.
+        pdf = pikepdf.Pdf.new()
+        text_page(
+            pdf,
+            {"F1": simple_font(pdf, "Helvetica")},
+            b"BT /F1 18 Tf 10 50 Td (Files) Tj ET",
+        )
+        pdf.attachments["notes.txt"] = pikepdf.AttachedFileSpec(
+            pdf, b"hello", filename="notes.txt"
+        )
+        pdf.save(self.source)
+        with self.assertRaisesRegex(tools.pdfa.ConversionError, "--pdfa 3b"):
+            self.convert_pdfa(pdfa="2b")
+        self.assertEqual(self.convert_pdfa(pdfa="3b"), "3b")
+        with pikepdf.Pdf.open(self.output) as result:
+            spec = result.attachments["notes.txt"].obj
+            self.assertEqual([s.objgen for s in result.Root.AF], [spec.objgen])
+            self.assertEqual(result.open_metadata()["pdfaid:part"], "3")
+        self.assert_pdfa("3b")
+
+    def test_pdfa_without_object_streams_for_pdfa1_inputs(self):
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page(page_size=(50, 50))
+        pdf.save(self.source)
+        self.convert_pdfa(object_streams=False)
+        self.assertNotIn(b"/ObjStm", Path(self.output).read_bytes())
+        self.convert_pdfa(object_streams=True)
+        self.assertIn(b"/ObjStm", Path(self.output).read_bytes())
+
+    def test_soft_masked_images_follow_dpi_and_clip(self):
+        pdf = pikepdf.Pdf.new()
+        base = image_object(
+            pdf, Image.frombytes("RGB", (300, 300), random.Random(5).randbytes(270000))
+        )
+        alpha = Image.linear_gradient("L").resize((300, 300))
+        mask = image_object(pdf, alpha)
+        base.SMask = mask
+        page = pdf.add_blank_page(page_size=(72, 72))
+        page.obj.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im=base))
+        page.obj.Contents = pdf.make_stream(b"q 72 0 0 72 0 0 cm /Im Do Q")
+        pdf.save(self.source, compress_streams=False)
+        before = rendered_samples(self.source)
+        tools.transform(self.source, self.output, options(dpi=72, codecs="flate"))
+        with pikepdf.Pdf.open(self.output) as result:
+            image = result.pages[0].Resources.XObject.Im
+            self.assertEqual((int(image.Width), int(image.Height)), (72, 72))
+            self.assertEqual(
+                (int(image.SMask.Width), int(image.SMask.Height)), (72, 72)
+            )
+            self.assertEqual(image.SMask.Filter, pikepdf.Name.FlateDecode)
+        after = rendered_samples(self.output)
+        diffs = [abs(x - y) for x, y in zip(before[0][2], after[0][2])]
+        self.assertLess(
+            sum(diffs) / len(diffs), 6
+        )  # downsampled noise, same alpha ramp
 
     def test_to_unicode_cleanup_keeps_codespace_and_valid_ranges(self):
         cmap = (
