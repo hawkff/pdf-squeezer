@@ -132,6 +132,20 @@ def placements(pdf, lossless=False):
         if key in active:
             raise ValueError("cyclic Form XObject")
         active = active | {key}
+        # Glyph geometry is not tracked. Type 3 fonts without resources borrow
+        # this context, so even page images may also be drawn inside a glyph.
+        fonts = list(resources.get("/Font", {}).values())
+        fonts.extend(
+            pdfa.selected_font(resources, "gs", name)
+            for name in resources.get("/ExtGState", {})
+        )
+        for font in fonts:
+            if (
+                isinstance(font, pikepdf.Dictionary)
+                and font.get("/Subtype") == pikepdf.Name.Type3
+            ):
+                collect_images(font, blocked)
+                collect_images(font.get("/Resources", resources), blocked)
         instructions = pikepdf.parse_content_stream(owner)
         streams[key] = (owner, resources, instructions)
         stack, path, pending_clip = [], None, False
@@ -263,7 +277,9 @@ def placements(pdf, lossless=False):
             continue
         for key in ("/SMask", "/Mask", "/Pattern", "/Alternates"):
             collect_images(obj.get(key), blocked)
-        if obj.get("/Subtype") == pikepdf.Name.Form and obj.objgen not in streams:
+        if obj.get("/Subtype") == pikepdf.Name.Type3 or (
+            obj.get("/Subtype") == pikepdf.Name.Form and obj.objgen not in streams
+        ):
             collect_images(obj, blocked)
     collect_images(pdf.Root.get("/AcroForm"), blocked)
     for key in blocked:
@@ -669,7 +685,14 @@ def process_images(pdf, options):
         if components == 4 and candidate[1] == pikepdf.Name.DCTDecode:
             obj.Decode = pikepdf.Array([1, 0] * 4)
         if isinstance(soft_mask, pikepdf.Stream) and (cropped or resized):
-            resample_mask(soft_mask, box, size)
+            # A mask with one image parent can still be drawn directly with Do.
+            # Keep its encoded data and dictionary intact for those consumers.
+            private_mask = pdf.make_stream(soft_mask.read_raw_bytes())
+            for key, value in soft_mask.items():
+                if key != "/Length":
+                    private_mask[key] = value
+            resample_mask(private_mask, box, size)
+            obj.SMask = private_mask
         if cropped:
             crops[obj.objgen] = (*box, w, h)
         changed += 1
@@ -747,6 +770,7 @@ def font_glyph_usage(pdf):
     import pikepdf
 
     used, blocked, visited_forms = {}, set(), set()
+    cid_maps = {}
 
     def block_graph(obj, seen=None, depth=0):
         if depth > 100:
@@ -790,8 +814,13 @@ def font_glyph_usage(pdf):
             return
         mapping = descendant.get("/CIDToGIDMap", pikepdf.Name.Identity)
         if isinstance(mapping, pikepdf.Stream):
-            mapping = mapping.read_bytes()
-            if len(mapping) > 131072 or len(mapping) % 2:
+            if mapping.objgen not in cid_maps:
+                data = mapping.read_bytes()
+                cid_maps[mapping.objgen] = (
+                    data if len(data) <= 131072 and len(data) % 2 == 0 else None
+                )
+            mapping = cid_maps[mapping.objgen]
+            if mapping is None:
                 blocked.add(program)
                 return
         elif mapping == pikepdf.Name.Identity:
@@ -834,8 +863,10 @@ def font_glyph_usage(pdf):
                 if not stack:
                     raise ValueError("unbalanced graphics state")
                 font = stack.pop()
-            elif op == "Tf":
-                font = resources.get("/Font", {}).get(args[0])
+            elif op in ("Tf", "gs"):
+                chosen = pdfa.selected_font(resources, op, args[0])
+                if chosen is not None or op == "Tf":
+                    font = chosen
             elif op in ("Tj", "'", '"'):
                 glyphs(font, args[-1])
             elif op == "TJ":
@@ -1000,7 +1031,9 @@ def merge_fonts(pdf, verbose):
         if len(data) > 32 << 20:
             continue
         font = TTFont(io.BytesIO(data), lazy=False)
-        name = re.sub(r"^[A-Z]{6}\+", "", str(descriptor.get("/FontName", "")))
+        name = re.sub(
+            r"^[A-Z]{6}\+", "", str(descriptor.get("/FontName", "")).lstrip("/")
+        )
         if not name:
             continue
         groups.setdefault(name, []).append((obj, descriptor, stream, data, font))

@@ -183,6 +183,46 @@ func TestFinalDeduplicationAcrossLosslessFilters(t *testing.T) {
 	}
 }
 
+func TestExpandInputsSkipsHiddenDirectories(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"visible.pdf", ".file.pdf", ".hidden/inside.pdf", ".hidden/.nested/skipped.pdf", "child/visible.pdf", "child/.nested/skipped.pdf"} {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, path, nil)
+	}
+	for _, tc := range []struct {
+		name      string
+		inputs    []string
+		recursive bool
+		want      []string
+	}{
+		{"recursive", []string{dir}, true, []string{"child/visible.pdf", "visible.pdf"}},
+		{"nonrecursive", []string{dir}, false, []string{"visible.pdf"}},
+		{"explicit hidden root", []string{filepath.Join(dir, ".hidden")}, true, []string{".hidden/inside.pdf"}},
+		{"explicit hidden file", []string{filepath.Join(dir, ".file.pdf")}, true, []string{".file.pdf"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files, err := expandInputs(t.Context(), tc.inputs, tc.recursive)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, file := range files {
+				rel, err := filepath.Rel(dir, file.path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got = append(got, filepath.ToSlash(rel))
+			}
+			if strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestProfilesBatchAndTimestamps(t *testing.T) {
 	dir, output := t.TempDir(), t.TempDir()
 	profilePath := filepath.Join(t.TempDir(), "profile.json")
@@ -480,6 +520,101 @@ func TestPDFAValidationFailsClosed(t *testing.T) {
 	}
 }
 
+func TestDeclaredPDFAMissingValidator(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	for _, count := range []int{1, 2, validationBatch + 1} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			dir, output := t.TempDir(), t.TempDir()
+			original := pdfaPDF("2", "B")
+			for i := range count {
+				writeFile(t, filepath.Join(dir, fmt.Sprintf("%02d.pdf", i)), original)
+			}
+			var messages bytes.Buffer
+			if err := run(t.Context(), []string{"-o", output, dir}, io.Discard, &messages); err != nil {
+				t.Fatalf("%v\n%s", err, &messages)
+			}
+			if strings.Count(messages.String(), "declared PDF/A conformance is not verified") != 1 {
+				t.Fatalf("expected one warning: %s", &messages)
+			}
+			for i := range count {
+				input := filepath.Join(dir, fmt.Sprintf("%02d.pdf", i))
+				if !bytes.Equal(readFile(t, input), original) {
+					t.Fatal("input changed")
+				}
+				path := filepath.Join(output, fmt.Sprintf("%02d.squeezed.pdf", i))
+				if flavour, err := declaredFlavour(t.Context(), path); err != nil || flavour != "2b" {
+					t.Fatalf("declaration changed: %q, %v", flavour, err)
+				}
+			}
+			assertNoTemps(t, output)
+		})
+	}
+	for _, count := range []int{1, 2} {
+		var batch []*staged
+		for range count {
+			batch = append(batch, &staged{path: "converted.pdf", flavour: "4", converted: true})
+		}
+		v := verifier{stderr: io.Discard}
+		v.validate(t.Context(), batch)
+		for _, s := range batch {
+			if err := v.check(t.Context(), s); err == nil {
+				t.Fatal("converted output accepted without validator")
+			}
+		}
+	}
+}
+
+func TestVerifierRetrySeparatesToolFailuresAndVerdicts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX tool stub")
+	}
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "verapdf")
+	writeFile(t, stub, []byte(`#!/bin/sh
+shift 6
+[ "$#" = 1 ] || exit 1
+case "$1" in
+  */unavailable.pdf) exit 1 ;;
+  */rejected.pdf|*/invalid.pdf) compliant=false ;;
+  *) compliant=true ;;
+esac
+printf '<report><jobs><job><item><name>%s</name></item><validationReport profileName="PDF/A-4 validation profile" isCompliant="%s"/></job></jobs></report>' "$1" "$compliant"
+`))
+	if err := os.Chmod(stub, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	for _, tc := range []struct {
+		name, output, input               string
+		converted, wantError, toolFailure bool
+	}{
+		{"tool unavailable", "unavailable", "valid", false, false, true},
+		{"converted tool unavailable", "unavailable", "valid", true, true, true},
+		{"compliant", "compliant", "valid", false, false, false},
+		{"invalid input", "rejected", "invalid", false, false, false},
+		{"valid input", "rejected", "valid", false, true, false},
+		{"unverified input", "rejected", "unavailable", false, true, false},
+		{"converted rejection", "rejected", "invalid", true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &staged{path: filepath.Join(dir, tc.output+".pdf"), input: filepath.Join(dir, tc.input+".pdf"), flavour: "4", converted: tc.converted}
+			other := &staged{path: filepath.Join(dir, "other.pdf"), flavour: "4"}
+			var messages bytes.Buffer
+			v := verifier{stderr: &messages}
+			v.validate(t.Context(), []*staged{s, other})
+			if _, failed := v.failed[s]; failed != tc.toolFailure {
+				t.Fatalf("tool failure = %v, want %v", failed, tc.toolFailure)
+			}
+			if err := v.check(t.Context(), s); (err != nil) != tc.wantError {
+				t.Fatalf("check error = %v", err)
+			}
+			if err := v.check(t.Context(), other); err != nil {
+				t.Fatalf("unrelated compliant file failed: %v", err)
+			}
+		})
+	}
+}
+
 func TestDeclaredPDFA1KeepsClassicCrossReference(t *testing.T) {
 	dir := t.TempDir()
 	input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
@@ -663,6 +798,26 @@ func TestPasswordFileReuseAndMetadataDates(t *testing.T) {
 	opts, _, _, err := parseOptions(t.Context(), []string{"--password-file", path, "--encrypt-owner-file", path, "input.pdf"}, io.Discard)
 	if err != nil || opts.password != "fictional-example-password" || opts.encryptOwner != opts.password {
 		t.Fatalf("shared file not read for both uses: %v", err)
+	}
+}
+
+func TestLosslessKeepsGrayEndpointSamples(t *testing.T) {
+	samples := bytes.Repeat([]byte{0, 255}, 2048)
+	dir := t.TempDir()
+	input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+	writeFile(t, input, imagePDF(8, "DeviceGray", "", samples))
+	if err := run(t.Context(), []string{"--lossless", "--force-recompression", "-o", output, input}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	sd := firstImage(t, readContext(t, output, ""))
+	if bits := sd.IntEntry("BitsPerComponent"); bits == nil || *bits != 8 {
+		t.Errorf("lossless mode changed 8-bit samples: %v", bits)
+	}
+	if cs := sd.NameEntry("ColorSpace"); cs == nil || *cs != "DeviceGray" {
+		t.Error("lossless mode changed DeviceGray")
+	}
+	if err := sd.Decode(); err != nil || !bytes.Equal(sd.Content, samples) {
+		t.Fatalf("decoded samples changed: %v", err)
 	}
 }
 

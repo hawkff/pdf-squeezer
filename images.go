@@ -349,13 +349,13 @@ func reencode(ctx context.Context, job *imageJob, opts options) encoding {
 		samples = highBytes(samples)
 		bits, out.bpc = 8, 8
 	}
-	if comps == 3 && job.device && !opts.lossless && allGray(samples, bits) {
+	if comps == 3 && job.device && !opts.lossless && opts.colorReduction != "preserve" && allGray(samples, bits) {
 		samples, comps, out.gray = grayChannel(samples, bits), 1, true
 	}
 	if bits == 1 {
-		return encodePacked(ctx, sd, samples, out, opts.force)
+		return encodePacked(ctx, sd, samples, out, opts)
 	}
-	bilevel := bits == 8 && comps == 1 && !job.softMask && job.device && onlyBlackAndWhite(samples)
+	bilevel := bits == 8 && comps == 1 && !opts.lossless && opts.colorReduction != "preserve" && !job.softMask && job.device && onlyBlackAndWhite(samples)
 	var img image.Image
 	switch {
 	case comps == 4:
@@ -363,7 +363,7 @@ func reencode(ctx context.Context, job *imageJob, opts options) encoding {
 		if !listContains(opts.imageCodecs, "flate") {
 			return preserve("no permitted CMYK codec")
 		}
-		data, err := deflateSamples(ctx, samples)
+		data, err := deflateSamples(ctx, samples, opts.compression == "heavy")
 		if err != nil {
 			return encoding{err: err}
 		}
@@ -410,12 +410,22 @@ func reencode(ctx context.Context, job *imageJob, opts options) encoding {
 		img = rgba
 	}
 	if listContains(opts.imageCodecs, "flate") || bilevel || job.softMask {
-		data, err := pngIDAT(ctx, img)
+		data, err := pngIDAT(ctx, img, opts.compression == "heavy")
 		if err != nil {
 			return encoding{err: err}
 		}
 		out.data, out.filter = data, "FlateDecode"
 		out.parms = types.Dict{"Predictor": types.Integer(15), "Colors": types.Integer(comps), "BitsPerComponent": types.Integer(out.bpc), "Columns": types.Integer(w)}
+	}
+	if opts.compression == "heavy" && !bilevel && (listContains(opts.imageCodecs, "flate") || job.softMask) {
+		// Some scan samples compress better without PNG row predictors.
+		data, err := deflateSamples(ctx, samples, true)
+		if err != nil {
+			return encoding{err: err}
+		}
+		if out.data == nil || len(data) < len(out.data) {
+			out.data, out.filter, out.parms = data, "FlateDecode", nil
+		}
 	}
 	if bits == 8 && !bilevel && !job.softMask && !opts.lossless && listContains(opts.imageCodecs, "jpeg") {
 		var buf bytes.Buffer
@@ -432,19 +442,26 @@ func reencode(ctx context.Context, job *imageJob, opts options) encoding {
 	return keepEncoding(sd, out, opts.force)
 }
 
-func encodePacked(ctx context.Context, sd *types.StreamDict, samples []byte, out encoding, force bool) encoding {
-	data, err := deflateSamples(ctx, samples)
+func encodePacked(ctx context.Context, sd *types.StreamDict, samples []byte, out encoding, opts options) encoding {
+	data, err := deflateSamples(ctx, samples, opts.compression == "heavy")
 	if err != nil {
 		return encoding{err: err}
 	}
 	out.data, out.filter, out.bpc = data, "FlateDecode", 1
-	return keepEncoding(sd, out, force)
+	return keepEncoding(sd, out, opts.force)
 }
 
-func deflateSamples(ctx context.Context, samples []byte) ([]byte, error) {
+func deflateSamples(ctx context.Context, samples []byte, best bool) ([]byte, error) {
 	var buf bytes.Buffer
-	w := zlib.NewWriter(contextWriter{ctx, &buf})
-	_, err := io.Copy(w, contextReader{ctx, bytes.NewReader(samples)})
+	level := zlib.DefaultCompression
+	if best {
+		level = zlib.BestCompression
+	}
+	w, err := zlib.NewWriterLevel(contextWriter{ctx, &buf}, level)
+	if err != nil {
+		return nil, err
+	}
+	_, err = io.Copy(w, contextReader{ctx, bytes.NewReader(samples)})
 	err = errors.Join(err, w.Close())
 	return buf.Bytes(), err
 }
@@ -580,7 +597,21 @@ func jpegSamples(ctx context.Context, img image.Image) ([]byte, int, error) {
 	switch img := img.(type) {
 	case *image.Gray:
 		return img.Pix, 1, nil
-	case *image.YCbCr, *image.RGBA, *image.NRGBA:
+	case *image.YCbCr:
+		out := make([]byte, 0, b.Dx()*b.Dy()*3)
+		for y := b.Min.Y; y < b.Max.Y; y++ {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+			yOffset := img.YOffset(b.Min.X, y)
+			for x := b.Min.X; x < b.Max.X; x++ {
+				cOffset := img.COffset(x, y)
+				r, g, bl := color.YCbCrToRGB(img.Y[yOffset+x-b.Min.X], img.Cb[cOffset], img.Cr[cOffset])
+				out = append(out, r, g, bl)
+			}
+		}
+		return out, 3, nil
+	case *image.RGBA, *image.NRGBA:
 		out := make([]byte, 0, b.Dx()*b.Dy()*3)
 		for y := b.Min.Y; y < b.Max.Y; y++ {
 			if err := ctx.Err(); err != nil {
@@ -623,9 +654,13 @@ func onlyBlackAndWhite(gray []byte) bool {
 }
 
 // PNG IDAT data is exactly the zlib stream expected by FlateDecode/Predictor 15.
-func pngIDAT(ctx context.Context, img image.Image) ([]byte, error) {
+func pngIDAT(ctx context.Context, img image.Image, best bool) ([]byte, error) {
 	var file bytes.Buffer
-	if err := png.Encode(contextWriter{ctx, &file}, img); err != nil {
+	encoder := png.Encoder{}
+	if best {
+		encoder.CompressionLevel = png.BestCompression
+	}
+	if err := encoder.Encode(contextWriter{ctx, &file}, img); err != nil {
 		return nil, err
 	}
 	var idat []byte

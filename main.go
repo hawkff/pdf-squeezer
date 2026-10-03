@@ -58,6 +58,20 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(files) == 0 {
 		return errors.New("no input PDFs found")
 	}
+	if len(opts.outputs) > 1 {
+		if len(opts.outputs) != len(files) || len(inputs) != len(files) {
+			return errors.New("repeat --output exactly once per distinct input file")
+		}
+		for _, input := range inputs {
+			info, err := os.Stat(input)
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return errors.New("per-input outputs require files, not directory inputs")
+			}
+		}
+	}
 	outputDir := false
 	if opts.output != "" {
 		info, err := os.Stat(opts.output)
@@ -83,6 +97,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			name = base + ".txt"
 		}
 		output := opts.output
+		if len(opts.outputs) > 1 {
+			output = opts.outputs[i]
+		}
 		if output == "" {
 			output = filepath.Join(filepath.Dir(file.path), name)
 		}
@@ -193,12 +210,12 @@ func (s *staged) cleanup() { os.RemoveAll(s.work) }
 type verifier struct {
 	stderr   io.Writer
 	verdicts map[*staged]error
-	failed   map[string]error // tool failure per flavour
+	failed   map[*staged]error // tool failures are not conformance verdicts
 	warned   bool
 }
 
 func (v *verifier) validate(ctx context.Context, batch []*staged) {
-	v.verdicts, v.failed = map[*staged]error{}, map[string]error{}
+	v.verdicts, v.failed = map[*staged]error{}, map[*staged]error{}
 	groups := map[string][]*staged{}
 	for _, s := range batch {
 		if s.flavour != "" {
@@ -212,22 +229,25 @@ func (v *verifier) validate(ctx context.Context, batch []*staged) {
 		}
 		results, err := validatePDFA(ctx, flavour, paths, v.stderr)
 		if err != nil && len(group) > 1 && ctx.Err() == nil {
-			// One oversized report or one broken file must not decide for the batch.
-			results, err = map[string]error{}, nil
-			for _, s := range group {
-				single, singleErr := validatePDFA(ctx, flavour, []string{s.path}, v.stderr)
-				if singleErr != nil {
-					single = map[string]error{s.path: singleErr}
+			// Retry file-specific report failures, but not a missing validator.
+			if _, lookupErr := exec.LookPath("verapdf"); lookupErr == nil {
+				for _, s := range group {
+					single, singleErr := validatePDFA(ctx, flavour, []string{s.path}, v.stderr)
+					if singleErr != nil {
+						v.failed[s] = singleErr
+					} else {
+						v.verdicts[s] = single[s.path]
+					}
 				}
-				results[s.path] = single[s.path]
+				continue
 			}
 		}
-		if err != nil {
-			v.failed[flavour] = err
-			continue
-		}
 		for _, s := range group {
-			v.verdicts[s] = results[s.path]
+			if err != nil {
+				v.failed[s] = err
+			} else {
+				v.verdicts[s] = results[s.path]
+			}
 		}
 	}
 }
@@ -240,7 +260,7 @@ func (v *verifier) check(ctx context.Context, s *staged) error {
 		return nil
 	}
 	label := "PDF/A-" + strings.ToUpper(s.flavour)
-	if err, failed := v.failed[s.flavour]; failed {
+	if err, failed := v.failed[s]; failed {
 		if s.converted {
 			return err
 		}
@@ -501,7 +521,7 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 		}
 		logf("%s", stats)
 	}
-	if opts.timestamps == "preserve" && !opts.privacy {
+	if opts.timestamps != "now" && !opts.privacy {
 		if err := restoreDocumentDates(pdf, originalDates); err != nil {
 			return nil, err
 		}

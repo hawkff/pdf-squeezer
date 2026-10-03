@@ -30,6 +30,7 @@ AGENTS.local.md
 __pycache__/
 *.pyc
 *.profile.json
+*.pdfscp
 *-password.txt
 
 # Editors and macOS metadata
