@@ -183,26 +183,11 @@ const validationBatch = 32
 type staged struct {
 	input, output, path, work string
 	info                      os.FileInfo
-	original                  *os.File // the checked input, kept open for the size fallback
-	flavour                   string   // veraPDF flavour to confirm, "" for none
-	converted                 bool     // --pdfa produced it: a failed check is fatal
+	flavour                   string // veraPDF flavour to confirm, "" for none
+	converted                 bool   // --pdfa produced it: a failed check is fatal
 }
 
-// verified is the file veraPDF checks: the staged result, or the unchanged input.
-func (s *staged) verified() string {
-	if s.original != nil {
-		return s.input
-	}
-	return s.path
-}
-
-func (s *staged) cleanup() {
-	if s.original != nil {
-		s.original.Close()
-		s.original = nil
-	}
-	os.RemoveAll(s.work)
-}
+func (s *staged) cleanup() { os.RemoveAll(s.work) }
 
 // verifier runs veraPDF once per batch and flavour and keeps each verdict.
 type verifier struct {
@@ -223,18 +208,18 @@ func (v *verifier) validate(ctx context.Context, batch []*staged) {
 	for flavour, group := range groups {
 		paths := make([]string, len(group))
 		for i, s := range group {
-			paths[i] = s.verified()
+			paths[i] = s.path
 		}
 		results, err := validatePDFA(ctx, flavour, paths, v.stderr)
 		if err != nil && len(group) > 1 && ctx.Err() == nil {
 			// One oversized report or one broken file must not decide for the batch.
 			results, err = map[string]error{}, nil
 			for _, s := range group {
-				single, singleErr := validatePDFA(ctx, flavour, []string{s.verified()}, v.stderr)
+				single, singleErr := validatePDFA(ctx, flavour, []string{s.path}, v.stderr)
 				if singleErr != nil {
-					single = map[string]error{s.verified(): singleErr}
+					single = map[string]error{s.path: singleErr}
 				}
-				results[s.verified()] = single[s.verified()]
+				results[s.path] = single[s.path]
 			}
 		}
 		if err != nil {
@@ -242,7 +227,7 @@ func (v *verifier) validate(ctx context.Context, batch []*staged) {
 			continue
 		}
 		for _, s := range group {
-			v.verdicts[s] = results[s.verified()]
+			v.verdicts[s] = results[s.path]
 		}
 	}
 }
@@ -272,11 +257,9 @@ func (v *verifier) check(ctx context.Context, s *staged) error {
 	if s.converted {
 		return verdict
 	}
-	if s.original == nil {
-		inputs, err := validatePDFA(ctx, s.flavour, []string{s.input}, v.stderr)
-		if err == nil && inputs[s.input] == nil {
-			return fmt.Errorf("compression broke the input's %s conformance; use --pdfa to repair it or report this:\n%w", label, verdict)
-		}
+	inputs, err := validatePDFA(ctx, s.flavour, []string{s.input}, v.stderr)
+	if err == nil && inputs[s.input] == nil {
+		return fmt.Errorf("compression broke the input's %s conformance; use --pdfa to repair it or report this:\n%w", label, verdict)
 	}
 	fmt.Fprintf(v.stderr, "warning: %s declares %s but does not conform to it; the output is not verified\n", s.input, label)
 	return nil
@@ -284,20 +267,11 @@ func (v *verifier) check(ctx context.Context, s *staged) error {
 
 func publish(ctx context.Context, s *staged, opts options) (int64, int64, error) {
 	defer s.cleanup()
-	var source io.ReadSeeker
-	if s.original != nil {
-		source = s.original
-	} else {
-		file, err := os.Open(s.path)
-		if err != nil {
-			return 0, 0, err
-		}
-		defer file.Close()
-		source = file
-	}
-	if _, err := source.Seek(0, io.SeekStart); err != nil {
+	source, err := os.Open(s.path)
+	if err != nil {
 		return 0, 0, err
 	}
+	defer source.Close()
 	written, err := writeNew(ctx, s.output, source)
 	if err == nil && opts.timestamps == "preserve" {
 		if err = os.Chtimes(s.output, s.info.ModTime(), s.info.ModTime()); err != nil {
@@ -345,7 +319,7 @@ func configuration(password string) *model.Configuration {
 
 // prepare compresses and transforms input into a staged file that pdfcpu has
 // validated. The caller confirms PDF/A with veraPDF when needed and publishes.
-func prepare(ctx context.Context, input, output string, opts options, stderr io.Writer) (result *staged, err error) {
+func prepare(ctx context.Context, input, output string, opts options, stderr io.Writer) (*staged, error) {
 	stderr = &lockedWriter{writer: stderr}
 	logf := func(format string, args ...any) {
 		if opts.verbose {
@@ -359,11 +333,7 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if result == nil || result.original != in {
-			in.Close()
-		}
-	}()
+	defer in.Close()
 	info, err := in.Stat()
 	if err != nil {
 		return nil, err
@@ -629,11 +599,19 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 		return nil, fmt.Errorf("output validation: %w", err)
 	}
 	logf("%s: %d bytes in %s; validated", opts.engine, ci.Size(), time.Since(start).Round(time.Millisecond))
-	result = &staged{input: input, output: output, path: current, work: work, info: info, flavour: flavour, converted: converted}
 	if ci.Size() >= info.Size() && !opts.requiredOutput() {
-		// The checked original is published unchanged; a declared level is still
-		// verified so that a nonconforming input gets its warning.
-		result.original = in
+		// The input is published unchanged. A staged copy of the bytes this run
+		// opened is what veraPDF checks and what publish copies, so a file
+		// swapped in under the input path cannot slip through.
+		if current, err = stagePath(work); err != nil {
+			return nil, err
+		}
+		if _, err := in.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		if err := copyStage(ctx, current, in); err != nil {
+			return nil, err
+		}
 	}
 	// Only the final stage waits for publication; intermediates would otherwise
 	// pile up across a validation batch.
@@ -646,7 +624,7 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 			os.RemoveAll(path)
 		}
 	}
-	return result, nil
+	return &staged{input: input, output: output, path: current, work: work, info: info, flavour: flavour, converted: converted}, nil
 }
 func stagePath(dir string) (string, error) {
 	f, err := os.CreateTemp(dir, "stage-*.pdf")

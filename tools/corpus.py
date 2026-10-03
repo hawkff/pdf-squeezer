@@ -64,22 +64,22 @@ def main():
         relative = path.relative_to(args.corpus)
         output = args.results / relative.parent / f"{relative.stem}.pdfa{args.pdfa}.pdf"
         output.parent.mkdir(parents=True, exist_ok=True)
-        if output.exists():
-            if not args.overwrite:
-                outcomes["skipped"] += 1
-                print(
-                    f"skipped          {path.name}  [output exists; pass --overwrite]",
-                    flush=True,
-                )
-                continue
-            output.unlink()
+        if output.exists() and not args.overwrite:
+            outcomes["skipped"] += 1
+            print(
+                f"skipped          {path.name}  [output exists; pass --overwrite]",
+                flush=True,
+            )
+            continue
+        partial = output.with_name(output.name + ".part")
+        partial.unlink(missing_ok=True)
         command = [
             args.binary,
             "--pdfa",
             args.pdfa,
             *shlex.split(args.extra),
             "-o",
-            str(output),
+            str(partial),
             str(path),
         ]
         started = time.monotonic()
@@ -95,6 +95,10 @@ def main():
         except subprocess.TimeoutExpired:
             code, stderr = -1, "timed out"
         outcome, detail = classify(code, stderr)
+        if outcome == "converted":
+            partial.replace(output)
+        else:
+            partial.unlink(missing_ok=True)
         outcomes[outcome] += 1
         details[outcome][detail] += 1
         print(
