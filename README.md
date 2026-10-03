@@ -13,8 +13,10 @@ go install github.com/hawkff/pdf-squeezer@latest
 The container image carries every optional tool (Python helpers, qpdf, Ghostscript, veraPDF with a Java runtime, fontconfig with URW and Liberation fonts), so PDF/A conversion works without any setup:
 
 ```sh
-docker run --rm -v "$PWD:/data" ghcr.io/hawkff/pdf-squeezer:latest --pdfa 4 report.pdf
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/data" ghcr.io/hawkff/pdf-squeezer:latest --pdfa 4 report.pdf
 ```
+
+The image runs as an unprivileged user; `--user` makes the output files yours.
 
 ## Use
 

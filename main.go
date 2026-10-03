@@ -153,6 +153,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	verifier.validate(ctx, pending)
 	flush()
+	if err := ctx.Err(); err != nil {
+		failures = append(failures, err)
+	}
 	return errors.Join(failures...)
 }
 
@@ -180,12 +183,18 @@ const validationBatch = 32
 type staged struct {
 	input, output, path, work string
 	info                      os.FileInfo
-	useOriginal               bool
-	flavour                   string // veraPDF flavour to confirm, "" for none
-	converted                 bool   // --pdfa produced it: a failed check is fatal
+	original                  *os.File // the checked input, kept open for the size fallback
+	flavour                   string   // veraPDF flavour to confirm, "" for none
+	converted                 bool     // --pdfa produced it: a failed check is fatal
 }
 
-func (s *staged) cleanup() { os.RemoveAll(s.work) }
+func (s *staged) cleanup() {
+	if s.original != nil {
+		s.original.Close()
+		s.original = nil
+	}
+	os.RemoveAll(s.work)
+}
 
 // verifier runs veraPDF once per batch and flavour and keeps each verdict.
 type verifier struct {
@@ -209,6 +218,17 @@ func (v *verifier) validate(ctx context.Context, batch []*staged) {
 			paths[i] = s.path
 		}
 		results, err := validatePDFA(ctx, flavour, paths, v.stderr)
+		if err != nil && len(group) > 1 && ctx.Err() == nil {
+			// One oversized report or one broken file must not decide for the batch.
+			results, err = map[string]error{}, nil
+			for _, s := range group {
+				single, singleErr := validatePDFA(ctx, flavour, []string{s.path}, v.stderr)
+				if singleErr != nil {
+					single = map[string]error{s.path: singleErr}
+				}
+				results[s.path] = single[s.path]
+			}
+		}
 		if err != nil {
 			v.failed[flavour] = err
 			continue
@@ -254,15 +274,20 @@ func (v *verifier) check(ctx context.Context, s *staged) error {
 
 func publish(ctx context.Context, s *staged, opts options) (int64, int64, error) {
 	defer s.cleanup()
-	path := s.path
-	if s.useOriginal {
-		path = s.input
+	var source io.ReadSeeker
+	if s.original != nil {
+		source = s.original
+	} else {
+		file, err := os.Open(s.path)
+		if err != nil {
+			return 0, 0, err
+		}
+		defer file.Close()
+		source = file
 	}
-	source, err := os.Open(path)
-	if err != nil {
+	if _, err := source.Seek(0, io.SeekStart); err != nil {
 		return 0, 0, err
 	}
-	defer source.Close()
 	written, err := writeNew(ctx, s.output, source)
 	if err == nil && opts.timestamps == "preserve" {
 		if err = os.Chtimes(s.output, s.info.ModTime(), s.info.ModTime()); err != nil {
@@ -324,7 +349,11 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 	if err != nil {
 		return nil, err
 	}
-	defer in.Close()
+	defer func() {
+		if result == nil || result.original != in {
+			in.Close()
+		}
+	}()
 	info, err := in.Stat()
 	if err != nil {
 		return nil, err
@@ -590,11 +619,23 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 		return nil, fmt.Errorf("output validation: %w", err)
 	}
 	logf("%s: %d bytes in %s; validated", opts.engine, ci.Size(), time.Since(start).Round(time.Millisecond))
-	useOriginal := ci.Size() >= info.Size() && !opts.requiredOutput()
-	if useOriginal {
-		flavour = "" // the original bytes are published unchanged
+	result = &staged{input: input, output: output, path: current, work: work, info: info, flavour: flavour, converted: converted}
+	if ci.Size() >= info.Size() && !opts.requiredOutput() {
+		// The checked original is published unchanged, so nothing needs verifying.
+		result.original, result.flavour = in, ""
 	}
-	return &staged{input: input, output: output, path: current, work: work, info: info, useOriginal: useOriginal, flavour: flavour, converted: converted}, nil
+	// Only the final stage waits for publication; intermediates would otherwise
+	// pile up across a validation batch.
+	entries, err := os.ReadDir(work)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if path := filepath.Join(work, entry.Name()); path != current {
+			os.RemoveAll(path)
+		}
+	}
+	return result, nil
 }
 func stagePath(dir string) (string, error) {
 	f, err := os.CreateTemp(dir, "stage-*.pdf")

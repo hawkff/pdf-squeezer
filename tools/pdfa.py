@@ -753,16 +753,18 @@ def strip_features(pdf, strip, problems, level=None):
                 action_holder(annot, where)
                 additional_actions(annot, where, level["catalog_page_aa"])
             kept.append(annot)
-        # A popup without its parent annotation keeps the parent reachable.
+        # A popup without its parent annotation keeps the parent reachable, and a
+        # popup carrying a direct copy of a removed parent carries its content.
         kept_ids = {a.objgen for a in kept if a.is_indirect}
-        orphans = [
-            a
-            for a in kept
-            if a.get("/Subtype") == Name.Popup
-            and isinstance(a.get("/Parent"), Dictionary)
-            and a.Parent.is_indirect
-            and a.Parent.objgen not in kept_ids
-        ]
+        dropped_kinds = {
+            pdf_name(a.get("/Subtype"))
+            for a in page.obj.get("/Annots") or []
+            if isinstance(a, Dictionary)
+            and not any(
+                a is k or (a.is_indirect and a.objgen in kept_ids) for k in kept
+            )
+        }
+        orphans = [a for a in kept if orphaned_popup(a, kept_ids, dropped_kinds)]
         if orphans:
             kept = [a for a in kept if a not in orphans]
             changed = True
@@ -787,6 +789,15 @@ def strip_features(pdf, strip, problems, level=None):
             del names["/EmbeddedFiles"]
         for holder in list(associated_file_holders(pdf)):
             del holder["/AF"]
+
+
+def orphaned_popup(annot, kept_ids, dropped_kinds):
+    parent = annot.get("/Parent")
+    if annot.get("/Subtype") != Name.Popup or not isinstance(parent, Dictionary):
+        return False
+    if parent.is_indirect:
+        return parent.objgen not in kept_ids
+    return pdf_name(parent.get("/Subtype")) in dropped_kinds
 
 
 def annotation_category(subtype):

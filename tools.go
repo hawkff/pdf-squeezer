@@ -201,14 +201,33 @@ func pdfaIdentification(pdf *model.Context) (string, error) {
 	return "", fmt.Errorf("unsupported PDF/A identification part %q conformance %q", part, conformance)
 }
 
-// xmpProperty finds a pdfaid property written as an attribute or as an element.
+// xmpProperty finds a PDF/A identification property by namespace and local
+// name, whether it is written as an attribute or as an element, with any prefix.
 func xmpProperty(xmp []byte, name string) string {
-	pattern := regexp.MustCompile(`pdfaid:` + name + `\s*=\s*"([^"]*)"|<pdfaid:` + name + `(?:\s[^>]*)?>\s*([^<\s]*)\s*</pdfaid:` + name + `>`)
-	m := pattern.FindSubmatch(xmp)
-	if m == nil {
-		return ""
+	const pdfaid = "http://www.aiim.org/pdfa/ns/id/"
+	decoder := xml.NewDecoder(bytes.NewReader(xmp))
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return ""
+		}
+		element, ok := token.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		for _, attr := range element.Attr {
+			if attr.Name.Space == pdfaid && attr.Name.Local == name {
+				return strings.TrimSpace(attr.Value)
+			}
+		}
+		if element.Name.Space == pdfaid && element.Name.Local == name {
+			var value string
+			if err := decoder.DecodeElement(&value, &element); err != nil {
+				return ""
+			}
+			return strings.TrimSpace(value)
+		}
 	}
-	return strings.TrimSpace(string(m[1]) + string(m[2]))
 }
 
 // declaredFlavour reads the identification from a file on disk.

@@ -11,6 +11,7 @@ refusals by the option they ask for and rejections by rule.
 import argparse
 import collections
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -57,15 +58,16 @@ def main():
         collections.defaultdict(collections.Counter),
     )
     for path in files:
-        relative = path.relative_to(args.corpus).with_suffix("")
-        output = args.results / f"{'_'.join(relative.parts)}.pdfa{args.pdfa}.pdf"
+        relative = path.relative_to(args.corpus)
+        output = args.results / relative.parent / f"{relative.stem}.pdfa{args.pdfa}.pdf"
+        output.parent.mkdir(parents=True, exist_ok=True)
         if output.exists():
             output.unlink()
         command = [
             args.binary,
             "--pdfa",
             args.pdfa,
-            *args.extra.split(),
+            *shlex.split(args.extra),
             "-o",
             str(output),
             str(path),
