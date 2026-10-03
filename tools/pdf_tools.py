@@ -122,7 +122,12 @@ def placements(pdf, lossless=False):
     import pikepdf
 
     uses, streams, blocked = {}, {}, set()
+    checked_glyphs = set()
     visits = 0
+
+    @functools.lru_cache(maxsize=64)
+    def type3_encoding(objgen):
+        return pdfa.simple_encoding(pdf.get_object(objgen), [None] * 256)
 
     def walk(
         owner,
@@ -147,7 +152,7 @@ def placements(pdf, lossless=False):
         instructions = pikepdf.parse_content_stream(owner)
         streams[key] = (owner, resources, instructions)
         stack, path, pending_clip = [], None, False
-        glyph_fonts = set()
+        borrowed_key = None
         for instruction in instructions:
             # Inline image objects are preserved by unparse_content_stream.
             if not hasattr(instruction, "operator"):
@@ -190,23 +195,64 @@ def placements(pdf, lossless=False):
                     isinstance(font, pikepdf.Dictionary)
                     and font.get("/Subtype") == pikepdf.Name.Type3
                 ):
-                    if font.is_indirect and font.objgen in glyph_fonts:
+                    text = args[0] if op == "TJ" and args else args[-1:]
+                    codes = {
+                        code
+                        for item in text
+                        if isinstance(item, pikepdf.String)
+                        for code in bytes(item)
+                    }
+                    if not codes:
                         continue
-                    if font.is_indirect:
-                        glyph_fonts.add(font.objgen)
-                    # Glyph geometry is unknown, but its invoked images can be
-                    # protected without disabling unrelated page images.
-                    for glyph in font.get("/CharProcs", {}).values():
-                        if isinstance(glyph, pikepdf.Stream):
-                            walk(
-                                glyph,
-                                font.get("/Resources", resources),
-                                IDENTITY,
-                                clip,
-                                active,
-                                depth + 1,
-                                preserve=True,
+                    encoding = (
+                        type3_encoding(font.objgen)
+                        if font.is_indirect
+                        else pdfa.simple_encoding(font, [None] * 256)
+                    )
+                    names = {encoding[code] for code in codes}
+                    font_key = font.objgen if font.is_indirect else font.unparse()
+                    glyph_resources = font.get("/Resources")
+                    if isinstance(glyph_resources, pikepdf.Dictionary):
+                        context_key = ("font", font_key)
+                    else:
+                        glyph_resources = resources
+                        if borrowed_key is None:
+                            borrowed_key = (
+                                "resources",
+                                resources.objgen
+                                if resources.is_indirect
+                                else resources.unparse(),
                             )
+                        context_key = borrowed_key
+                    if None in names:
+                        # Unknown encodings retain the conservative resource scan;
+                        # do not execute unused glyph programs to guess a mapping.
+                        key = ("unknown", font_key, context_key)
+                        if key not in checked_glyphs:
+                            checked_glyphs.add(key)
+                            collect_images(font, blocked)
+                            collect_images(glyph_resources, blocked)
+                        continue
+                    procs = font.get("/CharProcs", {})
+                    for name in names:
+                        glyph = procs.get("/" + name, procs.get("/.notdef"))
+                        if not isinstance(glyph, pikepdf.Stream):
+                            continue
+                        key = (glyph.objgen, context_key)
+                        if key in checked_glyphs:
+                            continue
+                        checked_glyphs.add(key)
+                        # Glyph geometry is unknown; protect its invoked images,
+                        # but retain placements belonging only to ordinary Do uses.
+                        walk(
+                            glyph,
+                            glyph_resources,
+                            IDENTITY,
+                            clip,
+                            active,
+                            depth + 1,
+                            preserve=True,
+                        )
             elif op == "Do":
                 if len(args) != 1:
                     raise ValueError("invalid XObject invocation")

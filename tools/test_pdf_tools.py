@@ -287,13 +287,24 @@ class PDFToolsTests(unittest.TestCase):
                         Subtype=pikepdf.Name.Type3,
                         FontBBox=[0, 0, 128, 128],
                         FontMatrix=[1, 0, 0, 1, 0, 0],
-                        CharProcs=pikepdf.Dictionary(square=glyph),
+                        CharProcs=pikepdf.Dictionary(
+                            square=glyph,
+                            unused=pdf.make_stream(
+                                b"128 0 d0 q 128 0 0 128 0 0 cm /Other Do Q"
+                            ),
+                            malformed=pdf.make_stream(b"128 0 d0 /Missing Do"),
+                        ),
                         Encoding=pikepdf.Dictionary(
-                            Differences=[97, pikepdf.Name.square]
+                            Differences=[
+                                97,
+                                pikepdf.Name.square,
+                                pikepdf.Name.unused,
+                                pikepdf.Name.malformed,
+                            ]
                         ),
                         FirstChar=97,
-                        LastChar=97,
-                        Widths=[128],
+                        LastChar=99,
+                        Widths=[128, 128, 128],
                     )
                 )
                 for seed in (19, 23):
@@ -380,6 +391,43 @@ class PDFToolsTests(unittest.TestCase):
                     for page in result.pages:
                         self.assertLess(int(page.Resources.XObject.Other.Width), 128)
                 pdf.close()
+
+    def test_type3_glyphs_are_scanned_once_per_resource_context(self):
+        pdf = pikepdf.Pdf.new()
+        glyphs = {f"g{i}": pdf.make_stream(b"1 0 d0") for i in range(256)}
+        font = pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name.Font,
+                Subtype=pikepdf.Name.Type3,
+                FontBBox=[0, 0, 1, 1],
+                FontMatrix=[1, 0, 0, 1, 0, 0],
+                CharProcs=pikepdf.Dictionary(**glyphs),
+                Resources=pikepdf.Dictionary(),
+                Encoding=pikepdf.Dictionary(
+                    Differences=[0] + [pikepdf.Name("/" + name) for name in glyphs]
+                ),
+                FirstChar=0,
+                LastChar=255,
+                Widths=[1] * 256,
+            )
+        )
+        content = b"BT /T3 1 Tf <" + bytes(range(256)).hex().encode() + b"> Tj ET"
+        for _ in range(400):
+            text_page(pdf, {"T3": font}, content)
+        parsed = []
+        original = pikepdf.parse_content_stream
+        glyph_ids = {g.objgen for g in glyphs.values()}
+
+        def counted(owner, *args, **kwargs):
+            obj = owner.obj if isinstance(owner, pikepdf.Page) else owner
+            if obj.objgen in glyph_ids:
+                parsed.append(obj.objgen)
+            return original(owner, *args, **kwargs)
+
+        with mock.patch.object(pikepdf, "parse_content_stream", counted):
+            tools.placements(pdf)
+        self.assertEqual(len(parsed), 256)
+        pdf.close()
 
     def test_crop_keeps_direct_consumers_of_a_soft_mask_unchanged(self):
         pdf = pikepdf.Pdf.new()
