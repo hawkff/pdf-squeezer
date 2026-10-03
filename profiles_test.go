@@ -388,7 +388,7 @@ func TestIndependentColorReduction(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if _, err := deflateSamples(ctx, []byte("sample"), true); err == nil {
+	if _, err := deflateSamples(ctx, []byte("sample"), true, 0); err == nil {
 		t.Fatal("heavy encoding ignored cancellation")
 	}
 }

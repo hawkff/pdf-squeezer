@@ -262,11 +262,26 @@ func removeStandardFont(d types.Dict, pdf *model.Context) {
 	d["Subtype"] = types.Name("Type1")
 }
 
+func streamDictionary(sd types.StreamDict) types.Dict {
+	d := sd.Dict.Clone().(types.Dict)
+	delete(d, "Length")
+	return d
+}
+
+func streamDigest(key string, data []byte) [32]byte {
+	h := sha256.New()
+	fmt.Fprintf(h, "%d:", len(key))
+	io.WriteString(h, key)
+	h.Write(data)
+	var digest [32]byte
+	copy(digest[:], h.Sum(nil))
+	return digest
+}
+
 // streamIdentity only normalizes generalized lossless filters. Encoded image
 // filters retain their Filter/DecodeParms, including bitonal polarity and globals.
 func streamIdentity(sd types.StreamDict) (string, []byte, error) {
-	d := sd.Dict.Clone().(types.Dict)
-	delete(d, "Length")
+	d := streamDictionary(sd)
 	normalize := true
 	for _, f := range sd.FilterPipeline {
 		switch f.Name {
@@ -289,6 +304,7 @@ func streamIdentity(sd types.StreamDict) (string, []byte, error) {
 
 func deduplicateStreams(ctx context.Context, pdf *model.Context) error {
 	seen := map[[32]byte]int{}
+	rawSeen := map[[32]byte]int{}
 	replace := map[int]types.IndirectRef{}
 	var ids []int
 	for n := range pdf.Table {
@@ -310,16 +326,28 @@ func deduplicateStreams(ctx context.Context, pdf *model.Context) error {
 		if typ := sd.NameEntry("Type"); typ != nil && (*typ == "XRef" || *typ == "ObjStm") {
 			continue
 		}
+		// Exact encodings need no decoding, including aliases re-encoded together.
+		rawKey := streamDictionary(sd).PDFString()
+		rawDigest := streamDigest(rawKey, sd.Raw)
+		if original, found := rawSeen[rawDigest]; found {
+			other := pdf.Table[original]
+			otherStream := other.Object.(types.StreamDict)
+			if len(sd.Content) == 0 && len(otherStream.Content) == 0 && rawKey == streamDictionary(otherStream).PDFString() && bytes.Equal(sd.Raw, otherStream.Raw) {
+				generation := 0
+				if other.Generation != nil {
+					generation = *other.Generation
+				}
+				replace[n] = *types.NewIndirectRef(original, generation)
+				continue
+			}
+		} else {
+			rawSeen[rawDigest] = n
+		}
 		key, data, err := streamIdentity(sd)
 		if err != nil {
 			continue
 		} // Unsupported/oversized streams stay unchanged.
-		h := sha256.New()
-		fmt.Fprintf(h, "%d:", len(key))
-		io.WriteString(h, key)
-		h.Write(data)
-		var digest [32]byte
-		copy(digest[:], h.Sum(nil))
+		digest := streamDigest(key, data)
 		original, found := seen[digest]
 		if !found {
 			seen[digest] = n

@@ -9,7 +9,6 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
-	"image/png"
 	"io"
 	"runtime"
 	"sort"
@@ -46,6 +45,7 @@ func (s imageStats) String() string {
 type imageJob struct {
 	objNr            int
 	entry            *model.XRefTableEntry
+	aliases          []*model.XRefTableEntry
 	sd               types.StreamDict
 	comps            int
 	device, softMask bool
@@ -89,6 +89,7 @@ func optimizeImages(ctx context.Context, pdf *model.Context, opts options, logf 
 	sort.Ints(ids)
 	budget := int64(opts.imageMemory) << 20
 	var jobs []imageJob
+	maskJobs := map[[32]byte]int{}
 	for _, nr := range ids {
 		if err := ctx.Err(); err != nil {
 			return stats, err
@@ -134,6 +135,19 @@ func optimizeImages(ctx context.Context, pdf *model.Context, opts options, logf 
 			stats.after += int64(len(sd.Raw))
 			continue
 		}
+		if j.softMask && len(sd.Content) == 0 {
+			key := streamDictionary(sd).PDFString()
+			digest := streamDigest(key, sd.Raw)
+			if index, found := maskJobs[digest]; found {
+				previous := &jobs[index]
+				if key == streamDictionary(previous.sd).PDFString() && bytes.Equal(sd.Raw, previous.sd.Raw) {
+					previous.aliases = append(previous.aliases, j.entry)
+					continue
+				}
+			} else {
+				maskJobs[digest] = len(jobs)
+			}
+		}
 		jobs = append(jobs, j)
 	}
 	type result struct {
@@ -172,13 +186,18 @@ func optimizeImages(ctx context.Context, pdf *model.Context, opts options, logf 
 		if firstErr != nil {
 			continue
 		}
+		count := 1 + len(r.job.aliases)
 		if r.reason != "" {
-			stats.preserved[r.reason]++
-			stats.after += int64(len(r.job.sd.Raw))
+			stats.preserved[r.reason] += count
+			stats.after += int64(count) * int64(len(r.job.sd.Raw))
 		} else {
 			applyEncoding(r.job.entry, r.job.sd, r.encoding)
-			stats.changed++
-			stats.after += int64(len(r.data))
+			for _, entry := range r.job.aliases {
+				sd, _ := imageStream(entry)
+				applyEncoding(entry, sd, r.encoding)
+			}
+			stats.changed += count
+			stats.after += int64(count) * int64(len(r.data))
 		}
 		logf("image %d/%d: object %d", done, len(jobs), r.job.objNr)
 	}
@@ -283,15 +302,17 @@ func reencode(ctx context.Context, job *imageJob, opts options) encoding {
 	var samples []byte
 	switch kind {
 	case "lossless":
-		// pdfcpu applies the limit to every filter stage. Intermediate stages hold
-		// compressed data or predictor rows, so allow twice the final sample size.
-		if err := sd.DecodeWithLimit(min(maxImageBytes, 2*(expected+int64(h)))); err != nil {
+		var err error
+		samples, err = imageSamples(ctx, sd, expected, h)
+		if ctx.Err() != nil {
+			return encoding{err: ctx.Err()}
+		}
+		if err != nil {
 			return preserve("undecodable")
 		}
-		if int64(len(sd.Content)) != expected {
+		if int64(len(samples)) != expected {
 			return preserve("length mismatch")
 		}
-		samples = sd.Content
 	case "jpeg":
 		if comps == 4 {
 			return preserve("CMYK JPEG")
@@ -345,8 +366,12 @@ func reencode(ctx context.Context, job *imageJob, opts options) encoding {
 			}
 		}
 	}
+	reuseRGB := false
 	if bits == 16 && opts.reduceBits && !job.softMask {
-		samples = highBytes(samples)
+		// Only this newly allocated buffer may be expanded in place. Heavy's
+		// raw-Flate candidate still needs the packed RGB samples afterwards.
+		reuseRGB = comps == 3 && opts.compression != "heavy"
+		samples = highBytes(samples, reuseRGB)
 		bits, out.bpc = 8, 8
 	}
 	if comps == 3 && job.device && !opts.lossless && opts.colorReduction != "preserve" && allGray(samples, bits) {
@@ -363,7 +388,7 @@ func reencode(ctx context.Context, job *imageJob, opts options) encoding {
 		if !listContains(opts.imageCodecs, "flate") {
 			return preserve("no permitted CMYK codec")
 		}
-		data, err := deflateSamples(ctx, samples, opts.compression == "heavy")
+		data, err := deflateSamples(ctx, samples, opts.compression == "heavy", 0)
 		if err != nil {
 			return encoding{err: err}
 		}
@@ -383,25 +408,31 @@ func reencode(ctx context.Context, job *imageJob, opts options) encoding {
 	case comps == 1:
 		img = &image.Gray{Pix: samples, Stride: w, Rect: image.Rect(0, 0, w, h)}
 	case bits == 16:
-		rgba := image.NewNRGBA64(image.Rect(0, 0, w, h))
+		rgb := &rgb16Image{rect: image.Rect(0, 0, w, h), pixels: make([]color.RGBA64, w*h)}
 		for y := range h {
 			if err := ctx.Err(); err != nil {
 				return encoding{err: err}
 			}
 			for x := range w {
 				i := y*w + x
-				copy(rgba.Pix[8*i:8*i+6], samples[6*i:6*i+6])
-				rgba.Pix[8*i+6], rgba.Pix[8*i+7] = 255, 255
+				s := samples[6*i : 6*i+6]
+				rgb.pixels[i] = color.RGBA64{R: uint16(s[0])<<8 | uint16(s[1]), G: uint16(s[2])<<8 | uint16(s[3]), B: uint16(s[4])<<8 | uint16(s[5]), A: 65535}
 			}
 		}
-		img = rgba
+		img = rgb
 	default:
-		rgba := image.NewRGBA(image.Rect(0, 0, w, h))
-		for y := range h {
+		var rgba *image.RGBA
+		if reuseRGB {
+			rgba = &image.RGBA{Pix: samples[:w*h*4], Stride: w * 4, Rect: image.Rect(0, 0, w, h)}
+		} else {
+			rgba = image.NewRGBA(image.Rect(0, 0, w, h))
+		}
+		// Backwards expansion is safe when samples and RGBA share the owned buffer.
+		for y := h - 1; y >= 0; y-- {
 			if err := ctx.Err(); err != nil {
 				return encoding{err: err}
 			}
-			for x := range w {
+			for x := w - 1; x >= 0; x-- {
 				i := y*w + x
 				copy(rgba.Pix[4*i:4*i+3], samples[3*i:3*i+3])
 				rgba.Pix[4*i+3] = 255
@@ -409,31 +440,32 @@ func reencode(ctx context.Context, job *imageJob, opts options) encoding {
 		}
 		img = rgba
 	}
-	if listContains(opts.imageCodecs, "flate") || bilevel || job.softMask {
-		data, err := pngIDAT(ctx, img, opts.compression == "heavy")
-		if err != nil {
-			return encoding{err: err}
-		}
-		out.data, out.filter = data, "FlateDecode"
-		out.parms = types.Dict{"Predictor": types.Integer(15), "Colors": types.Integer(comps), "BitsPerComponent": types.Integer(out.bpc), "Columns": types.Integer(w)}
-	}
-	if opts.compression == "heavy" && !bilevel && (listContains(opts.imageCodecs, "flate") || job.softMask) {
-		// Some scan samples compress better without PNG row predictors.
-		data, err := deflateSamples(ctx, samples, true)
-		if err != nil {
-			return encoding{err: err}
-		}
-		if out.data == nil || len(data) < len(out.data) {
-			out.data, out.filter, out.parms = data, "FlateDecode", nil
-		}
-	}
+	// JPEG is usually cheaper. Bound competing encoders by its actual payload.
 	if bits == 8 && !bilevel && !job.softMask && !opts.lossless && listContains(opts.imageCodecs, "jpeg") {
 		var buf bytes.Buffer
 		if err := jpeg.Encode(contextWriter{ctx, &buf}, img, &jpeg.Options{Quality: opts.imageQuality}); err != nil {
 			return encoding{err: err}
 		}
-		if out.data == nil || buf.Len() < len(out.data) {
-			out.data, out.filter, out.parms = buf.Bytes(), "DCTDecode", nil
+		out.data, out.filter = buf.Bytes(), "DCTDecode"
+	}
+	if listContains(opts.imageCodecs, "flate") || bilevel || job.softMask {
+		data, err := pngIDAT(ctx, img, opts.compression == "heavy", len(out.data))
+		if err != nil && !errors.Is(err, errEncodingLarger) {
+			return encoding{err: err}
+		}
+		if err == nil {
+			// Preserve the original tie order: PNG, raw Flate, then JPEG.
+			out.data, out.filter = data, "FlateDecode"
+			out.parms = types.Dict{"Predictor": types.Integer(15), "Colors": types.Integer(comps), "BitsPerComponent": types.Integer(out.bpc), "Columns": types.Integer(w)}
+		}
+	}
+	if opts.compression == "heavy" && !bilevel && (listContains(opts.imageCodecs, "flate") || job.softMask) {
+		data, err := deflateSamples(ctx, samples, true, len(out.data))
+		if err != nil && !errors.Is(err, errEncodingLarger) {
+			return encoding{err: err}
+		}
+		if err == nil && (out.data == nil || len(data) < len(out.data) || len(data) == len(out.data) && out.filter == "DCTDecode") {
+			out.data, out.filter, out.parms = data, "FlateDecode", nil
 		}
 	}
 	if out.data == nil {
@@ -443,7 +475,7 @@ func reencode(ctx context.Context, job *imageJob, opts options) encoding {
 }
 
 func encodePacked(ctx context.Context, sd *types.StreamDict, samples []byte, out encoding, opts options) encoding {
-	data, err := deflateSamples(ctx, samples, opts.compression == "heavy")
+	data, err := deflateSamples(ctx, samples, opts.compression == "heavy", 0)
 	if err != nil {
 		return encoding{err: err}
 	}
@@ -451,8 +483,8 @@ func encodePacked(ctx context.Context, sd *types.StreamDict, samples []byte, out
 	return keepEncoding(sd, out, opts.force)
 }
 
-func deflateSamples(ctx context.Context, samples []byte, best bool) ([]byte, error) {
-	var buf bytes.Buffer
+func deflateSamples(ctx context.Context, samples []byte, best bool, limit int) ([]byte, error) {
+	buf := encodingBuffer{limit: limit}
 	level := zlib.DefaultCompression
 	if best {
 		level = zlib.BestCompression
@@ -463,7 +495,7 @@ func deflateSamples(ctx context.Context, samples []byte, best bool) ([]byte, err
 	}
 	_, err = io.Copy(w, contextReader{ctx, bytes.NewReader(samples)})
 	err = errors.Join(err, w.Close())
-	return buf.Bytes(), err
+	return buf.data.Bytes(), err
 }
 
 func keepEncoding(sd *types.StreamDict, out encoding, force bool) encoding {
@@ -584,8 +616,13 @@ func filterKind(pipeline []types.PDFFilter) string {
 	return "lossless"
 }
 
-func highBytes(samples []byte) []byte {
-	out := make([]byte, len(samples)/2)
+func highBytes(samples []byte, reserveRGBA bool) []byte {
+	n := len(samples) / 2
+	capacity := n
+	if reserveRGBA {
+		capacity = n / 3 * 4
+	}
+	out := make([]byte, n, capacity)
 	for i := range out {
 		out[i] = samples[2*i]
 	}
@@ -651,29 +688,4 @@ func onlyBlackAndWhite(gray []byte) bool {
 		}
 	}
 	return true
-}
-
-// PNG IDAT data is exactly the zlib stream expected by FlateDecode/Predictor 15.
-func pngIDAT(ctx context.Context, img image.Image, best bool) ([]byte, error) {
-	var file bytes.Buffer
-	encoder := png.Encoder{}
-	if best {
-		encoder.CompressionLevel = png.BestCompression
-	}
-	if err := encoder.Encode(contextWriter{ctx, &file}, img); err != nil {
-		return nil, err
-	}
-	var idat []byte
-	data := file.Bytes()[8:]
-	for len(data) >= 12 {
-		length := int(data[0])<<24 | int(data[1])<<16 | int(data[2])<<8 | int(data[3])
-		if length < 0 || length > len(data)-12 {
-			return nil, errors.New("truncated PNG chunk")
-		}
-		if string(data[4:8]) == "IDAT" {
-			idat = append(idat, data[8:8+length]...)
-		}
-		data = data[12+length:]
-	}
-	return idat, nil
 }

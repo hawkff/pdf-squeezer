@@ -90,7 +90,9 @@ DPI is a ceiling, not a request to upscale. An image below the selected target s
 
 `--image-memory 512` sets the native image working-buffer budget in MiB. Workers share this budget and release decoded buffers after each job. It is an estimate, not a process-wide memory ceiling: the parsed document and encoded output also occupy memory. Images above the sample limit or working budget stay unchanged. `-V` reports progress and preservation reasons. Interrupting the CLI cancels processing and terminates optional tool process groups where supported.
 
-After image transformations, the CLI deduplicates equivalent streams. It compares decoded bytes for generalized lossless filters, retains encoding parameters for specialized image codecs, and keeps the smallest equivalent encoding. It also enables pdfcpu's duplicate-content-stream optimization.
+Identical encoded soft masks share compression work without removing their mask references. The native encoder tries JPEG first when permitted and stops competing encodings once their payload exceeds the current winner. It preserves the same codec choice and tie order without completing losing candidates.
+
+After image transformations, the CLI deduplicates equivalent streams. Exact encoded duplicates bypass decoding; other generalized lossless filters are compared by decoded bytes. Specialized image codecs retain their encoding parameters, and the smallest equivalent encoding wins. The CLI also enables pdfcpu's duplicate-content-stream optimization.
 
 ## Optional tools
 
