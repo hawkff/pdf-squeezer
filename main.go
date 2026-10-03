@@ -188,6 +188,14 @@ type staged struct {
 	converted                 bool     // --pdfa produced it: a failed check is fatal
 }
 
+// verified is the file veraPDF checks: the staged result, or the unchanged input.
+func (s *staged) verified() string {
+	if s.original != nil {
+		return s.input
+	}
+	return s.path
+}
+
 func (s *staged) cleanup() {
 	if s.original != nil {
 		s.original.Close()
@@ -215,18 +223,18 @@ func (v *verifier) validate(ctx context.Context, batch []*staged) {
 	for flavour, group := range groups {
 		paths := make([]string, len(group))
 		for i, s := range group {
-			paths[i] = s.path
+			paths[i] = s.verified()
 		}
 		results, err := validatePDFA(ctx, flavour, paths, v.stderr)
 		if err != nil && len(group) > 1 && ctx.Err() == nil {
 			// One oversized report or one broken file must not decide for the batch.
 			results, err = map[string]error{}, nil
 			for _, s := range group {
-				single, singleErr := validatePDFA(ctx, flavour, []string{s.path}, v.stderr)
+				single, singleErr := validatePDFA(ctx, flavour, []string{s.verified()}, v.stderr)
 				if singleErr != nil {
-					single = map[string]error{s.path: singleErr}
+					single = map[string]error{s.verified(): singleErr}
 				}
-				results[s.path] = single[s.path]
+				results[s.verified()] = single[s.verified()]
 			}
 		}
 		if err != nil {
@@ -234,7 +242,7 @@ func (v *verifier) validate(ctx context.Context, batch []*staged) {
 			continue
 		}
 		for _, s := range group {
-			v.verdicts[s] = results[s.path]
+			v.verdicts[s] = results[s.verified()]
 		}
 	}
 }
@@ -264,9 +272,11 @@ func (v *verifier) check(ctx context.Context, s *staged) error {
 	if s.converted {
 		return verdict
 	}
-	inputs, err := validatePDFA(ctx, s.flavour, []string{s.input}, v.stderr)
-	if err == nil && inputs[s.input] == nil {
-		return fmt.Errorf("compression broke the input's %s conformance; use --pdfa to repair it or report this:\n%w", label, verdict)
+	if s.original == nil {
+		inputs, err := validatePDFA(ctx, s.flavour, []string{s.input}, v.stderr)
+		if err == nil && inputs[s.input] == nil {
+			return fmt.Errorf("compression broke the input's %s conformance; use --pdfa to repair it or report this:\n%w", label, verdict)
+		}
 	}
 	fmt.Fprintf(v.stderr, "warning: %s declares %s but does not conform to it; the output is not verified\n", s.input, label)
 	return nil
@@ -621,8 +631,9 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 	logf("%s: %d bytes in %s; validated", opts.engine, ci.Size(), time.Since(start).Round(time.Millisecond))
 	result = &staged{input: input, output: output, path: current, work: work, info: info, flavour: flavour, converted: converted}
 	if ci.Size() >= info.Size() && !opts.requiredOutput() {
-		// The checked original is published unchanged, so nothing needs verifying.
-		result.original, result.flavour = in, ""
+		// The checked original is published unchanged; a declared level is still
+		// verified so that a nonconforming input gets its warning.
+		result.original = in
 	}
 	// Only the final stage waits for publication; intermediates would otherwise
 	// pile up across a validation batch.

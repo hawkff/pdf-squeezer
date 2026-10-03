@@ -50,6 +50,9 @@ def main():
     parser.add_argument(
         "--extra", default="", help="extra CLI flags, e.g. '--strip actions'"
     )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="replace existing results"
+    )
     args = parser.parse_args()
     args.results.mkdir(parents=True, exist_ok=True)
     files = sorted(p for p in args.corpus.rglob("*.pdf") if p.is_file())
@@ -62,6 +65,13 @@ def main():
         output = args.results / relative.parent / f"{relative.stem}.pdfa{args.pdfa}.pdf"
         output.parent.mkdir(parents=True, exist_ok=True)
         if output.exists():
+            if not args.overwrite:
+                outcomes["skipped"] += 1
+                print(
+                    f"skipped          {path.name}  [output exists; pass --overwrite]",
+                    flush=True,
+                )
+                continue
             output.unlink()
         command = [
             args.binary,
@@ -93,7 +103,14 @@ def main():
             flush=True,
         )
     print()
-    for outcome in ("converted", "refused", "rejected", "crashed", "timeout"):
+    for outcome in (
+        "converted",
+        "refused",
+        "rejected",
+        "crashed",
+        "timeout",
+        "skipped",
+    ):
         if outcomes[outcome]:
             print(f"{outcome:9} {outcomes[outcome]:4}")
             for detail, count in details[outcome].most_common():

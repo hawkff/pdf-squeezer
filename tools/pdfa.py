@@ -756,15 +756,15 @@ def strip_features(pdf, strip, problems, level=None):
         # A popup without its parent annotation keeps the parent reachable, and a
         # popup carrying a direct copy of a removed parent carries its content.
         kept_ids = {a.objgen for a in kept if a.is_indirect}
-        dropped_kinds = {
-            pdf_name(a.get("/Subtype"))
+        kept_signatures = {annotation_signature(a) for a in kept}
+        dropped_signatures = {
+            annotation_signature(a)
             for a in page.obj.get("/Annots") or []
             if isinstance(a, Dictionary)
-            and not any(
-                a is k or (a.is_indirect and a.objgen in kept_ids) for k in kept
-            )
-        }
-        orphans = [a for a in kept if orphaned_popup(a, kept_ids, dropped_kinds)]
+            and not (a.is_indirect and a.objgen in kept_ids)
+            and not any(a is k for k in kept)
+        } - kept_signatures
+        orphans = [a for a in kept if orphaned_popup(a, kept_ids, dropped_signatures)]
         if orphans:
             kept = [a for a in kept if a not in orphans]
             changed = True
@@ -791,13 +791,22 @@ def strip_features(pdf, strip, problems, level=None):
             del holder["/AF"]
 
 
-def orphaned_popup(annot, kept_ids, dropped_kinds):
+def annotation_signature(annot):
+    """Identity of an annotation by content, for direct copies in popups."""
+    return tuple(
+        str(annot.get(key))
+        for key in ("/Subtype", "/Rect", "/Contents", "/NM", "/M", "/CreationDate")
+    )
+
+
+def orphaned_popup(annot, kept_ids, dropped_signatures):
+    """A popup whose parent was removed: by reference, or by an identical direct copy."""
     parent = annot.get("/Parent")
     if annot.get("/Subtype") != Name.Popup or not isinstance(parent, Dictionary):
         return False
     if parent.is_indirect:
         return parent.objgen not in kept_ids
-    return pdf_name(parent.get("/Subtype")) in dropped_kinds
+    return annotation_signature(parent) in dropped_signatures
 
 
 def annotation_category(subtype):
