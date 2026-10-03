@@ -276,7 +276,11 @@ class PDFToolsTests(unittest.TestCase):
         for own_resources in (True, False):
             with self.subTest(own_resources=own_resources):
                 pdf = pikepdf.Pdf.new()
-                glyph = pdf.make_stream(b"128 0 d0 q 128 0 0 128 0 0 cm /Im Do Q")
+                glyph = pdf.make_stream(
+                    b"128 0 d0 /GlyphForm Do"
+                    if own_resources
+                    else b"128 0 d0 q 128 0 0 128 0 0 cm /Im Do Q"
+                )
                 font = pdf.make_indirect(
                     pikepdf.Dictionary(
                         Type=pikepdf.Name.Font,
@@ -301,20 +305,56 @@ class PDFToolsTests(unittest.TestCase):
                             random.Random(seed).randbytes(128 * 128 * 3),
                         ),
                     )
+                    other = image_object(
+                        pdf,
+                        Image.frombytes(
+                            "RGB",
+                            (128, 128),
+                            random.Random(seed + 1).randbytes(128 * 128 * 3),
+                        ),
+                    )
                     if own_resources:
-                        # A private font resource dictionary shares the page image.
+                        form = pdf.make_stream(b"q 128 0 0 128 0 0 cm /Im Do Q")
+                        form.Type, form.Subtype = (
+                            pikepdf.Name.XObject,
+                            pikepdf.Name.Form,
+                        )
+                        form.BBox = pikepdf.Array([0, 0, 128, 128])
+                        form.Resources = pikepdf.Dictionary(
+                            XObject=pikepdf.Dictionary(Im=image)
+                        )
                         font = pdf.make_indirect(pikepdf.Dictionary(font))
                         font.Resources = pikepdf.Dictionary(
-                            XObject=pikepdf.Dictionary(Im=image)
+                            XObject=pikepdf.Dictionary(
+                                Im=image, GlyphForm=form, Other=other
+                            )
                         )
                     page = text_page(
                         pdf,
                         {"T3": font},
                         b"q 0 0 64 64 re W n 128 0 0 128 -32 -32 cm /Im Do Q "
-                        b"BT /T3 1 Tf 0 72 Td (a) Tj ET",
-                        size=(128, 200),
+                        + (
+                            b"BT /T3 1 Tf 0 72 Td (a) Tj ET "
+                            if own_resources
+                            else b"BT /T3 1 Tf ET /TextForm Do "
+                        )
+                        + b"q 128 0 64 64 re W n 128 0 0 128 96 -32 cm /Other Do Q",
+                        size=(256, 200),
                     )
-                    page.Resources.XObject = pikepdf.Dictionary(Im=image)
+                    page.Resources.XObject = pikepdf.Dictionary(Im=image, Other=other)
+                    if not own_resources:
+                        # The form inherits the selected font but supplies its own
+                        # glyph resource context, without selecting the font again.
+                        text_form = pdf.make_stream(b"BT 0 72 Td (a) Tj ET")
+                        text_form.Type, text_form.Subtype = (
+                            pikepdf.Name.XObject,
+                            pikepdf.Name.Form,
+                        )
+                        text_form.BBox = pikepdf.Array([0, 0, 128, 200])
+                        text_form.Resources = pikepdf.Dictionary(
+                            XObject=pikepdf.Dictionary(Im=image)
+                        )
+                        page.Resources.XObject.TextForm = text_form
                 pdf.save(self.source, compress_streams=False)
                 before = rendered_samples(self.source, isolate_pages=True)
                 tools.transform(
@@ -337,6 +377,8 @@ class PDFToolsTests(unittest.TestCase):
                         ],
                         [(128, 128), (128, 128)],
                     )
+                    for page in result.pages:
+                        self.assertLess(int(page.Resources.XObject.Other.Width), 128)
                 pdf.close()
 
     def test_crop_keeps_direct_consumers_of_a_soft_mask_unchanged(self):
@@ -742,6 +784,39 @@ class PDFToolsTests(unittest.TestCase):
         used, blocked = tools.font_glyph_usage(pdf)
         self.assertEqual(next(iter(used.values())), {11})
         self.assertEqual(blocked, set())
+        pdf.close()
+
+    def test_font_glyph_usage_bounds_cached_maps(self):
+        pdf = pikepdf.Pdf.new()
+        maps = [
+            pdf.make_stream(b"\x00\x00" + (i + 1).to_bytes(2, "big") + b"\x00" * 131068)
+            for i in range(65)
+        ]
+        fonts = {
+            f"F{i}": cid_font(pdf, mapping=mapping) for i, mapping in enumerate(maps)
+        }
+        content = (
+            "BT "
+            + " ".join(f"/F{i} 12 Tf <0001> Tj" for i in range(65))
+            + " /F64 12 Tf <0001> Tj /F0 12 Tf <0001> Tj <0001> Tj ET"
+        )
+        text_page(pdf, fonts, content.encode())
+        original, decoded = pikepdf.Object.read_bytes, []
+
+        def counted(stream, *args, **kwargs):
+            decoded.append(stream.objgen)
+            return original(stream, *args, **kwargs)
+
+        with mock.patch.object(pikepdf.Object, "read_bytes", counted):
+            used, blocked = tools.font_glyph_usage(pdf)
+        self.assertEqual(blocked, set())
+        self.assertEqual(len(used), 65)
+        self.assertEqual(decoded.count(maps[0].objgen), 2)
+        self.assertEqual(decoded.count(maps[-1].objgen), 1)
+        self.assertEqual(len(decoded), 66)
+        self.assertEqual(
+            {next(iter(gids)) for gids in used.values()}, set(range(1, 66))
+        )
         pdf.close()
 
     def test_flatten_forms_keeps_visible_value(self):

@@ -287,13 +287,15 @@ type veraReport struct {
 	} `xml:"jobs>job"`
 }
 
+var errNoPDFAValidator = errors.New("PDF/A validation requires veraPDF on PATH")
+
 // validatePDFA runs veraPDF once over every path with one flavour and returns an
 // error per path: nil for compliant files, diagnostics grouped by what resolves
 // them otherwise. The second result reports a failure to run or read veraPDF.
 func validatePDFA(ctx context.Context, flavour string, paths []string, stderr io.Writer) (map[string]error, error) {
 	binary, err := exec.LookPath("verapdf")
 	if err != nil {
-		return nil, errors.New("PDF/A validation requires veraPDF on PATH")
+		return nil, errNoPDFAValidator
 	}
 	absolute := make([]string, len(paths))
 	for i, path := range paths {

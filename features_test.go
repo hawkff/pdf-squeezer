@@ -575,6 +575,8 @@ shift 6
 [ "$#" = 1 ] || exit 1
 case "$1" in
   */unavailable.pdf) exit 1 ;;
+  */oversized.pdf) printf '%1048577s' ''; exit 0 ;;
+  */malformed.pdf) printf 'not XML'; exit 0 ;;
   */rejected.pdf|*/invalid.pdf) compliant=false ;;
   *) compliant=true ;;
 esac
@@ -588,8 +590,10 @@ printf '<report><jobs><job><item><name>%s</name></item><validationReport profile
 		name, output, input               string
 		converted, wantError, toolFailure bool
 	}{
-		{"tool unavailable", "unavailable", "valid", false, false, true},
-		{"converted tool unavailable", "unavailable", "valid", true, true, true},
+		{"tool failure", "unavailable", "valid", false, true, true},
+		{"converted tool failure", "unavailable", "valid", true, true, true},
+		{"oversized report", "oversized", "valid", false, true, true},
+		{"malformed report", "malformed", "valid", false, true, true},
 		{"compliant", "compliant", "valid", false, false, false},
 		{"invalid input", "rejected", "invalid", false, false, false},
 		{"valid input", "rejected", "valid", false, true, false},

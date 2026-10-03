@@ -246,25 +246,24 @@ func legacyProfile(settings map[string]json.RawMessage) (profile, error) {
 			}
 		}
 	}
-	if _, present := values["optimizeImages"]; !present {
-		values["optimizeImages"] = true
-		p.Flags["images"] = "true"
+	quality, qOK := numbers["imageQuality"]
+	dpi, dOK := numbers["imageResolution"]
+	if qOK && (quality < 0 || quality > 1) || dOK && (dpi < 0 || dpi > 9600 || math.Trunc(dpi) != dpi) {
+		return p, errors.New("imageQuality must be in 0..1 and imageResolution must be an integer in 0..9600")
 	}
-	if !values["optimizeImages"] {
+	if enabled, present := values["optimizeImages"]; present && !enabled {
 		// Stored image settings are inactive when image optimization is disabled.
 		p.Flags["clip-images"], p.Flags["force-recompression"] = "false", "false"
-	}
-	if values["optimizeImages"] {
-		quality, qOK := numbers["imageQuality"]
-		dpi, dOK := numbers["imageResolution"]
-		if !qOK || !dOK || quality < 0 || quality > 1 || dpi < 0 || dpi > 9600 || math.Trunc(dpi) != dpi {
-			return p, errors.New("image optimization requires imageQuality in 0..1 and integer imageResolution in 0..9600")
+	} else {
+		if qOK {
+			// Keep truncation while correcting one-ULP loss at whole quality steps.
+			p.Flags["image-quality"] = strconv.Itoa(max(1, int(math.Nextafter(quality*100, math.Inf(1)))))
 		}
-		// Profile quality uses truncation, not rounding, with a minimum of one.
-		p.Flags["image-quality"] = strconv.Itoa(max(1, int(quality*100)))
-		p.Flags["dpi"] = strconv.Itoa(int(dpi))
-		if values["downsampleMonochromeScans"] {
-			p.Flags["mono-dpi"] = p.Flags["dpi"]
+		if dOK {
+			p.Flags["dpi"] = strconv.Itoa(int(dpi))
+			if values["downsampleMonochromeScans"] {
+				p.Flags["mono-dpi"] = p.Flags["dpi"]
+			}
 		}
 	}
 	if value, present := values["reduceColorComplexity"]; present {

@@ -185,7 +185,8 @@ func TestLegacyPropertyListProfiles(t *testing.T) {
 		})
 	}
 	for _, data := range []string{
-		`{"optimizeImages":true}`,
+		`{"imageQuality":1.1}`,
+		`{"imageResolution":144.5}`,
 		`{"optimizeImages":false,"colorConversion":1}`,
 		`{"optimizeImages":false,"optimizeResources":false}`,
 		`{"optimizeImages":false,"removeProducer":true}`,
@@ -203,8 +204,49 @@ func TestLegacyPropertyListProfiles(t *testing.T) {
 	}
 }
 
+func TestLegacyProfileOptionalSettings(t *testing.T) {
+	for _, tc := range []struct {
+		settings     string
+		tier         string
+		images       bool
+		quality, dpi int
+	}{
+		{`{"removeAuthor":true,"customAuthor":"Example","stripSpiderInfo":true}`, "", false, 75, 0},
+		{`{"optimizeImages":true}`, "", true, 75, 0},
+		{`{"imageQuality":0.8}`, "", false, 80, 0},
+		{`{"imageResolution":144}`, "", false, 75, 144},
+		{`{"removeAuthor":true,"customAuthor":"Example"}`, "light", true, 90, 0},
+	} {
+		var settings map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(tc.settings), &settings); err != nil {
+			t.Fatal(err)
+		}
+		p, err := legacyProfile(settings)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "settings.json")
+		writeFile(t, path, data)
+		args := []string{"--profile", path, "in.pdf"}
+		if tc.tier != "" {
+			args = append(args, "--compression", tc.tier)
+		}
+		o, _, _, err := parseOptions(t.Context(), args, io.Discard)
+		if err != nil || o.images != tc.images || o.imageQuality != tc.quality || o.dpi != tc.dpi {
+			t.Fatalf("optional settings %s: %+v, %v", tc.settings, o, err)
+		}
+		if _, ok := settings["removeAuthor"]; ok && strings.Join(o.metadata, "") != "Author=Example" {
+			t.Fatal("metadata was lost")
+		}
+	}
+}
+
 func TestLegacyQualityTruncation(t *testing.T) {
-	for input, want := range map[string]string{"0": "1", "0.5799": "57", "1": "100"} {
+	for input, want := range map[string]string{"0": "1", "0.57": "57", "0.58": "58", "0.5799": "57", "1": "100"} {
 		p, err := legacyProfile(map[string]json.RawMessage{"imageQuality": json.RawMessage(input), "imageResolution": json.RawMessage("144")})
 		if err != nil || p.Flags["image-quality"] != want {
 			t.Fatalf("quality %s: %v, %v", input, p.Flags, err)

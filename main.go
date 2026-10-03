@@ -230,7 +230,7 @@ func (v *verifier) validate(ctx context.Context, batch []*staged) {
 		results, err := validatePDFA(ctx, flavour, paths, v.stderr)
 		if err != nil && len(group) > 1 && ctx.Err() == nil {
 			// Retry file-specific report failures, but not a missing validator.
-			if _, lookupErr := exec.LookPath("verapdf"); lookupErr == nil {
+			if !errors.Is(err, errNoPDFAValidator) {
 				for _, s := range group {
 					single, singleErr := validatePDFA(ctx, flavour, []string{s.path}, v.stderr)
 					if singleErr != nil {
@@ -254,14 +254,15 @@ func (v *verifier) validate(ctx context.Context, batch []*staged) {
 
 // check decides whether a staged document may be published. Converted documents
 // fail closed. Documents that only declared PDF/A on input are published with a
-// warning when veraPDF is unavailable or when the input did not conform either.
+// warning when veraPDF is not installed or when the input did not conform either.
+// A validator that runs but cannot return a verdict fails closed.
 func (v *verifier) check(ctx context.Context, s *staged) error {
 	if s.flavour == "" {
 		return nil
 	}
 	label := "PDF/A-" + strings.ToUpper(s.flavour)
 	if err, failed := v.failed[s]; failed {
-		if s.converted {
+		if s.converted || !errors.Is(err, errNoPDFAValidator) {
 			return err
 		}
 		if !v.warned {
