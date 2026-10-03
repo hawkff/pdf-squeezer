@@ -10,7 +10,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,12 +23,14 @@ relative directories. Advanced operations require optional tools; see README.
 
 General:
   --engine NAME           pdfcpu (default) or ghostscript
-  -o, --output PATH        output file or existing directory
+  -o, --output PATH        output file/directory; repeat once per input for separate files
+  --compression LEVEL     light, balanced, medium, strong, heavy; explicit flags override
   --recursive             recurse into directory inputs; skip *.squeezed.pdf
   --collision POLICY      error (default) or number
-  --profile FILE          load a versioned JSON compression profile
-  --save-profile FILE     save settings without paths or passwords
-  --timestamps POLICY     preserve (default) or now
+  --profile FILE          load JSON or .pdfscp profiles; repeat to combine bundles
+  --profile-entry NAME|N  select a profile by name or 1-based index (default first)
+  --save-profile FILE     save resolved settings; retain other entries in a JSON bundle
+  --timestamps POLICY     preserve (default), modified, or now (both document dates)
   -V, --verbose           report stages, image progress, and preserved images
   -v, --version           print version
   -h, --help              print help
@@ -41,6 +42,7 @@ Images:
   --image-codecs LIST     flate,jpeg (default), flate, or jpeg
   --mono-codecs LIST      flate (default), ccitt, jbig2, or a comma-separated list
   --reduce-bit-depth      allow 16-bit to 8-bit conversion; never for soft masks
+  --color-reduction MODE  exact (default) or preserve; independent of JPEG/bit depth
   --force-recompression   keep requested re-encoding even without size savings
   --image-memory N        native image working-buffer budget in MiB (default 512)
   --dpi N                 color/gray target DPI; 0 keeps resolution
@@ -59,7 +61,7 @@ Document:
                           CreationDate or ModDate; repeatable; empty removes a key
   --strip LIST            thumbnails,alternates,threads,tags,output-intents,piece-info,
                           metadata,links,annotations,forms,images,actions,multimedia,
-                          hidden,xfa,attachments; opt-in removals
+                          hidden,xfa,attachments,web-capture; opt-in removals
   --flatten LIST          forms,annotations,links or all; freezes appearances
   --subset-fonts          subset eligible embedded fonts
   --merge-fonts           merge compatible embedded TrueType subsets
@@ -85,6 +87,8 @@ Security and conversion:
 
 type options struct {
 	engine, quality, output, collision, timestamps               string
+	compression, colorReduction                                  string
+	outputs                                                      stringList
 	dpi, grayDPI, monoDPI, imageQuality, imageMemory             int
 	dpiThreshold                                                 float64
 	gray, images, privacy, verbose, recursive                    bool
@@ -110,6 +114,7 @@ func (s *stringList) Set(v string) error {
 
 type profile struct {
 	Version  int               `json:"version"`
+	Name     string            `json:"name,omitempty"`
 	Flags    map[string]string `json:"flags"`
 	Metadata []string          `json:"metadata,omitempty"`
 }
@@ -132,7 +137,7 @@ func parseFlags(flags *flag.FlagSet, args []string) ([]string, error) {
 
 func profileFlag(name string) bool {
 	switch name {
-	case "o", "output", "profile", "save-profile", "password-file", "encrypt-user-file", "encrypt-owner-file", "metadata", "v", "version", "V", "verbose", "recursive", "collision", "extract", "output-intent", "font-file":
+	case "o", "output", "profile", "profile-entry", "save-profile", "password-file", "encrypt-user-file", "encrypt-owner-file", "metadata", "v", "version", "V", "verbose", "recursive", "collision", "extract", "output-intent", "font-file":
 		return false
 	}
 	return true
@@ -145,8 +150,10 @@ func parseOptions(ctx context.Context, args []string, stderr io.Writer) (options
 	f.Usage = func() { fmt.Fprint(stderr, usage) }
 	f.StringVar(&opts.engine, "engine", "pdfcpu", "")
 	f.StringVar(&opts.quality, "quality", "", "")
-	f.StringVar(&opts.output, "output", "", "")
-	f.StringVar(&opts.output, "o", "", "")
+	f.Var(&opts.outputs, "output", "")
+	f.Var(&opts.outputs, "o", "")
+	f.StringVar(&opts.compression, "compression", "", "")
+	f.StringVar(&opts.colorReduction, "color-reduction", "exact", "")
 	f.StringVar(&opts.collision, "collision", "error", "")
 	f.StringVar(&opts.timestamps, "timestamps", "preserve", "")
 	f.BoolVar(&opts.recursive, "recursive", false, "")
@@ -189,9 +196,11 @@ func parseOptions(ctx context.Context, args []string, stderr io.Writer) (options
 	f.StringVar(&opts.pdfa, "pdfa", "", "")
 	f.StringVar(&opts.outputIntent, "output-intent", "", "")
 	f.Var(&opts.fontFiles, "font-file", "")
-	var profilePath, saveProfile string
+	var profilePaths stringList
+	var profileEntry, saveProfile string
 	var version bool
-	f.StringVar(&profilePath, "profile", "", "")
+	f.Var(&profilePaths, "profile", "")
+	f.StringVar(&profileEntry, "profile-entry", "", "")
 	f.StringVar(&saveProfile, "save-profile", "", "")
 	f.BoolVar(&version, "version", false, "")
 	f.BoolVar(&version, "v", false, "")
@@ -201,29 +210,33 @@ func parseOptions(ctx context.Context, args []string, stderr io.Writer) (options
 	}
 	visited := map[string]bool{}
 	f.Visit(func(f *flag.Flag) { visited[f.Name] = true })
-	if profilePath != "" {
-		file, err := os.Open(profilePath)
+	if len(opts.outputs) == 1 {
+		opts.output = opts.outputs[0]
+	}
+	var profiles []profile
+	for _, path := range profilePaths {
+		loaded, err := loadProfiles(ctx, path, stderr)
 		if err != nil {
 			return opts, nil, false, err
 		}
-		decoder := json.NewDecoder(io.LimitReader(file, 1<<20))
-		decoder.DisallowUnknownFields()
-		var p profile
-		err = decoder.Decode(&p)
-		if err == nil && decoder.Decode(new(any)) != io.EOF {
-			err = errors.New("profile has trailing data")
-		}
-		file.Close()
-		if err != nil {
-			return opts, nil, false, fmt.Errorf("profile: %w", err)
-		}
-		if p.Version != 1 {
-			return opts, nil, false, errors.New("unsupported profile version; expected 1")
-		}
-		for name, value := range p.Flags {
+		profiles = append(profiles, loaded...)
+	}
+	selected, err := selectProfile(profiles, profileEntry)
+	if err != nil {
+		return opts, nil, false, err
+	}
+	configured := map[string]bool{}
+	for _, p := range profiles {
+		for name := range p.Flags {
 			if !profileFlag(name) || f.Lookup(name) == nil {
 				return opts, nil, false, fmt.Errorf("profile flag %q is not permitted", name)
 			}
+		}
+	}
+	if len(profiles) > 0 {
+		p := profiles[selected]
+		for name, value := range p.Flags {
+			configured[name] = true
 			if !visited[name] {
 				if err := f.Set(name, value); err != nil {
 					return opts, nil, false, fmt.Errorf("profile flag %s: %w", name, err)
@@ -233,22 +246,58 @@ func parseOptions(ctx context.Context, args []string, stderr io.Writer) (options
 		// Explicit metadata wins per key, applied after the profile's metadata.
 		opts.metadata = append(p.Metadata, opts.metadata...)
 	}
+	imagesOff := (visited["images"] || configured["images"]) && !opts.images
+	if opts.compression != "" {
+		defaults, err := compressionFlags(opts.compression)
+		if err != nil {
+			return opts, nil, false, err
+		}
+		for name, value := range defaults {
+			if imagesOff && name != "merge-fonts" {
+				continue
+			}
+			if !visited[name] && !configured[name] {
+				if err := f.Set(name, value); err != nil {
+					return opts, nil, false, err
+				}
+			}
+		}
+	}
 	if opts.lossless && !visited["image-codecs"] && opts.imageCodecs == "flate,jpeg" {
 		opts.imageCodecs = "flate"
 	}
 	if err := opts.validate(); err != nil {
 		return opts, nil, false, err
 	}
+	if imagesOff && opts.images {
+		return opts, nil, false, errors.New("--images=false conflicts with an enabled image transformation")
+	}
 	if saveProfile != "" {
+		if strings.EqualFold(filepath.Ext(saveProfile), ".pdfscp") {
+			return opts, nil, false, errors.New("--save-profile writes native JSON; use a .json filename, not .pdfscp")
+		}
 		p := profile{Version: 1, Flags: map[string]string{}, Metadata: opts.metadata}
 		f.VisitAll(func(f *flag.Flag) {
 			if profileFlag(f.Name) {
 				p.Flags[f.Name] = f.Value.String()
 			}
 		})
-		data, err := json.MarshalIndent(p, "", "  ")
+		if len(profiles) > 0 {
+			p.Name = profiles[selected].Name
+		} else {
+			p.Name = opts.compression
+		}
+		var saved any = p
+		if len(profiles) > 1 {
+			profiles[selected] = p
+			saved = profileBundle{Version: 2, Profiles: profiles}
+		}
+		data, err := json.MarshalIndent(saved, "", "  ")
 		if err != nil {
 			return opts, nil, false, err
+		}
+		if len(data)+1 > maxProfileBytes {
+			return opts, nil, false, errors.New("saved profile exceeds 1 MiB; export fewer entries or less metadata")
 		}
 		if _, err := writeNew(ctx, saveProfile, strings.NewReader(string(data)+"\n")); err != nil {
 			return opts, nil, false, err
@@ -348,7 +397,7 @@ func (o *options) validate() error {
 	if o.imageCodecs == "" || !validList(o.imageCodecs, "flate,jpeg") || o.monoCodecs == "" || !validList(o.monoCodecs, "flate,ccitt,jbig2") {
 		return errors.New("invalid image or monochrome codec list")
 	}
-	if !validList(o.strip, "thumbnails,alternates,threads,tags,output-intents,piece-info,metadata,links,annotations,forms,images,actions,multimedia,hidden,xfa,attachments") {
+	if !validList(o.strip, "thumbnails,alternates,threads,tags,output-intents,piece-info,metadata,links,annotations,forms,images,actions,multimedia,hidden,xfa,attachments,web-capture") {
 		return errors.New("invalid --strip list")
 	}
 	if !validList(o.flatten, "forms,annotations,links,all") {
@@ -365,8 +414,16 @@ func (o *options) validate() error {
 	if o.collision != "error" && o.collision != "number" {
 		return errors.New("--collision must be error or number")
 	}
-	if o.timestamps != "preserve" && o.timestamps != "now" {
-		return errors.New("--timestamps must be preserve or now")
+	if !listContains("preserve,modified,now", o.timestamps) {
+		return errors.New("--timestamps must be preserve, modified, or now")
+	}
+	if !listContains("exact,preserve", o.colorReduction) {
+		return errors.New("--color-reduction must be exact or preserve")
+	}
+	for _, output := range o.outputs {
+		if output == "" {
+			return errors.New("--output must not be empty")
+		}
 	}
 	for _, setting := range o.metadata {
 		key, value, ok := strings.Cut(setting, "=")
@@ -441,7 +498,7 @@ func (o *options) validate() error {
 
 // requiredOutput prevents a size fallback from undoing requested document changes.
 func (o options) requiredOutput() bool {
-	return o.privacy || len(o.metadata) > 0 || o.strip != "" || o.flatten != "" || o.gray || o.force || o.decrypt || o.encryptOwnerFile != "" || o.bitmap || o.mrc || o.pdfa != "" || o.timestamps == "now" || o.removeStandardFonts
+	return o.privacy || len(o.metadata) > 0 || o.strip != "" || o.flatten != "" || o.gray || o.force || o.decrypt || o.encryptOwnerFile != "" || o.bitmap || o.mrc || o.pdfa != "" || o.timestamps == "now" || o.timestamps == "modified" || o.removeStandardFonts
 }
 
 // breaksPDFA names the first option that removes something PDF/A requires, or "".
@@ -464,8 +521,8 @@ func (o options) breaksPDFA(conversion bool) string {
 		return ""
 	case len(o.metadata) > 0:
 		return "--metadata"
-	case o.timestamps == "now":
-		return "--timestamps now"
+	case o.timestamps == "now" || o.timestamps == "modified":
+		return "--timestamps " + o.timestamps
 	case o.bitmap:
 		return "--bitmap"
 	case o.mrc:
@@ -545,7 +602,7 @@ func expandInputs(ctx context.Context, inputs []string, recursive bool) ([]input
 				return err
 			}
 			if d.IsDir() {
-				if path != input && !recursive {
+				if path != input && (!recursive || strings.HasPrefix(d.Name(), ".")) {
 					return filepath.SkipDir
 				}
 				return nil
@@ -563,6 +620,5 @@ func expandInputs(ctx context.Context, inputs []string, recursive bool) ([]input
 			return nil, err
 		}
 	}
-	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
 	return files, nil
 }

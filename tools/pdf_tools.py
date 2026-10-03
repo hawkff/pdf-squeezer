@@ -2,6 +2,7 @@
 
 import array
 import copy
+import functools
 import hashlib
 import io
 import json
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import zlib
+from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -120,9 +122,24 @@ def placements(pdf, lossless=False):
     import pikepdf
 
     uses, streams, blocked = {}, {}, set()
+    checked_glyphs = set()
     visits = 0
 
-    def walk(owner, resources, matrix, clip, active, depth=0, borrowed=False):
+    @functools.lru_cache(maxsize=64)
+    def type3_encoding(objgen):
+        return pdfa.simple_encoding(pdf.get_object(objgen), [None] * 256)
+
+    def walk(
+        owner,
+        resources,
+        matrix,
+        clip,
+        active,
+        depth=0,
+        borrowed=False,
+        preserve=False,
+        font=None,
+    ):
         nonlocal visits
         visits += 1
         if depth > 64 or visits > 100000:
@@ -135,6 +152,7 @@ def placements(pdf, lossless=False):
         instructions = pikepdf.parse_content_stream(owner)
         streams[key] = (owner, resources, instructions)
         stack, path, pending_clip = [], None, False
+        borrowed_key = None
         for instruction in instructions:
             # Inline image objects are preserved by unparse_content_stream.
             if not hasattr(instruction, "operator"):
@@ -143,11 +161,11 @@ def placements(pdf, lossless=False):
             if op == "q":
                 if len(stack) >= 256:
                     raise ValueError("graphics state nesting exceeds safety limit")
-                stack.append((matrix, clip))
+                stack.append((matrix, clip, font))
             elif op == "Q":
                 if not stack:
                     raise ValueError("unbalanced graphics state")
-                matrix, clip = stack.pop()
+                matrix, clip, font = stack.pop()
             elif op == "cm":
                 if len(args) != 6:
                     raise ValueError("invalid transformation matrix")
@@ -168,6 +186,73 @@ def placements(pdf, lossless=False):
                 if pending_clip:
                     clip = intersect(clip, path) if path is not None else (0, 0, 0, 0)
                 path, pending_clip = None, False
+            elif op in ("Tf", "gs") and args:
+                chosen = pdfa.selected_font(resources, op, args[0])
+                if chosen is not None or op == "Tf":
+                    font = chosen
+            elif op in ("Tj", "TJ", "'", '"'):
+                if (
+                    isinstance(font, pikepdf.Dictionary)
+                    and font.get("/Subtype") == pikepdf.Name.Type3
+                ):
+                    text = args[0] if op == "TJ" and args else args[-1:]
+                    codes = {
+                        code
+                        for item in text
+                        if isinstance(item, pikepdf.String)
+                        for code in bytes(item)
+                    }
+                    if not codes:
+                        continue
+                    encoding = (
+                        type3_encoding(font.objgen)
+                        if font.is_indirect
+                        else pdfa.simple_encoding(font, [None] * 256)
+                    )
+                    names = {encoding[code] for code in codes}
+                    font_key = font.objgen if font.is_indirect else font.unparse()
+                    glyph_resources = font.get("/Resources")
+                    if isinstance(glyph_resources, pikepdf.Dictionary):
+                        context_key = ("font", font_key)
+                    else:
+                        glyph_resources = resources
+                        if borrowed_key is None:
+                            borrowed_key = (
+                                "resources",
+                                resources.objgen
+                                if resources.is_indirect
+                                else resources.unparse(),
+                            )
+                        context_key = borrowed_key
+                    if None in names:
+                        # Unknown encodings retain the conservative resource scan;
+                        # do not execute unused glyph programs to guess a mapping.
+                        key = ("unknown", font_key, context_key)
+                        if key not in checked_glyphs:
+                            checked_glyphs.add(key)
+                            collect_images(font, blocked)
+                            collect_images(glyph_resources, blocked)
+                        continue
+                    procs = font.get("/CharProcs", {})
+                    for name in names:
+                        glyph = procs.get("/" + name, procs.get("/.notdef"))
+                        if not isinstance(glyph, pikepdf.Stream):
+                            continue
+                        key = (glyph.objgen, context_key)
+                        if key in checked_glyphs:
+                            continue
+                        checked_glyphs.add(key)
+                        # Glyph geometry is unknown; protect its invoked images,
+                        # but retain placements belonging only to ordinary Do uses.
+                        walk(
+                            glyph,
+                            glyph_resources,
+                            IDENTITY,
+                            clip,
+                            active,
+                            depth + 1,
+                            preserve=True,
+                        )
             elif op == "Do":
                 if len(args) != 1:
                     raise ValueError("invalid XObject invocation")
@@ -187,10 +272,12 @@ def placements(pdf, lossless=False):
                         active,
                         depth + 1,
                         "/Resources" not in target,
+                        preserve,
+                        font,
                     )
                 elif subtype == pikepdf.Name.Image:
                     nr = target.objgen
-                    if borrowed:
+                    if borrowed or preserve:
                         # A form without its own resources can draw different
                         # images under one name on different pages, so the crop
                         # rewrite could not bind the name reliably. Preserve them.
@@ -289,13 +376,15 @@ def place_crops(pdf, streams, crops):
                 rewritten.append(instruction)
                 continue
             left, top, right, bottom, width, height = crop
+            # Float serialization rounds to six places, which can shift the
+            # viewer's pixel sampling at an otherwise integer-aligned crop.
             transform = [
-                (right - left) / width,
+                Decimal(right - left) / width,
                 0,
                 0,
-                (bottom - top) / height,
-                left / width,
-                1 - bottom / height,
+                Decimal(bottom - top) / height,
+                Decimal(left) / width,
+                Decimal(height - bottom) / height,
             ]
             rewritten.extend(
                 [
@@ -669,7 +758,14 @@ def process_images(pdf, options):
         if components == 4 and candidate[1] == pikepdf.Name.DCTDecode:
             obj.Decode = pikepdf.Array([1, 0] * 4)
         if isinstance(soft_mask, pikepdf.Stream) and (cropped or resized):
-            resample_mask(soft_mask, box, size)
+            # A mask with one image parent can still be drawn directly with Do.
+            # Keep its encoded data and dictionary intact for those consumers.
+            private_mask = pdf.make_stream(soft_mask.read_raw_bytes())
+            for key, value in soft_mask.items():
+                if key != "/Length":
+                    private_mask[key] = value
+            resample_mask(private_mask, box, size)
+            obj.SMask = private_mask
         if cropped:
             crops[obj.objgen] = (*box, w, h)
         changed += 1
@@ -748,6 +844,12 @@ def font_glyph_usage(pdf):
 
     used, blocked, visited_forms = {}, set(), set()
 
+    @functools.lru_cache(maxsize=64)
+    def cid_map(objgen):
+        # At most 64 maps of 128 KiB: 8 MiB of retained mapping data per call.
+        data = pdf.get_object(objgen).read_bytes()
+        return data if len(data) <= 131072 and len(data) % 2 == 0 else None
+
     def block_graph(obj, seen=None, depth=0):
         if depth > 100:
             raise ValueError("font resource nesting exceeds safety limit")
@@ -790,8 +892,8 @@ def font_glyph_usage(pdf):
             return
         mapping = descendant.get("/CIDToGIDMap", pikepdf.Name.Identity)
         if isinstance(mapping, pikepdf.Stream):
-            mapping = mapping.read_bytes()
-            if len(mapping) > 131072 or len(mapping) % 2:
+            mapping = cid_map(mapping.objgen)
+            if mapping is None:
                 blocked.add(program)
                 return
         elif mapping == pikepdf.Name.Identity:
@@ -834,8 +936,10 @@ def font_glyph_usage(pdf):
                 if not stack:
                     raise ValueError("unbalanced graphics state")
                 font = stack.pop()
-            elif op == "Tf":
-                font = resources.get("/Font", {}).get(args[0])
+            elif op in ("Tf", "gs"):
+                chosen = pdfa.selected_font(resources, op, args[0])
+                if chosen is not None or op == "Tf":
+                    font = chosen
             elif op in ("Tj", "'", '"'):
                 glyphs(font, args[-1])
             elif op == "TJ":
@@ -1000,7 +1104,9 @@ def merge_fonts(pdf, verbose):
         if len(data) > 32 << 20:
             continue
         font = TTFont(io.BytesIO(data), lazy=False)
-        name = re.sub(r"^[A-Z]{6}\+", "", str(descriptor.get("/FontName", "")))
+        name = re.sub(
+            r"^[A-Z]{6}\+", "", str(descriptor.get("/FontName", "")).lstrip("/")
+        )
         if not name:
             continue
         groups.setdefault(name, []).append((obj, descriptor, stream, data, font))

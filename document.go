@@ -41,7 +41,8 @@ func transformDocument(ctx context.Context, pdf *model.Context, opts options) er
 			return err
 		}
 	}
-	if len(opts.metadata) > 0 || opts.timestamps == "now" {
+	updateDates := opts.timestamps == "now" || opts.timestamps == "modified"
+	if len(opts.metadata) > 0 || updateDates {
 		var info types.Dict
 		var err error
 		if pdf.Info != nil {
@@ -57,9 +58,12 @@ func transformDocument(ctx context.Context, pdf *model.Context, opts options) er
 				return err
 			}
 		}
-		if opts.timestamps == "now" && !opts.privacy {
+		if updateDates && !opts.privacy {
 			date := types.StringLiteral("D:" + time.Now().UTC().Format("20060102150405") + "Z")
-			info["CreationDate"], info["ModDate"] = date, date
+			info["ModDate"] = date
+			if opts.timestamps == "now" {
+				info["CreationDate"] = date
+			}
 		}
 		for _, setting := range opts.metadata {
 			key, value, _ := strings.Cut(setting, "=")
@@ -97,7 +101,7 @@ func transformDocument(ctx context.Context, pdf *model.Context, opts options) er
 		}
 		// Resource names are arbitrary. A resource named /Metadata or /B must
 		// not be mistaken for a metadata field or a page's article-bead array.
-		if opts.privacy || len(opts.metadata) > 0 || opts.timestamps == "now" || listContains(opts.strip, "metadata") {
+		if opts.privacy || len(opts.metadata) > 0 || updateDates || listContains(opts.strip, "metadata") {
 			if metadata, _, err := pdf.DereferenceStreamDict(d["Metadata"]); err == nil && metadata != nil {
 				if typ := metadata.NameEntry("Type"); typ != nil && *typ == "Metadata" {
 					delete(d, "Metadata")
@@ -184,7 +188,7 @@ func transformDocument(ctx context.Context, pdf *model.Context, opts options) er
 		delete(pdf.RootDict, "StructTreeRoot")
 		delete(pdf.RootDict, "MarkInfo")
 	}
-	if opts.privacy {
+	if opts.privacy || listContains(opts.strip, "web-capture") {
 		delete(pdf.RootDict, "SpiderInfo")
 	}
 	return nil

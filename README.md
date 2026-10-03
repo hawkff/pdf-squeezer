@@ -28,7 +28,11 @@ pdf-squeezer document.pdf
 pdf-squeezer document.pdf -o smaller.pdf
 pdf-squeezer document.pdf -o out/
 
-# Re-encode images, permitting lossy JPEG
+# Choose a compression tier without flattening the document
+pdf-squeezer --compression medium scan.pdf
+pdf-squeezer --compression heavy scan.pdf
+
+# Set image encoding options directly
 pdf-squeezer --images --image-quality 75 scan.pdf
 
 # Re-encode without discarding sample precision or recompressing JPEG
@@ -50,15 +54,37 @@ pdf-squeezer --version
 
 Flags may come before or after filenames. Use `--` before a filename that starts with a dash. Short flags are `-o` output, `-V` verbose, `-v` version, and `-h` help.
 
-The CLI leaves inputs unchanged and refuses to overwrite outputs, including symlinks. `--collision number` chooses a numbered name instead. Directory scans skip hidden files, symlinks, and generated `.squeezed.pdf` or `.squeezed.N.pdf` outputs. Batch output retains relative subdirectories beneath an existing output directory. A batch reports individual failures and returns a failing exit status if any input fails.
+The CLI leaves inputs unchanged and refuses to overwrite outputs, including symlinks. `--collision number` chooses a numbered name instead. Directory scans skip hidden files, symlinks, and generated `.squeezed.pdf` or `.squeezed.N.pdf` outputs. Batch output retains relative subdirectories beneath an existing output directory. A batch reports individual failures and returns a failing exit status if any input fails. For separate destinations, repeat `-o` once per distinct input file. Inputs keep their command-line order; directory inputs cannot use this form. Every destination is checked before processing begins.
+
+```sh
+pdf-squeezer first.pdf second.pdf -o out/first.pdf -o elsewhere/second.pdf
+```
 
 Compression keeps the original bytes when the result would be no smaller. Explicit document changes, including privacy, metadata edits, grayscale, encryption, removals, flattening, raster conversion, and PDF/A-4 conversion, keep their result even when it is larger. `--force-recompression` also disables the size fallback. Unsupported or unsafe images remain untouched even with that flag.
+
+## Compression tiers
+
+`--compression light|balanced|medium|strong|heavy` sets image-compression defaults. Without this flag, default structural optimization stays unchanged.
+
+| Tier | JPEG quality | Allow 16-bit to 8-bit images | Target color/gray DPI | Other work |
+| --- | ---: | --- | ---: | --- |
+| `light` | 90 | No | Unchanged | Compare JPEG and lossless Flate |
+| `balanced` | 85 | Yes | Unchanged | Same codec comparison |
+| `medium` | 65 | Yes | 150 | Crop unused margins; include inline images |
+| `strong` | 45 | Yes | 120 | Same placement-aware work |
+| `heavy` | 30 | Yes | 96 | Also merge compatible fonts; try maximum-effort Flate with and without PNG predictors |
+
+Light and balanced need no external tools. Medium and strong need the Python tools and qpdf. Heavy also uses the fontTools package included in the Python requirements. Missing tools cause an error, not a fallback to another engine.
+
+Tiers never enable rasterization, flattening, grayscale conversion, metadata stripping, or removal of fonts, tags, links, forms, or attachments. They retain soft-mask precision. Higher tiers permit more image loss; heavy can introduce visible JPEG artifacts around small text and colored edges. They do not guarantee a reduction percentage or a smaller result on every document. The no-size-gain fallback still applies.
+
+DPI is a ceiling, not a request to upscale. An image below the selected target stays at its existing resolution. Tier settings are defaults: profile values override them, and explicit flags override both. For example, `--compression strong --image-quality 70 --dpi 0` retains resolution and uses JPEG quality 70. `--lossless` rejects tier settings that would discard precision or resolution; use it without a tier for preservation.
 
 ## Image compression
 
 `--images` handles supported 1-, 8-, and 16-bit image samples. It compares Flate compression with PNG predictors against JPEG, with configurable `--image-quality 1..100` and `--image-codecs flate,jpeg`. A native re-encode normally needs to save at least 2% and 1 KiB.
 
-The lossy path can reduce exactly gray DeviceRGB samples to DeviceGray and exact black-and-white gray samples to 1-bit. It preserves ICC color spaces and avoids grayscale reclassification when the document overrides default color spaces. `--lossless` forbids JPEG re-encoding, color-space changes, downsampling, and bit-depth reduction. Existing JPEG data stays encoded in that mode.
+`--color-reduction exact`, the default, lets the lossy path reduce exactly gray DeviceRGB samples to DeviceGray and exact black-and-white gray samples to 1-bit. `--color-reduction preserve` disables both classifications while still allowing JPEG. It does not disable separately requested `--reduce-bit-depth` or `--gray` conversion. It preserves ICC color spaces and avoids grayscale reclassification when the document overrides default color spaces. `--lossless` forbids JPEG re-encoding, color-space changes, downsampling, and bit-depth reduction. Existing JPEG data stays encoded in that mode.
 
 16-bit samples retain their precision unless `--reduce-bit-depth` permits an 8-bit conversion. Soft masks retain their precision regardless of that flag. Matte-backed images, explicit masks, indexed images, unsupported transfer functions, and unknown filters stay unchanged. The native pass handles identity and inversion `/Decode` arrays and lossless CMYK streams. Use `--extended-images` for supported JPEG 2000 and CMYK JPEG decoding through the optional tools.
 
@@ -145,20 +171,38 @@ pdf-squeezer --profile web.profile.json --image-quality 85 document.pdf
 
 pdf-squeezer --metadata 'Title=Public report' --metadata 'Author=' document.pdf
 pdf-squeezer --strip thumbnails,alternates,piece-info document.pdf
+pdf-squeezer --strip web-capture document.pdf
+pdf-squeezer --timestamps modified document.pdf
 pdf-squeezer --timestamps now document.pdf
 ```
 
-Profiles are versioned JSON. They contain settings and optional metadata, never input/output paths, password files, or password values. They use this app's format, not another application's exported profile format. A profile may request destructive transformations, so inspect profiles before using them.
+Native profiles use versioned JSON and contain settings and optional metadata, never input/output paths, password files, or password values. Existing version-1 files still work. Version-2 bundles contain an ordered `profiles` array of version-1 entries, each with an optional `name`.
+
+`--profile-entry NAME|N` selects an entry by name or 1-based index. A matching name takes precedence over an index; ambiguous names require an index. Without it, the first entry is used. Repeat `--profile` to combine files in argument order. `--save-profile` saves the selected entry's resolved settings and retains the other entries when saving a bundle. Export uses native JSON only.
+
+```sh
+pdf-squeezer --compression light --save-profile light.profile.json
+pdf-squeezer --compression strong --save-profile strong.profile.json
+pdf-squeezer --profile light.profile.json --profile strong.profile.json \
+  --profile-entry strong --save-profile presets.profile.json
+pdf-squeezer --profile presets.profile.json --profile-entry 2 document.pdf
+pdf-squeezer --profile exported.pdfscp --profile-entry 1 document.pdf
+```
+
+`.pdfscp` import accepts XML or binary property lists containing an array of settings dictionaries. It requires Python 3's standard-library `plistlib`, not the optional PDF packages. It maps supported image, font, removal, metadata and date fields to CLI settings. Normalized `imageQuality` values become JPEG quality 1..100. Fields absent from the file use CLI defaults; the importer does not reproduce another engine's internal compression rules.
+
+Unknown fields, unverified nonzero `colorConversion` values, disabled structural optimization, and automatic Producer replacement cause an error rather than a guessed conversion. Use a native profile for those settings. Timestamp import preserves the CLI's portable filesystem behavior, not macOS birth-time changes. A profile can request destructive transformations independently of a compression tier, so inspect imported profiles before using them.
 
 `--metadata KEY=VALUE` is repeatable. Supported keys are `Title`, `Author`, `Subject`, `Keywords`, `Creator`, `Producer`, `CreationDate`, and `ModDate`. An empty value removes that key. Dates use `D:YYYYMMDDhhmmssZ`. Editing these fields removes XMP copies that could retain contradictory values.
 
-`--timestamps preserve` retains existing document dates and the input's filesystem modification time. It is the default. `--timestamps now` updates document creation/modification dates and leaves the output with its new filesystem timestamp. The CLI does not promise portable filesystem birth-time preservation.
+`--timestamps preserve` retains existing document dates and the input's filesystem modification time. It is the default. `--timestamps modified` updates only the document modification date, preserving its creation date. `--timestamps now` updates both document dates. Both update modes leave the output with its new filesystem timestamp and remove stale XMP copies. The CLI does not promise portable filesystem birth-time preservation.
 
 `--privacy` empties the document information dictionary, removes XMP metadata, application piece information, and web-capture information, and creates a fresh document identifier. Page content, comments, form values, and attachments can still contain personal information. Check those separately.
 
 `--strip` accepts a comma-separated list:
 
 - `thumbnails`, `alternates`, `threads`, `piece-info`, or `metadata`. Here `metadata` means XMP; use `--privacy` to clear document information too.
+- `web-capture` removes the catalog's SpiderInfo web-capture data without clearing document information or XMP.
 - `tags` removes accessibility structure and reading-order information.
 - `output-intents` removes document color/output-intent information.
 - `links`, `annotations`, or `forms` removes those objects rather than flattening their appearances.

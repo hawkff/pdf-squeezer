@@ -9,7 +9,9 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
+from unittest import mock
 
 import pikepdf
 import pymupdf
@@ -72,6 +74,46 @@ def simple_font(pdf, base_font, **extra):
             Subtype=pikepdf.Name.Type1,
             BaseFont=pikepdf.Name("/" + base_font),
             **extra,
+        )
+    )
+
+
+def cid_font(pdf, program=b"unused program", mapping=None):
+    descriptor = pdf.make_indirect(
+        pikepdf.Dictionary(
+            Type=pikepdf.Name.FontDescriptor,
+            FontName=pikepdf.Name.Fixture,
+            FontFile2=pdf.make_stream(program),
+            Flags=4,
+            FontBBox=[0, -200, 1000, 1000],
+            ItalicAngle=0,
+            Ascent=1000,
+            Descent=-200,
+            CapHeight=700,
+            StemV=80,
+        )
+    )
+    descendant = pdf.make_indirect(
+        pikepdf.Dictionary(
+            Type=pikepdf.Name.Font,
+            Subtype=pikepdf.Name.CIDFontType2,
+            BaseFont=pikepdf.Name.Fixture,
+            CIDSystemInfo=pikepdf.Dictionary(
+                Registry=pikepdf.String("Adobe"),
+                Ordering=pikepdf.String("Identity"),
+                Supplement=0,
+            ),
+            FontDescriptor=descriptor,
+            CIDToGIDMap=mapping if mapping is not None else pikepdf.Name.Identity,
+        )
+    )
+    return pdf.make_indirect(
+        pikepdf.Dictionary(
+            Type=pikepdf.Name.Font,
+            Subtype=pikepdf.Name.Type0,
+            BaseFont=pikepdf.Name.Fixture,
+            Encoding=pikepdf.Name("/Identity-H"),
+            DescendantFonts=[descendant],
         )
     )
 
@@ -229,6 +271,212 @@ class PDFToolsTests(unittest.TestCase):
         with pikepdf.Pdf.open(self.output) as result:
             widths = [int(page.Resources.XObject.Im.Width) for page in result.pages]
             self.assertEqual(widths, [128, 128])
+
+    def test_crop_preserves_images_shared_with_type3_glyphs(self):
+        for own_resources in (True, False):
+            with self.subTest(own_resources=own_resources):
+                pdf = pikepdf.Pdf.new()
+                glyph = pdf.make_stream(
+                    b"128 0 d0 /GlyphForm Do"
+                    if own_resources
+                    else b"128 0 d0 q 128 0 0 128 0 0 cm /Im Do Q"
+                )
+                font = pdf.make_indirect(
+                    pikepdf.Dictionary(
+                        Type=pikepdf.Name.Font,
+                        Subtype=pikepdf.Name.Type3,
+                        FontBBox=[0, 0, 128, 128],
+                        FontMatrix=[1, 0, 0, 1, 0, 0],
+                        CharProcs=pikepdf.Dictionary(
+                            square=glyph,
+                            unused=pdf.make_stream(
+                                b"128 0 d0 q 128 0 0 128 0 0 cm /Other Do Q"
+                            ),
+                            malformed=pdf.make_stream(b"128 0 d0 /Missing Do"),
+                        ),
+                        Encoding=pikepdf.Dictionary(
+                            Differences=[
+                                97,
+                                pikepdf.Name.square,
+                                pikepdf.Name.unused,
+                                pikepdf.Name.malformed,
+                            ]
+                        ),
+                        FirstChar=97,
+                        LastChar=99,
+                        Widths=[128, 128, 128],
+                    )
+                )
+                for seed in (19, 23):
+                    image = image_object(
+                        pdf,
+                        Image.frombytes(
+                            "RGB",
+                            (128, 128),
+                            random.Random(seed).randbytes(128 * 128 * 3),
+                        ),
+                    )
+                    other = image_object(
+                        pdf,
+                        Image.frombytes(
+                            "RGB",
+                            (128, 128),
+                            random.Random(seed + 1).randbytes(128 * 128 * 3),
+                        ),
+                    )
+                    if own_resources:
+                        form = pdf.make_stream(b"q 128 0 0 128 0 0 cm /Im Do Q")
+                        form.Type, form.Subtype = (
+                            pikepdf.Name.XObject,
+                            pikepdf.Name.Form,
+                        )
+                        form.BBox = pikepdf.Array([0, 0, 128, 128])
+                        form.Resources = pikepdf.Dictionary(
+                            XObject=pikepdf.Dictionary(Im=image)
+                        )
+                        font = pdf.make_indirect(pikepdf.Dictionary(font))
+                        font.Resources = pikepdf.Dictionary(
+                            XObject=pikepdf.Dictionary(
+                                Im=image, GlyphForm=form, Other=other
+                            )
+                        )
+                    page = text_page(
+                        pdf,
+                        {"T3": font},
+                        b"q 0 0 64 64 re W n 128 0 0 128 -32 -32 cm /Im Do Q "
+                        + (
+                            b"BT /T3 1 Tf 0 72 Td (a) Tj ET "
+                            if own_resources
+                            else b"BT /T3 1 Tf ET /TextForm Do "
+                        )
+                        + b"q 128 0 64 64 re W n 128 0 0 128 96 -32 cm /Other Do Q",
+                        size=(256, 200),
+                    )
+                    page.Resources.XObject = pikepdf.Dictionary(Im=image, Other=other)
+                    if not own_resources:
+                        # The form inherits the selected font but supplies its own
+                        # glyph resource context, without selecting the font again.
+                        text_form = pdf.make_stream(b"BT 0 72 Td (a) Tj ET")
+                        text_form.Type, text_form.Subtype = (
+                            pikepdf.Name.XObject,
+                            pikepdf.Name.Form,
+                        )
+                        text_form.BBox = pikepdf.Array([0, 0, 128, 200])
+                        text_form.Resources = pikepdf.Dictionary(
+                            XObject=pikepdf.Dictionary(Im=image)
+                        )
+                        page.Resources.XObject.TextForm = text_form
+                pdf.save(self.source, compress_streams=False)
+                before = rendered_samples(self.source, isolate_pages=True)
+                tools.transform(
+                    self.source,
+                    self.output,
+                    options(clip=True, lossless=True, codecs="flate"),
+                )
+                self.assertTrue(
+                    before == rendered_samples(self.output, isolate_pages=True),
+                    "Type 3 page pixels or dimensions changed",
+                )
+                with pikepdf.Pdf.open(self.output) as result:
+                    self.assertEqual(
+                        [
+                            (
+                                int(p.Resources.XObject.Im.Width),
+                                int(p.Resources.XObject.Im.Height),
+                            )
+                            for p in result.pages
+                        ],
+                        [(128, 128), (128, 128)],
+                    )
+                    for page in result.pages:
+                        self.assertLess(int(page.Resources.XObject.Other.Width), 128)
+                pdf.close()
+
+    def test_type3_glyphs_are_scanned_once_per_resource_context(self):
+        pdf = pikepdf.Pdf.new()
+        glyphs = {f"g{i}": pdf.make_stream(b"1 0 d0") for i in range(256)}
+        font = pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name.Font,
+                Subtype=pikepdf.Name.Type3,
+                FontBBox=[0, 0, 1, 1],
+                FontMatrix=[1, 0, 0, 1, 0, 0],
+                CharProcs=pikepdf.Dictionary(**glyphs),
+                Resources=pikepdf.Dictionary(),
+                Encoding=pikepdf.Dictionary(
+                    Differences=[0] + [pikepdf.Name("/" + name) for name in glyphs]
+                ),
+                FirstChar=0,
+                LastChar=255,
+                Widths=[1] * 256,
+            )
+        )
+        content = b"BT /T3 1 Tf <" + bytes(range(256)).hex().encode() + b"> Tj ET"
+        for _ in range(400):
+            text_page(pdf, {"T3": font}, content)
+        parsed = []
+        original = pikepdf.parse_content_stream
+        glyph_ids = {g.objgen for g in glyphs.values()}
+
+        def counted(owner, *args, **kwargs):
+            obj = owner.obj if isinstance(owner, pikepdf.Page) else owner
+            if obj.objgen in glyph_ids:
+                parsed.append(obj.objgen)
+            return original(owner, *args, **kwargs)
+
+        with mock.patch.object(pikepdf, "parse_content_stream", counted):
+            tools.placements(pdf)
+        self.assertEqual(len(parsed), 256)
+        pdf.close()
+
+    def test_crop_keeps_direct_consumers_of_a_soft_mask_unchanged(self):
+        pdf = pikepdf.Pdf.new()
+        image = image_object(
+            pdf,
+            Image.frombytes(
+                "RGB", (128, 128), random.Random(29).randbytes(128 * 128 * 3)
+            ),
+        )
+        mask = image_object(pdf, Image.linear_gradient("L").resize((128, 128)))
+        mask.Interpolate = False
+        mask.write(
+            zlib.compress(mask.read_bytes()),
+            filter=pikepdf.Name.FlateDecode,
+            decode_parms=pikepdf.Dictionary(
+                Predictor=1, Columns=128, Colors=1, BitsPerComponent=8
+            ),
+        )
+        image.SMask = mask
+        for target, size, content in (
+            (image, (64, 64), b"q 128 0 0 128 -32 -32 cm /Im Do Q"),
+            (mask, (128, 128), b"q 128 0 0 128 0 0 cm /Im Do Q"),
+        ):
+            page = pdf.add_blank_page(page_size=size)
+            page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im=target))
+            page.Contents = pdf.make_stream(content)
+        pdf.save(self.source, compress_streams=False)
+        before = rendered_samples(self.source)
+        tools.transform(
+            self.source, self.output, options(clip=True, lossless=True, codecs="flate")
+        )
+        self.assertTrue(
+            before == rendered_samples(self.output), "Page pixels or dimensions changed"
+        )
+        with pikepdf.Pdf.open(self.output) as result:
+            cropped = result.pages[0].Resources.XObject.Im
+            ordinary = result.pages[1].Resources.XObject.Im
+            self.assertLess(int(cropped.Width), 128)
+            self.assertEqual((int(ordinary.Width), int(ordinary.Height)), (128, 128))
+            self.assertEqual(ordinary.read_bytes(), mask.read_bytes())
+            self.assertEqual(ordinary.Filter, mask.Filter)
+            self.assertEqual(ordinary.DecodeParms, mask.DecodeParms)
+            self.assertNotEqual(cropped.SMask.objgen, ordinary.objgen)
+            self.assertEqual(
+                (cropped.Width, cropped.Height),
+                (cropped.SMask.Width, cropped.SMask.Height),
+            )
+            self.assertFalse(cropped.SMask.Interpolate)
+        pdf.close()
 
     def test_downsampling_accounts_for_largest_shared_placement(self):
         pdf = pikepdf.Pdf.new()
@@ -457,6 +705,14 @@ class PDFToolsTests(unittest.TestCase):
                 page.insert_font(fontname="Embedded", fontbuffer=buffer.getvalue())
                 page.insert_text((10, 40), text, fontname="Embedded", fontsize=20)
             doc.save(self.source)
+        with pikepdf.Pdf.open(self.source, allow_overwriting_input=True) as pdf:
+            for page, tag in zip(pdf.pages, ("ABCDEF", "UVWXYZ")):
+                font = page.Resources.Font.Embedded
+                descendant = font.DescendantFonts[0]
+                name = pikepdf.Name("/" + tag + "+DejaVuSans")
+                font.BaseFont = descendant.BaseFont = name
+                descendant.FontDescriptor.FontName = name
+            pdf.save(self.source)
         before = rendered(self.source)
         tools.transform(self.source, self.output, options(merge_fonts=True))
         self.assertEqual(before, rendered(self.output))
@@ -467,6 +723,149 @@ class PDFToolsTests(unittest.TestCase):
                 if isinstance(o, pikepdf.Dictionary) and "/FontFile2" in o
             }
             self.assertEqual(len(programs), 1)
+
+    def test_font_glyph_usage_tracks_extgstate_fonts_and_restore(self):
+        pdf = pikepdf.Pdf.new()
+        first, second = cid_font(pdf), cid_font(pdf)
+        page = text_page(
+            pdf,
+            {"F1": first},
+            b"BT /F1 12 Tf <0001> Tj q /G gs <0002> Tj /NoFont gs <0003> Tj Q <0004> Tj ET",
+        )
+        page.Resources.ExtGState = pikepdf.Dictionary(
+            G=pikepdf.Dictionary(Font=[second, 12]), NoFont=pikepdf.Dictionary(ca=1)
+        )
+        used, blocked = tools.font_glyph_usage(pdf)
+        self.assertEqual(blocked, set())
+        self.assertEqual(
+            used,
+            {
+                first.DescendantFonts[0].FontDescriptor.FontFile2.objgen: {1, 4},
+                second.DescendantFonts[0].FontDescriptor.FontFile2.objgen: {2, 3},
+            },
+        )
+        pdf.close()
+
+    def test_merge_fonts_preserves_used_empty_glyph_selected_by_gs(self):
+        from fontTools import subset
+        from fontTools.ttLib import TTFont
+
+        path = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+        if not path.exists():
+            self.skipTest("DejaVu font fixture is not installed")
+        pdf = pikepdf.Pdf.new()
+        for text in ("X", "A"):
+            tt = TTFont(path)
+            gid = tt.getGlyphID("A")
+            config = subset.Options()
+            config.retain_gids = True
+            subsetter = subset.Subsetter(options=config)
+            subsetter.populate(text=text)
+            subsetter.subset(tt)
+            if text == "X":
+                name = tt.getGlyphOrder()[gid]
+                self.assertEqual(tt["glyf"][name].numberOfContours, 0)
+                self.assertEqual(tt["hmtx"][name], (0, 0))
+            buffer = io.BytesIO()
+            tt.save(buffer)
+            font = cid_font(pdf, buffer.getvalue())
+            page = text_page(pdf, {}, f"BT /G gs 10 30 Td <{gid:04x}> Tj ET".encode())
+            page.Resources.ExtGState = pikepdf.Dictionary(
+                G=pikepdf.Dictionary(Font=[font, 30])
+            )
+        pdf.save(self.source, compress_streams=False)
+        pdf.close()
+        before = rendered_samples(self.source)
+        tools.transform(self.source, self.output, options(merge_fonts=True))
+        self.assertTrue(
+            before == rendered_samples(self.output), "Page pixels or dimensions changed"
+        )
+        with pikepdf.Pdf.open(self.output) as result:
+            programs = {
+                page.Resources.ExtGState.G.Font[0]
+                .DescendantFonts[0]
+                .FontDescriptor.FontFile2.objgen
+                for page in result.pages
+            }
+            self.assertEqual(len(programs), 2)
+
+    def test_font_glyph_usage_decodes_shared_cid_map_once_per_invocation(self):
+        pdf = pikepdf.Pdf.new()
+        mapping = pdf.make_stream(b"\x00\x00\x00\x07\x00\x09")
+        first, second = cid_font(pdf, mapping=mapping), cid_font(pdf, mapping=mapping)
+        page = text_page(
+            pdf,
+            {"F1": first, "F2": second},
+            b"BT /F1 12 Tf "
+            + b"<0001> Tj " * 200
+            + b"/F2 12 Tf "
+            + b"[<0002> 0 <0001>] TJ " * 200
+            + b"ET",
+        )
+        original = pikepdf.Object.read_bytes
+        decoded = []
+
+        def counted(stream, *args, **kwargs):
+            decoded.append(stream.objgen)
+            return original(stream, *args, **kwargs)
+
+        with mock.patch.object(pikepdf.Object, "read_bytes", counted):
+            used, blocked = tools.font_glyph_usage(pdf)
+        self.assertEqual(decoded.count(mapping.objgen), 1)
+        self.assertEqual(blocked, set())
+        self.assertEqual(
+            used,
+            {
+                first.DescendantFonts[0].FontDescriptor.FontFile2.objgen: {7},
+                second.DescendantFonts[0].FontDescriptor.FontFile2.objgen: {7, 9},
+            },
+        )
+        # No cross-invocation cache, including invalid maps used repeatedly.
+        for data in (b"\x00", b"\x00\x00", b"\x00" * 131074):
+            mapping.write(data)
+            with mock.patch.object(pikepdf.Object, "read_bytes", counted):
+                _, blocked = tools.font_glyph_usage(pdf)
+            self.assertEqual(blocked, set(used))
+        self.assertEqual(decoded.count(mapping.objgen), 4)
+        page.Contents = pdf.make_stream(b"BT /F1 12 Tf <0001> Tj ET")
+        mapping.write(b"\x00\x00\x00\x0b")
+        used, blocked = tools.font_glyph_usage(pdf)
+        self.assertEqual(next(iter(used.values())), {11})
+        self.assertEqual(blocked, set())
+        pdf.close()
+
+    def test_font_glyph_usage_bounds_cached_maps(self):
+        pdf = pikepdf.Pdf.new()
+        maps = [
+            pdf.make_stream(b"\x00\x00" + (i + 1).to_bytes(2, "big") + b"\x00" * 131068)
+            for i in range(65)
+        ]
+        fonts = {
+            f"F{i}": cid_font(pdf, mapping=mapping) for i, mapping in enumerate(maps)
+        }
+        content = (
+            "BT "
+            + " ".join(f"/F{i} 12 Tf <0001> Tj" for i in range(65))
+            + " /F64 12 Tf <0001> Tj /F0 12 Tf <0001> Tj <0001> Tj ET"
+        )
+        text_page(pdf, fonts, content.encode())
+        original, decoded = pikepdf.Object.read_bytes, []
+
+        def counted(stream, *args, **kwargs):
+            decoded.append(stream.objgen)
+            return original(stream, *args, **kwargs)
+
+        with mock.patch.object(pikepdf.Object, "read_bytes", counted):
+            used, blocked = tools.font_glyph_usage(pdf)
+        self.assertEqual(blocked, set())
+        self.assertEqual(len(used), 65)
+        self.assertEqual(decoded.count(maps[0].objgen), 2)
+        self.assertEqual(decoded.count(maps[-1].objgen), 1)
+        self.assertEqual(len(decoded), 66)
+        self.assertEqual(
+            {next(iter(gids)) for gids in used.values()}, set(range(1, 66))
+        )
+        pdf.close()
 
     def test_flatten_forms_keeps_visible_value(self):
         with pymupdf.open() as doc:

@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"compress/zlib"
+	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -178,6 +180,79 @@ func TestGhostscriptImageFlags(t *testing.T) {
 	}
 	if found != 1 {
 		t.Fatalf("found %d images, want 1", found)
+	}
+}
+
+// jpegSamplesBaseline retains the interface-based RGB loop for equivalence and allocation comparisons.
+func jpegSamplesBaseline(ctx context.Context, img image.Image) ([]byte, int, error) {
+	b := img.Bounds()
+	out := make([]byte, 0, b.Dx()*b.Dy()*3)
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		for x := b.Min.X; x < b.Max.X; x++ {
+			r, g, bl, _ := img.At(x, y).RGBA()
+			out = append(out, byte(r>>8), byte(g>>8), byte(bl>>8))
+		}
+	}
+	return out, 3, nil
+}
+
+func TestJPEGSamplesYCbCr(t *testing.T) {
+	for _, ratio := range []image.YCbCrSubsampleRatio{
+		image.YCbCrSubsampleRatio444, image.YCbCrSubsampleRatio422, image.YCbCrSubsampleRatio420,
+		image.YCbCrSubsampleRatio440, image.YCbCrSubsampleRatio411, image.YCbCrSubsampleRatio410,
+	} {
+		for _, rect := range []image.Rectangle{image.Rect(0, 0, 31, 19), image.Rect(3, 5, 34, 24), image.Rect(-9, -7, 22, 12)} {
+			t.Run(fmt.Sprintf("%s/%v", ratio, rect), func(t *testing.T) {
+				img := image.NewYCbCr(rect, ratio)
+				for j, plane := range [][]byte{img.Y, img.Cb, img.Cr} {
+					for i := range plane {
+						plane[i] = byte(uint32(i+j*31) * 2654435761 >> 13)
+					}
+				}
+				for _, sample := range []image.Image{img, img.SubImage(rect.Inset(3))} {
+					want, _, err := jpegSamplesBaseline(t.Context(), sample)
+					if err != nil {
+						t.Fatal(err)
+					}
+					got, comps, err := jpegSamples(t.Context(), sample)
+					if err != nil || comps != 3 || !bytes.Equal(got, want) {
+						t.Fatalf("RGB samples differ: components %d, error %v", comps, err)
+					}
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				if _, _, err := jpegSamples(ctx, img); !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkJPEGSamplesYCbCr(b *testing.B) {
+	img := image.NewYCbCr(image.Rect(0, 0, 512, 512), image.YCbCrSubsampleRatio420)
+	for j, plane := range [][]byte{img.Y, img.Cb, img.Cr} {
+		for i := range plane {
+			plane[i] = byte(uint32(i+j*31) * 2654435761 >> 13)
+		}
+	}
+	for _, tc := range []struct {
+		name    string
+		samples func(context.Context, image.Image) ([]byte, int, error)
+	}{{"interface-baseline", jpegSamplesBaseline}, {"concrete", jpegSamples}} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(512 * 512 * 3)
+			for b.Loop() {
+				out, comps, err := tc.samples(b.Context(), img)
+				if err != nil || comps != 3 || len(out) != 512*512*3 {
+					b.Fatal("invalid samples", err)
+				}
+			}
+		})
 	}
 }
 
