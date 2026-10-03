@@ -26,6 +26,15 @@ def message(text):
     print(text, file=sys.stderr, flush=True)
 
 
+def stream_mode(options):
+    """Object streams, unless the document must stay a PDF 1.4 file (PDF/A-1)."""
+    import pikepdf
+
+    if options.get("object_streams", True):
+        return pikepdf.ObjectStreamMode.generate
+    return pikepdf.ObjectStreamMode.disable
+
+
 def multiply(a, b):
     return (
         a[0] * b[0] + a[2] * b[1],
@@ -217,29 +226,23 @@ def placements(pdf, lossless=False):
                     # viewer's downsampling grid for fractional placements.
                     if not axis_aligned or lossless and not integer_grid:
                         uv = (0, 0, 1, 1)
-                    # The largest singular value accounts for rotation and shear.
-                    a, b, c, d = (
-                        matrix[0] / w,
-                        matrix[1] / w,
-                        matrix[2] / h,
-                        matrix[3] / h,
-                    )
-                    norm = a * a + b * b + c * c + d * d
-                    sigma = math.sqrt(
-                        (
-                            norm
-                            + math.sqrt(max(0, norm * norm - 4 * (a * d - b * c) ** 2))
-                        )
-                        / 2
-                    )
-                    if sigma <= 0 or not math.isfinite(sigma):
+                    # Each image axis maps to one column of the matrix; its length
+                    # in points per pixel gives that axis's placement resolution,
+                    # so anisotropic placements downsample each axis on its own.
+                    across = math.hypot(matrix[0], matrix[1]) / w
+                    down = math.hypot(matrix[2], matrix[3]) / h
+                    if not all(v > 0 and math.isfinite(v) for v in (across, down)):
                         blocked.add(nr)
                         continue
                     previous = uses.get(nr)
                     uses[nr] = (
-                        (union(previous[0], uv), min(previous[1], 72 / sigma))
+                        (
+                            union(previous[0], uv),
+                            min(previous[1], 72 / across),
+                            min(previous[2], 72 / down),
+                        )
                         if previous
-                        else (uv, 72 / sigma)
+                        else (uv, 72 / across, 72 / down)
                     )
         if stack:
             raise ValueError("unbalanced graphics state")
@@ -397,21 +400,52 @@ def resize16(data, width, height, components, size):
         samples.byteswap()
     channels = []
     for component in range(components):
-        channel = Image.new("I", (width, height))
-        channel.putdata(samples[component::components])
-        channel = channel.resize(size, Image.Resampling.BOX)
-        channels.append(
-            array.array(
-                "H",
-                (max(0, min(65535, value)) for value in channel.get_flattened_data()),
-            )
-        )
+        channel = Image.new("I;16", (width, height))
+        channel.frombytes(samples[component::components].tobytes())
+        channel = channel.resize(size, Image.Resampling.BOX)  # native 16-bit resampling
+        resized = array.array("H")
+        resized.frombytes(channel.tobytes())
+        channels.append(resized)
     result = array.array("H", [0]) * (size[0] * size[1] * components)
     for component, channel in enumerate(channels):
         result[component::components] = channel
     if sys.byteorder == "little":
         result.byteswap()
     return result.tobytes()
+
+
+def resamplable_mask(mask, width, height):
+    """A plain gray soft mask of the parent's size follows its crop and scale."""
+    return (
+        int(mask.get("/Width", 0)) == width
+        and int(mask.get("/Height", 0)) == height
+        and int(mask.get("/BitsPerComponent", 0)) in (8, 16)
+        and str(mask.get("/ColorSpace")) == "/DeviceGray"
+        and "/Matte" not in mask
+        and "/Decode" not in mask
+    )
+
+
+def resample_mask(mask, box, size):
+    """Crop and scale a soft mask like its parent, keeping 16-bit precision."""
+    import pikepdf
+    from PIL import Image
+
+    width, height = int(mask.Width), int(mask.Height)
+    if int(mask.BitsPerComponent) == 16:
+        data = mask.read_bytes()
+        if len(data) != width * height * 2:
+            raise ValueError("16-bit soft mask length does not match its dimensions")
+        data = crop16(data, width, height, 1, box)
+        if (box[2] - box[0], box[3] - box[1]) != size:
+            data = resize16(data, box[2] - box[0], box[3] - box[1], 1, size)
+        mask.write(zlib.compress(data), filter=pikepdf.Name.FlateDecode)
+    else:
+        image = pikepdf.PdfImage(mask).as_pil_image().convert("L").crop(box)
+        if image.size != size:
+            image = image.resize(size, Image.Resampling.LANCZOS)
+        mask.write(zlib.compress(image.tobytes()), filter=pikepdf.Name.FlateDecode)
+    mask.Width, mask.Height = size[0], size[1]
 
 
 def process_images(pdf, options):
@@ -428,7 +462,7 @@ def process_images(pdf, options):
     )
     uses, streams = placements(pdf, options["lossless"]) if geometry else ({}, {})
     crops, changed, preserved = {}, 0, {}
-    protected = set()
+    protected, mask_parents = set(), {}
     for obj in pdf.objects:
         if (
             isinstance(obj, pikepdf.Stream)
@@ -438,6 +472,7 @@ def process_images(pdf, options):
                 mask = obj.get(key)
                 if isinstance(mask, pikepdf.Stream):
                     protected.add(mask.objgen)
+                    mask_parents[mask.objgen] = mask_parents.get(mask.objgen, 0) + 1
     for obj in list(pdf.objects):
         if (
             not isinstance(obj, pikepdf.Stream)
@@ -445,18 +480,20 @@ def process_images(pdf, options):
         ):
             continue
         reason = None
-        if (
-            obj.objgen in protected
-            or obj.get("/ImageMask", False)
-            or "/Mask" in obj
-            or "/SMask" in obj
-        ):
-            reason = "mask or transparency"
         w, h, bits = (
             int(obj.get("/Width", 0)),
             int(obj.get("/Height", 0)),
             int(obj.get("/BitsPerComponent", 0)),
         )
+        soft_mask = obj.get("/SMask")
+        if obj.objgen in protected or obj.get("/ImageMask", False) or "/Mask" in obj:
+            reason = "mask or transparency"
+        elif soft_mask is not None and not (
+            isinstance(soft_mask, pikepdf.Stream)
+            and resamplable_mask(soft_mask, w, h)
+            and mask_parents.get(soft_mask.objgen) == 1
+        ):
+            reason = "soft mask"
         cs = obj.get("/ColorSpace")
         components = {"/DeviceGray": 1, "/DeviceRGB": 3, "/DeviceCMYK": 4}.get(
             str(cs), 0
@@ -511,7 +548,7 @@ def process_images(pdf, options):
         original = obj.read_raw_bytes()
         box = (0, 0, w, h)
         if placement and options["clip"]:
-            uv, _ = placement
+            uv = placement[0]
             # Retain a one-pixel border for interpolation at the clipping edge.
             box = (
                 max(0, math.floor(uv[0] * w) - 1),
@@ -526,11 +563,16 @@ def process_images(pdf, options):
             if components == 1
             else options["dpi"]
         )
-        scale = 1
-        if placement and target > 0 and placement[1] > target * options["threshold"]:
-            scale = min(1, target / placement[1])
+        scales = [1.0, 1.0]
+        for axis in (0, 1):
+            if (
+                placement
+                and target > 0
+                and placement[1 + axis] > target * options["threshold"]
+            ):
+                scales[axis] = min(1, target / placement[1 + axis])
         cw, ch = box[2] - box[0], box[3] - box[1]
-        size = (max(1, round(cw * scale)), max(1, round(ch * scale)))
+        size = (max(1, round(cw * scales[0])), max(1, round(ch * scales[1])))
         cropped = box != (0, 0, w, h)
         resized = size != (cw, ch)
         if (
@@ -556,11 +598,17 @@ def process_images(pdf, options):
                 data = resize16(data, cw, ch, components, size)
             candidate = zlib.compress(data), pikepdf.Name.FlateDecode, None
         else:
+            # pikepdf folds a soft mask into an alpha channel; decode the base alone.
+            if isinstance(soft_mask, pikepdf.Stream):
+                del obj["/SMask"]
             try:
                 image = pikepdf.PdfImage(obj).as_pil_image()
             except (pikepdf.UnsupportedImageTypeError, NotImplementedError) as exc:
                 preserved[type(exc).__name__] = preserved.get(type(exc).__name__, 0) + 1
                 continue
+            finally:
+                if isinstance(soft_mask, pikepdf.Stream):
+                    obj.SMask = soft_mask
             if image.size != (w, h) or image.mode not in ("1", "L", "RGB", "CMYK"):
                 preserved["unsupported decoded image"] = (
                     preserved.get("unsupported decoded image", 0) + 1
@@ -620,6 +668,8 @@ def process_images(pdf, options):
             del obj["/Decode"]
         if components == 4 and candidate[1] == pikepdf.Name.DCTDecode:
             obj.Decode = pikepdf.Array([1, 0] * 4)
+        if isinstance(soft_mask, pikepdf.Stream) and (cropped or resized):
+            resample_mask(soft_mask, box, size)
         if cropped:
             crops[obj.objgen] = (*box, w, h)
         changed += 1
@@ -1075,7 +1125,7 @@ def rasterize(document, output, options):
         target.obj.Contents = result.make_stream((content + " Q\n").encode("ascii"))
         if options["verbose"]:
             message(f"rendered page {number + 1}/{len(document)}")
-    result.save(output, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+    result.save(output, object_stream_mode=stream_mode(options))
     result.close()
 
 
@@ -1113,7 +1163,7 @@ def transform(source, output, options):
             )
         )
         intermediate = str(Path(WORK) / "prepared.pdf") if needs_mupdf else output
-        pdf.save(intermediate, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+        pdf.save(intermediate, object_stream_mode=stream_mode(options))
     if needs_mupdf:
         import pymupdf
 
@@ -1135,7 +1185,11 @@ def transform(source, output, options):
                 if options["subset_fonts"]:
                     document.subset_fonts()
                 document.save(
-                    output, garbage=4, deflate=True, deflate_fonts=True, use_objstms=1
+                    output,
+                    garbage=4,
+                    deflate=True,
+                    deflate_fonts=True,
+                    use_objstms=int(options.get("object_streams", True)),
                 )
 
 
@@ -1166,8 +1220,8 @@ def main():
         options.update(geometry=False, extended=False, clip=False)
         with pikepdf.Pdf.open(source) as pdf:
             process_images(pdf, options)
-            pdf.save(output, object_stream_mode=pikepdf.ObjectStreamMode.generate)
-    elif operation == "pdfa4":
+            pdf.save(output, object_stream_mode=stream_mode(options))
+    elif operation == "pdfa":
         pdfa.convert(source, output, options, message)
     elif operation == "text":
         extract_text(source, output, options)
@@ -1184,7 +1238,7 @@ if __name__ == "__main__":
         )
         sys.exit(1)
     except pdfa.ConversionError as exc:
-        message(f"PDF/A-4: {exc}")
+        message(f"PDF/A: {exc}")
         sys.exit(1)
     except Exception as exc:  # noqa: BLE001 -- redact exceptions at the process boundary
         # Do not include tracebacks or input options, which may contain passwords.

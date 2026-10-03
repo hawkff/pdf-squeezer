@@ -10,6 +10,12 @@ Download a binary for Linux, macOS, or Windows from the [releases page](https://
 go install github.com/hawkff/pdf-squeezer@latest
 ```
 
+The container image carries every optional tool (Python helpers, qpdf, Ghostscript, veraPDF with a Java runtime, fontconfig with URW and Liberation fonts), so PDF/A conversion works without any setup:
+
+```sh
+docker run --rm -v "$PWD:/data" ghcr.io/hawkff/pdf-squeezer:latest --pdfa 4 report.pdf
+```
+
 ## Use
 
 ```sh
@@ -34,7 +40,7 @@ pdf-squeezer --recursive documents/ -o out/
 pdf-squeezer --privacy document.pdf
 
 # Convert to PDF/A-4, verified by veraPDF
-pdf-squeezer --pdfa4 report.pdf
+pdf-squeezer --pdfa 4 report.pdf
 
 pdf-squeezer --help
 pdf-squeezer --version
@@ -92,7 +98,7 @@ pdf-squeezer --mono-dpi 300 --mono-codecs flate,ccitt,jbig2 scan.pdf
 
 These operations use pikepdf and Pillow. Inline-image externalization uses `qpdf`. CCITT Group 4 requires Pillow's libtiff support. JBIG2 requires [jbig2enc](https://github.com/agl/jbig2enc)'s `jbig2` executable. Its generic-region encoding is lossless; the CLI never enables lossy symbol substitution. Install `jbig2dec` as well to decode existing JBIG2 images through pikepdf.
 
-`--dpi` targets color and gray images; `--gray-dpi` overrides gray resolution. Monochrome resolution stays unchanged unless `--mono-dpi` is supplied. Images must exceed the target times `--dpi-threshold`, which defaults to 1.5, before downsampling. A shared image uses the most demanding placement across pages and nested forms, including `/UserUnit` and affine transforms.
+`--dpi` targets color and gray images; `--gray-dpi` overrides gray resolution. Monochrome resolution stays unchanged unless `--mono-dpi` is supplied. Images must exceed the target times `--dpi-threshold`, which defaults to 1.5, before downsampling. Each image axis is judged on its own, so an image squeezed in one direction loses pixels only along that direction. A shared image uses the most demanding placement across pages and nested forms, including `/UserUnit` and affine transforms.
 
 Cropping unions visible bounds across shared uses and adjusts drawing transforms. It retains a border for interpolation and only crops axis-aligned placements. Lossless mode additionally preserves images on fractional or downsampled display grids to avoid changing a viewer's sampling. It preserves images used in masks, annotation appearances, patterns, or unanalysed forms rather than guessing their placement. Complex clipping paths use conservative bounding boxes. Downsampling remains lossy; inspect fine text before sharing scans.
 
@@ -176,17 +182,20 @@ Password files contain one line. Password values never enter command arguments o
 
 Encrypted inputs require qpdf. The CLI uses private decrypted working copies, then preserves the input's encryption unless `--decrypt` or new output encryption was requested. For a fresh identifier, `--privacy` on encrypted input requires explicit decryption or new encryption. Protect the working filesystem as well as the final document.
 
-## PDF/A-4
+## PDF/A
 
 ```sh
-pdf-squeezer --pdfa4 report.pdf
-pdf-squeezer --pdfa4 --output-intent ISOcoated_v2.icc brochure.pdf
-pdf-squeezer --pdfa4 --font-file 'Verdana=/path/to/verdana.ttf' slides.pdf
-pdf-squeezer --pdfa4 --strip actions,hidden form.pdf
-pdf-squeezer --pdfa4 --images --image-quality 80 scan.pdf
+pdf-squeezer --pdfa 4 report.pdf
+pdf-squeezer --pdfa 3b invoice.pdf
+pdf-squeezer --pdfa 4 --output-intent ISOcoated_v2.icc brochure.pdf
+pdf-squeezer --pdfa 4 --font-file 'Verdana=/path/to/verdana.ttf' slides.pdf
+pdf-squeezer --pdfa 2b --strip actions,hidden form.pdf
+pdf-squeezer --pdfa 4 --images --dpi 150 --image-quality 80 scan.pdf
 ```
 
-`--pdfa4` converts the compressed document to PDF/A-4 (ISO 19005-4) and publishes it only after [veraPDF](https://verapdf.org/) confirms compliance. Documents with embedded files become PDF/A-4f. Ghostscript cannot produce PDF/A-4, so the conversion is this project's own code on top of pikepdf, fontTools, and MuPDF.
+`--pdfa LEVEL` converts the compressed document to PDF/A-2b, PDF/A-3b, or PDF/A-4 (ISO 19005) and publishes it only after [veraPDF](https://verapdf.org/) confirms compliance. PDF/A-4 documents with embedded files become PDF/A-4f; PDF/A-3b associates every embedded file with the document; PDF/A-2b refuses attachments, since it only permits ones that are PDF/A themselves. PDF/A-2 and 3 also forbid JavaScript and event actions, and keep only predefined XMP schemas, so custom XMP properties without an extension schema are dropped. Ghostscript cannot produce PDF/A-4, so the conversion is this project's own code on top of pikepdf, fontTools, and MuPDF.
+
+A batch runs veraPDF once per group of files rather than once per file.
 
 It requires the Python tools, qpdf, veraPDF with a Java runtime on `PATH`, and fontconfig with metric-compatible fonts for the standard 14 fonts: the URW Base35 family (`fonts-urw-base35`) or Liberation (`fonts-liberation`).
 
@@ -195,6 +204,7 @@ The converter repairs what it can without changing page content:
 - PDF 2.0 header, file identifier, XMP identification, document information moved into XMP, and PDF 2.0 deprecations such as LZW streams, transfer functions, halftone settings, image alternates, OPI, reference XObjects, and interpolation flags.
 - Resources inherited by form XObjects, annotation appearances, patterns, and Type 3 glyphs become explicit.
 - Missing appearance streams for annotations and form fields are generated with MuPDF.
+- Soft masks follow their images when `--dpi` or `--clip-images` downsample or crop them, as long as the mask has the image's size and no matte.
 - Non-embedded Helvetica, Times, Courier, Symbol, ZapfDingbats, and their Arial, Times New Roman, and Courier New aliases are embedded from a metric-compatible font. The document's glyph widths must match; otherwise supply a font with `--font-file NAME=PATH`. A supplied font keeps the document's widths: its glyph advances are set to them, so text does not move. Composite (Type 0) fonts need the original TrueType file through `--font-file`, because their glyph identifiers only match that file.
 - Embedded fonts get consistent widths (font programs are patched, so layout does not change), TrueType cmap subtables, symbolic encoding rules, CIDToGIDMap entries, and valid ToUnicode mappings. Fonts and glyphs count as used only when drawn, including through forms, patterns, Type 3 glyphs, and appearance streams; text in rendering mode 3 does not require embedding.
 - An output intent is added. The bundled sRGB profile covers DeviceGray and DeviceRGB content. DeviceCMYK content needs a CMYK ICC profile through `--output-intent`; the converter then adds a DefaultRGB color space for any RGB content.
@@ -202,7 +212,21 @@ The converter repairs what it can without changing page content:
 
 It refuses to guess. Forbidden features stop the conversion with the object number and the `--strip` category that removes them: forbidden actions, multimedia annotations, hidden annotations, XFA data, or attachments for a plain PDF/A-4. Unavailable fonts, mismatched widths, and ambiguous color conversions produce errors that name the font or the profile to supply. When veraPDF still rejects the result, the diagnostics list each failed rule with its clause, the affected objects, and the option that resolves it. Nothing is flattened, rasterized, or discarded to pass validation; `-V` reports every repair.
 
-PDF/A forbids encryption and requires metadata, color information, and embedded fonts, so `--pdfa4` rejects output encryption, `--privacy`, `--strip metadata`, `--strip output-intents`, and `--remove-standard-fonts`. Encrypted input needs `--decrypt`. Known limits: non-Identity CMaps and CFF-based CIDFonts without embedded programs, glyphs missing from embedded fonts, and JPEG 2000 streams that violate PDF/A constraints are reported, not repaired.
+PDF/A forbids encryption and requires metadata, color information, and embedded fonts, so `--pdfa` rejects output encryption, `--privacy`, `--strip metadata`, `--strip output-intents`, and `--remove-standard-fonts`. Encrypted input needs `--decrypt`.
+
+### Inputs that already are PDF/A
+
+Without `--pdfa`, an input that declares PDF/A keeps its level: a PDF/A-1 document is written with a classic cross-reference table and no object streams, and when veraPDF is on `PATH` the output is verified against the declared level before it is published. If compression broke conformance the file is not published; if the input did not conform in the first place, a warning says so and the output is published unverified. Options that remove what PDF/A requires (`--privacy`, `--metadata`, `--timestamps now`, `--strip metadata|output-intents`, raster output, a Ghostscript rewrite) print a warning and skip verification.
+
+### Checking a corpus
+
+`tools/corpus.py` converts every PDF under a directory and tabulates the outcomes: converted, refused (grouped by the option the converter asks for), rejected by veraPDF (grouped by rule), crashed, or timed out.
+
+```sh
+python3 tools/corpus.py --pdfa 4 --binary ./pdf-squeezer documents/ results/
+```
+
+Known limits: non-Identity CMaps and CFF-based CIDFonts without embedded programs, glyphs missing from embedded fonts, and JPEG 2000 streams that violate PDF/A constraints are reported, not repaired.
 
 ## Extraction and raster output
 
@@ -231,7 +255,7 @@ Bitmap output replaces pages with rendered images. MRC output separates a high-r
 
 CI runs on Namespace. It runs Go tests with the race detector, `go vet`, formatting checks, Python lint checks, and synthetic render-comparison tests. It cross-compiles standalone binaries for the supported targets.
 
-The tests cover shared-image cropping and DPI, masks and scan codecs, CMYK/JPEG 2000, font merging/subsetting, flattening and raster output, and PDF/A-4 conversion of fonts, color, attachments, annotations, and forbidden features, each verified with veraPDF. A missing optional dependency or a noncompliant validator report must fail without publishing an output.
+The tests cover shared-image cropping and DPI, masks and scan codecs, CMYK/JPEG 2000, font merging/subsetting, flattening and raster output, and PDF/A conversion of fonts, color, attachments, annotations, and forbidden features at every level, each verified with veraPDF. CI also builds the container image and pushes it on release tags. A missing optional dependency or a noncompliant validator report must fail without publishing an output.
 
 ## License
 

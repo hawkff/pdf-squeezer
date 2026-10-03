@@ -97,8 +97,31 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		reserved[output] = true
 	}
 	var failures []error
+	var pending []*staged
+	verifier := &verifier{stderr: stderr}
+	flush := func() {
+		for _, s := range pending {
+			if err := ctx.Err(); err != nil {
+				s.cleanup()
+				continue
+			}
+			if err := verifier.check(ctx, s); err != nil {
+				failures = append(failures, fmt.Errorf("%s: %w", s.input, err))
+				s.cleanup()
+				continue
+			}
+			before, after, err := publish(ctx, s, opts)
+			if err != nil {
+				failures = append(failures, fmt.Errorf("%s: %w", s.input, err))
+				continue
+			}
+			report(stdout, s.output, before, after, opts)
+		}
+		pending = nil
+	}
 	for i, file := range files {
 		if err := ctx.Err(); err != nil {
+			flush()
 			return errors.Join(append(failures, err)...)
 		}
 		output := outputs[i]
@@ -116,27 +139,137 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			fmt.Fprintln(stdout, output)
 			continue
 		}
-		before, after, err := squeeze(ctx, file.path, output, opts, stderr)
+		s, err := prepare(ctx, file.path, output, opts, stderr)
 		if err != nil {
 			failures = append(failures, fmt.Errorf("%s: %w", file.path, err))
 			continue
 		}
-		switch {
-		case before == after && !opts.requiredOutput():
-			hint := "try --engine ghostscript"
-			if opts.engine == "ghostscript" {
-				hint = "try --quality screen or a lower --dpi"
-			} else if !opts.images {
-				hint = "try --images or --engine ghostscript"
-			}
-			fmt.Fprintf(stdout, "%s: no reduction; copied the original (%d bytes); %s\n", output, before, hint)
-		case after > before:
-			fmt.Fprintf(stdout, "%s: %d -> %d bytes (%.1f%% larger, %s)\n", output, before, after, 100*(float64(after)/float64(before)-1), opts.engine)
-		default:
-			fmt.Fprintf(stdout, "%s: %d -> %d bytes (%.1f%% smaller, %s)\n", output, before, after, 100*(1-float64(after)/float64(before)), opts.engine)
+		// veraPDF starts a JVM per invocation, so files that need it wait for a batch.
+		pending = append(pending, s)
+		if s.flavour == "" || len(pending) >= validationBatch {
+			verifier.validate(ctx, pending)
+			flush()
 		}
 	}
+	verifier.validate(ctx, pending)
+	flush()
 	return errors.Join(failures...)
+}
+
+func report(stdout io.Writer, output string, before, after int64, opts options) {
+	switch {
+	case before == after && !opts.requiredOutput():
+		hint := "try --engine ghostscript"
+		if opts.engine == "ghostscript" {
+			hint = "try --quality screen or a lower --dpi"
+		} else if !opts.images {
+			hint = "try --images or --engine ghostscript"
+		}
+		fmt.Fprintf(stdout, "%s: no reduction; copied the original (%d bytes); %s\n", output, before, hint)
+	case after > before:
+		fmt.Fprintf(stdout, "%s: %d -> %d bytes (%.1f%% larger, %s)\n", output, before, after, 100*(float64(after)/float64(before)-1), opts.engine)
+	default:
+		fmt.Fprintf(stdout, "%s: %d -> %d bytes (%.1f%% smaller, %s)\n", output, before, after, 100*(1-float64(after)/float64(before)), opts.engine)
+	}
+}
+
+const validationBatch = 32
+
+// staged is a compressed document that pdfcpu validated and that waits for
+// publication, and for veraPDF when a PDF/A flavour has to be confirmed.
+type staged struct {
+	input, output, path, work string
+	info                      os.FileInfo
+	useOriginal               bool
+	flavour                   string // veraPDF flavour to confirm, "" for none
+	converted                 bool   // --pdfa produced it: a failed check is fatal
+}
+
+func (s *staged) cleanup() { os.RemoveAll(s.work) }
+
+// verifier runs veraPDF once per batch and flavour and keeps each verdict.
+type verifier struct {
+	stderr   io.Writer
+	verdicts map[*staged]error
+	failed   map[string]error // tool failure per flavour
+	warned   bool
+}
+
+func (v *verifier) validate(ctx context.Context, batch []*staged) {
+	v.verdicts, v.failed = map[*staged]error{}, map[string]error{}
+	groups := map[string][]*staged{}
+	for _, s := range batch {
+		if s.flavour != "" {
+			groups[s.flavour] = append(groups[s.flavour], s)
+		}
+	}
+	for flavour, group := range groups {
+		paths := make([]string, len(group))
+		for i, s := range group {
+			paths[i] = s.path
+		}
+		results, err := validatePDFA(ctx, flavour, paths, v.stderr)
+		if err != nil {
+			v.failed[flavour] = err
+			continue
+		}
+		for _, s := range group {
+			v.verdicts[s] = results[s.path]
+		}
+	}
+}
+
+// check decides whether a staged document may be published. Converted documents
+// fail closed. Documents that only declared PDF/A on input are published with a
+// warning when veraPDF is unavailable or when the input did not conform either.
+func (v *verifier) check(ctx context.Context, s *staged) error {
+	if s.flavour == "" {
+		return nil
+	}
+	label := "PDF/A-" + strings.ToUpper(s.flavour)
+	if err, failed := v.failed[s.flavour]; failed {
+		if s.converted {
+			return err
+		}
+		if !v.warned {
+			fmt.Fprintf(v.stderr, "warning: %v; declared PDF/A conformance is not verified\n", err)
+			v.warned = true
+		}
+		return nil
+	}
+	verdict := v.verdicts[s]
+	if verdict == nil {
+		return nil
+	}
+	if s.converted {
+		return verdict
+	}
+	inputs, err := validatePDFA(ctx, s.flavour, []string{s.input}, v.stderr)
+	if err == nil && inputs[s.input] == nil {
+		return fmt.Errorf("compression broke the input's %s conformance; use --pdfa to repair it or report this:\n%w", label, verdict)
+	}
+	fmt.Fprintf(v.stderr, "warning: %s declares %s but does not conform to it; the output is not verified\n", s.input, label)
+	return nil
+}
+
+func publish(ctx context.Context, s *staged, opts options) (int64, int64, error) {
+	defer s.cleanup()
+	path := s.path
+	if s.useOriginal {
+		path = s.input
+	}
+	source, err := os.Open(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer source.Close()
+	written, err := writeNew(ctx, s.output, source)
+	if err == nil && opts.timestamps == "preserve" {
+		if err = os.Chtimes(s.output, s.info.ModTime(), s.info.ModTime()); err != nil {
+			err = errors.Join(err, os.Remove(s.output))
+		}
+	}
+	return s.info.Size(), written, err
 }
 
 func availableOutput(path, policy string, reserved map[string]bool) (string, error) {
@@ -175,7 +308,9 @@ func configuration(password string) *model.Configuration {
 	return conf
 }
 
-func squeeze(ctx context.Context, input, output string, opts options, stderr io.Writer) (int64, int64, error) {
+// prepare compresses and transforms input into a staged file that pdfcpu has
+// validated. The caller confirms PDF/A with veraPDF when needed and publishes.
+func prepare(ctx context.Context, input, output string, opts options, stderr io.Writer) (result *staged, err error) {
 	stderr = &lockedWriter{writer: stderr}
 	logf := func(format string, args ...any) {
 		if opts.verbose {
@@ -183,33 +318,37 @@ func squeeze(ctx context.Context, input, output string, opts options, stderr io.
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	in, err := os.Open(input)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	defer in.Close()
 	info, err := in.Stat()
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	if !info.Mode().IsRegular() {
-		return 0, 0, errors.New("input must be a regular PDF file")
+		return nil, errors.New("input must be a regular PDF file")
 	}
 	if err := checkPDF(in); err != nil {
-		return 0, 0, fmt.Errorf("input: %w", err)
+		return nil, fmt.Errorf("input: %w", err)
 	}
 	if _, err := os.Lstat(output); err == nil {
-		return 0, 0, fmt.Errorf("output already exists: %s", output)
+		return nil, fmt.Errorf("output already exists: %s", output)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return 0, 0, err
+		return nil, err
 	}
 	work, err := os.MkdirTemp(filepath.Dir(output), ".pdf-squeezer-*")
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
-	defer os.RemoveAll(work)
+	defer func() {
+		if err != nil {
+			os.RemoveAll(work)
+		}
+	}()
 	logf("input: %s (%d bytes)", input, info.Size())
 	logf("staging in %s", work)
 	if opts.verbose {
@@ -219,18 +358,37 @@ func squeeze(ctx context.Context, input, output string, opts options, stderr io.
 	conf := configuration(opts.password)
 	pdf, err := api.ReadAndValidate(ctx, in, conf)
 	if err != nil {
-		return 0, 0, fmt.Errorf("input: %w", err)
+		return nil, fmt.Errorf("input: %w", err)
 	}
 	originalDates, err := documentDates(pdf)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	encrypted := pdf.Encrypt != nil
-	if encrypted && opts.pdfa4 && !opts.decrypt {
-		return 0, 0, errors.New("PDF/A-4 cannot preserve encryption; explicitly use --decrypt")
+	if encrypted && opts.pdfa != "" && !opts.decrypt {
+		return nil, errors.New("PDF/A cannot preserve encryption; explicitly use --decrypt")
 	}
+	declared, err := pdfaIdentification(pdf)
+	if err != nil {
+		fmt.Fprintf(stderr, "warning: %v; declared conformance is not preserved\n", err)
+	}
+	if declared != "" && opts.pdfa == "" {
+		label := "PDF/A-" + strings.ToUpper(declared)
+		breaking := opts.breaksPDFA(false)
+		if breaking == "" && strings.HasSuffix(declared, "a") && listContains(opts.strip, "tags") {
+			breaking = "--strip tags"
+		}
+		if breaking != "" {
+			fmt.Fprintf(stderr, "warning: the input declares %s and %s removes what it requires; the output will not conform\n", label, breaking)
+			declared = ""
+		} else {
+			logf("input declares %s; preserving its structure and verifying the output", label)
+		}
+	}
+	// PDF/A-1 is a PDF 1.4 profile: cross-reference and object streams are not allowed.
+	opts.classicXref = opts.pdfa == "" && strings.HasPrefix(declared, "1")
 	if encrypted && opts.privacy && !opts.decrypt && opts.encryptOwnerFile == "" {
-		return 0, 0, errors.New("--privacy on encrypted input requires --decrypt or new output encryption to replace its identifier")
+		return nil, errors.New("--privacy on encrypted input requires --decrypt or new output encryption to replace its identifier")
 	}
 	if len(pdf.Signatures) > 0 {
 		fmt.Fprintln(stderr, "warning: rewriting this signed PDF invalidates its digital signatures")
@@ -238,25 +396,25 @@ func squeeze(ctx context.Context, input, output string, opts options, stderr io.
 	start := time.Now()
 	current, err := filepath.Abs(input)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	// Every tool works on a private staged copy, never the original path.
 	stage, err := stagePath(work)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	if encrypted {
 		logf("decrypting working copy")
 		if err := qpdf(ctx, []string{"--decrypt", current, stage}, opts.password, stderr); err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 		pdf = nil
 	} else {
 		if _, err := in.Seek(0, io.SeekStart); err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 		if err := copyStage(ctx, stage, in); err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 	}
 	current = stage
@@ -276,12 +434,12 @@ func squeeze(ctx context.Context, input, output string, opts options, stderr io.
 		return nil
 	}
 	// PDF/A-4 constrains inline images (length key, filters); XObjects avoid that.
-	if opts.inline || opts.pdfa4 || listContains(opts.strip, "images") {
+	if opts.inline || opts.pdfa != "" || listContains(opts.strip, "images") {
 		err = apply("externalizing inline images", func(in, out string) error {
 			return qpdf(ctx, []string{"--externalize-inline-images", "--ii-min-bytes=0", in, out}, "", stderr)
 		})
 		if err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 	}
 	if opts.engine == "ghostscript" || opts.cffFonts {
@@ -299,66 +457,67 @@ func squeeze(ctx context.Context, input, output string, opts options, stderr io.
 			return errors.Join(err, output.Close())
 		})
 		if err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 	}
 	if opts.advancedImages() || opts.flatten != "" || opts.mergeFonts || opts.subsetFonts || opts.bitmap || opts.mrc || opts.pythonStrip() || opts.gray && opts.engine == "pdfcpu" {
 		err = apply("processing advanced document features", func(in, out string) error { return pythonPDF(ctx, "transform", in, out, opts, stderr) })
 		if err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 	}
 	if pdf == nil {
 		f, err := os.Open(current)
 		if err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 		pdf, err = api.ReadAndValidate(ctx, f, configuration(""))
 		err = errors.Join(err, f.Close())
 		if err != nil {
-			return 0, 0, fmt.Errorf("transformed input: %w", err)
+			return nil, fmt.Errorf("transformed input: %w", err)
 		}
 	}
 	// Optimize structure first to avoid re-encoding duplicate image objects.
 	if err := api.OptimizeContext(ctx, pdf); err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	if opts.images {
 		stats, err := optimizeImages(ctx, pdf, opts, logf)
 		if err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 		logf("%s", stats)
 	}
 	if opts.timestamps == "preserve" && !opts.privacy {
 		if err := restoreDocumentDates(pdf, originalDates); err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 	}
 	if err := transformDocument(ctx, pdf, opts); err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	if err := deduplicateStreams(ctx, pdf); err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	next, err := stagePath(work)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	out, err := os.OpenFile(next, os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
+	pdf.WriteXRefStream, pdf.WriteObjectStream = !opts.classicXref, !opts.classicXref
 	err = api.WriteContext(ctx, pdf, out)
 	err = errors.Join(err, out.Close())
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	current, pdf = next, nil
 	if opts.monoCodecs != "flate" {
 		err = apply("encoding monochrome images", func(in, out string) error { return pythonPDF(ctx, "monochrome", in, out, opts, stderr) })
 		if err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 		err = apply("deduplicating final streams", func(src, dst string) error {
 			in, err := os.Open(src)
@@ -377,21 +536,27 @@ func squeeze(ctx context.Context, input, output string, opts options, stderr io.
 			if err != nil {
 				return err
 			}
+			final.WriteXRefStream, final.WriteObjectStream = !opts.classicXref, !opts.classicXref
 			err = api.WriteContext(ctx, final, out)
 			return errors.Join(err, out.Close())
 		})
 		if err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 	}
-	if opts.pdfa4 {
-		err = apply("converting to PDF/A-4", func(in, out string) error { return pythonPDF(ctx, "pdfa4", in, out, opts, stderr) })
+	flavour, converted := declared, false
+	if opts.pdfa != "" {
+		err = apply("converting to PDF/A-"+strings.ToUpper(opts.pdfa), func(in, out string) error { return pythonPDF(ctx, "pdfa", in, out, opts, stderr) })
 		if err != nil {
-			return 0, 0, err
+			return nil, err
 		}
-		if err := validatePDFA(ctx, current, stderr); err != nil {
-			return 0, 0, err
+		if flavour, err = declaredFlavour(ctx, current); err != nil {
+			return nil, err
 		}
+		if flavour == "" {
+			return nil, errors.New("converted document does not declare PDF/A")
+		}
+		converted = true
 	}
 	outputPassword := ""
 	if opts.encryptOwnerFile != "" {
@@ -400,7 +565,7 @@ func squeeze(ctx context.Context, input, output string, opts options, stderr io.
 	} else if encrypted && !opts.decrypt {
 		original, absErr := filepath.Abs(input)
 		if absErr != nil {
-			return 0, 0, absErr
+			return nil, absErr
 		}
 		err = apply("preserving encryption", func(in, out string) error {
 			return qpdf(ctx, []string{"--copy-encryption=" + original, "--encryption-file-password=" + opts.password, in, out}, "", stderr)
@@ -408,38 +573,29 @@ func squeeze(ctx context.Context, input, output string, opts options, stderr io.
 		outputPassword = opts.password
 	}
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	compressed, err := os.Open(current)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
-	defer compressed.Close()
 	ci, err := compressed.Stat()
 	if err != nil {
-		return 0, 0, err
+		compressed.Close()
+		return nil, err
 	}
-	if err := api.Validate(ctx, compressed, configuration(outputPassword), nil); err != nil {
-		return 0, 0, fmt.Errorf("output validation: %w", err)
+	err = api.Validate(ctx, compressed, configuration(outputPassword), nil)
+	err = errors.Join(err, compressed.Close())
+	if err != nil {
+		return nil, fmt.Errorf("output validation: %w", err)
 	}
 	logf("%s: %d bytes in %s; validated", opts.engine, ci.Size(), time.Since(start).Round(time.Millisecond))
-	source := compressed
-	if ci.Size() >= info.Size() && !opts.requiredOutput() {
-		source = in
+	useOriginal := ci.Size() >= info.Size() && !opts.requiredOutput()
+	if useOriginal {
+		flavour = "" // the original bytes are published unchanged
 	}
-	if _, err := source.Seek(0, io.SeekStart); err != nil {
-		return 0, 0, err
-	}
-	logf("writing %s", output)
-	written, err := writeNew(ctx, output, source)
-	if err == nil && opts.timestamps == "preserve" {
-		if err = os.Chtimes(output, info.ModTime(), info.ModTime()); err != nil {
-			err = errors.Join(err, os.Remove(output))
-		}
-	}
-	return info.Size(), written, err
+	return &staged{input: input, output: output, path: current, work: work, info: info, useOriginal: useOriginal, flavour: flavour, converted: converted}, nil
 }
-
 func stagePath(dir string) (string, error) {
 	f, err := os.CreateTemp(dir, "stage-*.pdf")
 	if err != nil {

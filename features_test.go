@@ -380,8 +380,9 @@ func TestOptionsRejectConflicts(t *testing.T) {
 		{"--strip", "forms", "--flatten", "forms"}, {"--privacy", "--metadata", "Title=test"},
 		{"--bitmap", "--mrc"}, {"--extract", "images", "--gray"},
 		{"--encrypt-user-file", "example.txt"}, {"--flatten", "all,links"},
-		{"--pdfa4", "--privacy"}, {"--pdfa4", "--strip", "output-intents"}, {"--output-intent", "profile.icc"},
-		{"--pdfa4", "--font-file", "Arial"}, {"--strip", "javascript"}, {"--extract", "text", "--pdfa4"},
+		{"--pdfa", "4", "--privacy"}, {"--pdfa", "4", "--strip", "output-intents"}, {"--output-intent", "profile.icc"},
+		{"--pdfa", "4", "--font-file", "Arial"}, {"--strip", "javascript"}, {"--extract", "text", "--pdfa", "4"},
+		{"--pdfa", "1b"}, {"--pdfa", "4f"},
 	} {
 		if _, _, _, err := parseOptions(t.Context(), append(args, "input.pdf"), io.Discard); err == nil {
 			t.Errorf("accepted %v", args)
@@ -389,13 +390,21 @@ func TestOptionsRejectConflicts(t *testing.T) {
 	}
 }
 
-// pdfa4PDF declares PDF/A-4 in XMP; the stub validator decides compliance.
-func pdfa4PDF() []byte {
-	xmp := `<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/" pdfaid:part="4" pdfaid:rev="2020"/></rdf:RDF></x:xmpmeta>`
-	return buildPDF(0,
+// pdfaPDF declares a PDF/A level in XMP without conforming to it.
+func pdfaPDF(part, conformance string) []byte {
+	xmp := `<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/" pdfaid:part="` + part + `"`
+	if conformance != "" {
+		xmp += ` pdfaid:conformance="` + conformance + `"`
+	}
+	xmp += `/></rdf:RDF></x:xmpmeta>`
+	// Padding makes the rewrite smaller than the input, so the output is not the
+	// original; the DeviceRGB fill keeps the document from conforming by accident.
+	content := "0 0 1 rg 10 10 30 30 re f\n"
+	return buildPDF(64000,
 		"<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> >>",
-		fmt.Sprintf("<< /Type /Metadata /Subtype /XML /Length %d >>\nstream\n%s\nendstream", len(xmp), xmp))
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 5 0 R >>",
+		fmt.Sprintf("<< /Type /Metadata /Subtype /XML /Length %d >>\nstream\n%s\nendstream", len(xmp), xmp),
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content))
 }
 
 func requirePythonTools(t *testing.T) {
@@ -415,17 +424,20 @@ func TestPDFAValidationFailsClosed(t *testing.T) {
 	}
 	dir := t.TempDir()
 	document := filepath.Join(dir, "declared.pdf")
-	writeFile(t, document, pdfa4PDF())
-	failure := `<report><jobs><job><validationReport profileName="PDF/A-4 validation profile" isCompliant="false"><details>` +
+	writeFile(t, document, pdfaPDF("4", ""))
+	job := func(report string) string {
+		return `<report><jobs><job><item><name>` + document + `</name></item>` + report + `</job></jobs></report>`
+	}
+	failure := job(`<validationReport profileName="PDF/A-4 validation profile" isCompliant="false"><details>` +
 		`<rule specification="ISO 19005-4:2020" clause="6.2.10.4.1" testNumber="1" status="failed"><description>The font programs for all fonts used for rendering within a conforming file shall be embedded</description>` +
 		`<check status="failed"><context>root/document[0]/pages[0](3 0 obj PDPage)/contentStream[0](4 0 obj PDContentStream)/operators[3]/font[0](Helvetica)</context></check></rule>` +
 		`<rule specification="ISO 19005-4:2020" clause="6.1.3" testNumber="1" status="passed"><description>irrelevant</description></rule>` +
-		`</details></validationReport></job></jobs></report>`
+		`</details></validationReport>`)
 	for report, want := range map[string]string{
-		`<report><jobs><job><validationReport profileName="PDF/A-4 validation profile" isCompliant="true"/></job></jobs></report>`: "",
+		job(`<validationReport profileName="PDF/A-4 validation profile" isCompliant="true"/>`): "",
 		failure: "fonts 6.2.10.4.1-1",
-		`<report><jobs><job><validationReport profileName="PDF/A-2B validation profile" isCompliant="true"/></job></jobs></report>`: "did not confirm",
-		`<report/>`:  "exactly one",
+		job(`<validationReport profileName="PDF/A-2B validation profile" isCompliant="true"/>`): "did not confirm",
+		`<report/>`:  "did not report",
 		`broken xml`: "veraPDF report",
 		``:           "no report",
 	} {
@@ -435,7 +447,10 @@ func TestPDFAValidationFailsClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Setenv("PATH", dir)
-		err := validatePDFA(t.Context(), document, io.Discard)
+		results, err := validatePDFA(t.Context(), "4", []string{document}, io.Discard)
+		if err == nil {
+			err = results[document]
+		}
 		if want == "" && err != nil {
 			t.Fatalf("compliant report rejected: %v", err)
 		}
@@ -446,10 +461,48 @@ func TestPDFAValidationFailsClosed(t *testing.T) {
 			t.Fatalf("diagnostics lack the object: %v", err)
 		}
 	}
+	for _, c := range []struct{ part, conformance, want string }{
+		{"4", "", "4"}, {"4", "F", "4f"}, {"2", "B", "2b"}, {"1", "A", "1a"}, {"3", "U", "3u"},
+	} {
+		writeFile(t, document, pdfaPDF(c.part, c.conformance))
+		if flavour, err := declaredFlavour(t.Context(), document); err != nil || flavour != c.want {
+			t.Fatalf("part %s conformance %q: flavour %q, %v", c.part, c.conformance, flavour, err)
+		}
+	}
+	writeFile(t, document, pdfaPDF("2", ""))
+	if _, err := declaredFlavour(t.Context(), document); err == nil {
+		t.Fatal("part 2 without conformance accepted")
+	}
 	plain := filepath.Join(dir, "plain.pdf")
 	writeFile(t, plain, testPDF(0))
-	if err := validatePDFA(t.Context(), plain, io.Discard); err == nil || !strings.Contains(err.Error(), "declare") {
-		t.Fatalf("undeclared document accepted: %v", err)
+	if flavour, err := declaredFlavour(t.Context(), plain); err != nil || flavour != "" {
+		t.Fatalf("undeclared document: %q, %v", flavour, err)
+	}
+}
+
+func TestDeclaredPDFA1KeepsClassicCrossReference(t *testing.T) {
+	dir := t.TempDir()
+	input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+	writeFile(t, input, pdfaPDF("1", "B"))
+	t.Setenv("PATH", t.TempDir()) // no veraPDF: preserve structure, warn, publish
+	var messages bytes.Buffer
+	if err := run(t.Context(), []string{"-V", "-o", output, input}, io.Discard, &messages); err != nil {
+		t.Fatalf("%v\n%s", err, &messages)
+	}
+	data := readFile(t, output)
+	if bytes.Contains(data, []byte("/XRef")) || bytes.Contains(data, []byte("/ObjStm")) {
+		t.Fatal("PDF/A-1 input was written with cross-reference or object streams")
+	}
+	if !strings.Contains(messages.String(), "declares PDF/A-1B") || !strings.Contains(messages.String(), "not verified") {
+		t.Fatalf("missing preservation messages:\n%s", &messages)
+	}
+	broken := filepath.Join(dir, "broken.pdf")
+	messages.Reset()
+	if err := run(t.Context(), []string{"--privacy", "-o", broken, input}, io.Discard, &messages); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(messages.String(), "--privacy removes what it requires") {
+		t.Fatalf("missing conflict warning:\n%s", &messages)
 	}
 }
 
@@ -459,14 +512,14 @@ func TestPDFA4FailsClosedWithoutTools(t *testing.T) {
 	writeFile(t, input, testPDF(0))
 	t.Setenv("PATH", t.TempDir())
 	t.Setenv("PDF_SQUEEZER_PYTHON", "")
-	if err := run(t.Context(), []string{"--pdfa4", "-o", output, input}, io.Discard, io.Discard); err == nil {
+	if err := run(t.Context(), []string{"--pdfa", "4", "-o", output, input}, io.Discard, io.Discard); err == nil {
 		t.Fatal("PDF/A-4 succeeded without its tools")
 	}
 	assertMissing(t, output)
 	assertNoTemps(t, dir)
 }
 
-func TestPDFA4Conversion(t *testing.T) {
+func TestPDFAConversion(t *testing.T) {
 	if os.Getenv("PDF_SQUEEZER_INTEGRATION") != "1" {
 		t.Skip("optional tool integration")
 	}
@@ -476,17 +529,6 @@ func TestPDFA4Conversion(t *testing.T) {
 	dir := t.TempDir()
 	input := filepath.Join(dir, "text.pdf")
 	writeFile(t, input, testPDF(0))
-	output := filepath.Join(dir, "text-a4.pdf")
-	var messages bytes.Buffer
-	if err := run(t.Context(), []string{"--pdfa4", "-V", "-o", output, input}, io.Discard, &messages); err != nil {
-		t.Fatalf("%v\n%s", err, &messages)
-	}
-	if !bytes.HasPrefix(readFile(t, output), []byte("%PDF-2.0")) {
-		t.Fatal("output is not PDF 2.0")
-	}
-	if flavour, err := pdfaFlavour(t.Context(), output); err != nil || flavour != "4" {
-		t.Fatalf("flavour %q, %v", flavour, err)
-	}
 	attached := filepath.Join(dir, "attached.pdf")
 	writeFile(t, attached, buildPDF(0,
 		"<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles << /Names [(note.txt) 4 0 R] >> >> >>",
@@ -495,20 +537,52 @@ func TestPDFA4Conversion(t *testing.T) {
 		"<< /Type /Filespec /F (note.txt) /EF << /F 5 0 R >> >>",
 		"<< /Type /EmbeddedFile /Length 5 >>\nstream\nhello\nendstream"))
 	for _, c := range []struct {
-		name string
-		args []string
-		want string
+		name, input, header string
+		args                []string
+		want                string
 	}{
-		{"attachments", []string{"--pdfa4"}, "4f"},
-		{"stripped", []string{"--pdfa4", "--strip", "attachments"}, "4"},
+		{"text-4", input, "%PDF-2.0", []string{"--pdfa", "4", "-V"}, "4"},
+		{"text-2b", input, "%PDF-1.7", []string{"--pdfa", "2b"}, "2b"},
+		{"attached-4f", attached, "%PDF-2.0", []string{"--pdfa", "4"}, "4f"},
+		{"attached-3b", attached, "%PDF-1.7", []string{"--pdfa", "3b"}, "3b"},
+		{"attached-stripped", attached, "%PDF-2.0", []string{"--pdfa", "4", "--strip", "attachments"}, "4"},
 	} {
 		out := filepath.Join(dir, c.name+".pdf")
-		messages.Reset()
-		if err := run(t.Context(), append(c.args, "-o", out, attached), io.Discard, &messages); err != nil {
+		var messages bytes.Buffer
+		if err := run(t.Context(), append(c.args, "-o", out, c.input), io.Discard, &messages); err != nil {
 			t.Fatalf("%s: %v\n%s", c.name, err, &messages)
 		}
-		if flavour, err := pdfaFlavour(t.Context(), out); err != nil || flavour != c.want {
+		if !bytes.HasPrefix(readFile(t, out), []byte(c.header)) {
+			t.Fatalf("%s: header is not %s", c.name, c.header)
+		}
+		if flavour, err := declaredFlavour(t.Context(), out); err != nil || flavour != c.want {
 			t.Fatalf("%s: flavour %q, %v", c.name, flavour, err)
+		}
+	}
+	// PDF/A-2 refuses attachments it cannot prove to be PDF/A.
+	var messages bytes.Buffer
+	if err := run(t.Context(), []string{"--pdfa", "2b", "-o", filepath.Join(dir, "refused.pdf"), attached}, io.Discard, &messages); err == nil || !strings.Contains(messages.String(), "--pdfa 3b") {
+		t.Fatalf("attachments accepted for PDF/A-2b: %v\n%s", err, &messages)
+	}
+	// A batch shares one validator run and publishes every compliant result.
+	batch := filepath.Join(dir, "batch")
+	if err := os.Mkdir(batch, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a.pdf", "b.pdf", "c.pdf"} {
+		writeFile(t, filepath.Join(batch, name), testPDF(0))
+	}
+	outDir := filepath.Join(dir, "batch-out")
+	if err := os.Mkdir(outDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	messages.Reset()
+	if err := run(t.Context(), []string{"--pdfa", "4", "-o", outDir, batch}, io.Discard, &messages); err != nil {
+		t.Fatalf("batch: %v\n%s", err, &messages)
+	}
+	for _, name := range []string{"a.squeezed.pdf", "b.squeezed.pdf", "c.squeezed.pdf"} {
+		if flavour, err := declaredFlavour(t.Context(), filepath.Join(outDir, name)); err != nil || flavour != "4" {
+			t.Fatalf("%s: flavour %q, %v", name, flavour, err)
 		}
 	}
 	cmyk := filepath.Join(dir, "cmyk.pdf")
@@ -519,12 +593,22 @@ func TestPDFA4Conversion(t *testing.T) {
 		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content)))
 	failed := filepath.Join(dir, "cmyk-a4.pdf")
 	messages.Reset()
-	err := run(t.Context(), []string{"--pdfa4", "-o", failed, cmyk}, io.Discard, &messages)
+	err := run(t.Context(), []string{"--pdfa", "4", "-o", failed, cmyk}, io.Discard, &messages)
 	if err == nil || !strings.Contains(messages.String(), "--output-intent") {
 		t.Fatalf("DeviceCMYK without a CMYK intent: %v\n%s", err, &messages)
 	}
 	assertMissing(t, failed)
 	assertNoTemps(t, dir)
+	// A declared PDF/A input that does not conform is published with a warning.
+	declared := filepath.Join(dir, "declared.pdf")
+	writeFile(t, declared, pdfaPDF("2", "B"))
+	messages.Reset()
+	if err := run(t.Context(), []string{"-o", filepath.Join(dir, "declared-out.pdf"), declared}, io.Discard, &messages); err != nil {
+		t.Fatalf("declared input: %v\n%s", err, &messages)
+	}
+	if !strings.Contains(messages.String(), "does not conform") {
+		t.Fatalf("expected a warning about the input:\n%s", &messages)
+	}
 }
 
 func TestAdvancedCLI(t *testing.T) {

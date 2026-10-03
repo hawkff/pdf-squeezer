@@ -35,6 +35,106 @@ ALLOWED_ACTIONS = {
 ALLOWED_NAMED_ACTIONS = {"/NextPage", "/PrevPage", "/FirstPage", "/LastPage"}
 ALLOWED_ADDITIONAL_ACTIONS = {"/E", "/X", "/D", "/U", "/Fo", "/Bl"}
 APPEARANCE_EXEMPT = {"/Popup", "/Link", "/Projection"}
+PDF17_ACTIONS = {
+    "/GoTo",
+    "/GoToR",
+    "/GoToE",
+    "/Thread",
+    "/URI",
+    "/Named",
+    "/SubmitForm",
+}
+# What each PDF/A level (ISO 19005 part and conformance) allows beyond the shared rules.
+LEVELS = {
+    "2b": {
+        "part": 2,
+        "conformance": "B",
+        "version": "1.7",
+        "actions": PDF17_ACTIONS,
+        "annotations": ALLOWED_ANNOTATIONS - {"/Projection"},
+        "catalog_page_aa": set(),
+        "widget_aa": False,
+        "perms": {"/DocMDP", "/UR3"},
+        "attachments": "pdfa-only",
+        "predefined_xmp": True,
+        "javascript_names": False,
+    },
+    "3b": {
+        "part": 3,
+        "conformance": "B",
+        "version": "1.7",
+        "actions": PDF17_ACTIONS,
+        "annotations": ALLOWED_ANNOTATIONS - {"/Projection"},
+        "catalog_page_aa": set(),
+        "widget_aa": False,
+        "perms": {"/DocMDP", "/UR3"},
+        "attachments": "associated",
+        "predefined_xmp": True,
+        "javascript_names": False,
+    },
+    "4": {
+        "part": 4,
+        "conformance": None,
+        "version": "2.0",
+        "actions": ALLOWED_ACTIONS,
+        "annotations": ALLOWED_ANNOTATIONS,
+        "catalog_page_aa": ALLOWED_ADDITIONAL_ACTIONS,
+        "widget_aa": True,
+        "perms": {"/DocMDP"},
+        "attachments": "4f",
+        "predefined_xmp": False,
+        "javascript_names": True,
+    },
+}
+# XMP schemas that PDF/A-2 and PDF/A-3 accept without an extension schema.
+PREDEFINED_XMP_NAMESPACES = {
+    "http://purl.org/dc/elements/1.1/",
+    "http://ns.adobe.com/xap/1.0/",
+    "http://ns.adobe.com/xap/1.0/rights/",
+    "http://ns.adobe.com/xap/1.0/mm/",
+    "http://ns.adobe.com/xmp/Identifier/qual/1.0/",
+    "http://ns.adobe.com/xap/1.0/bj/",
+    "http://ns.adobe.com/xap/1.0/t/pg/",
+    "http://ns.adobe.com/xmp/1.0/DynamicMedia/",
+    "http://ns.adobe.com/pdf/1.3/",
+    "http://www.aiim.org/pdfa/ns/id/",
+    "http://www.aiim.org/pdfa/ns/extension/",
+    "http://www.aiim.org/pdfa/ns/schema#",
+    "http://www.aiim.org/pdfa/ns/property#",
+    "http://www.aiim.org/pdfa/ns/type#",
+    "http://www.aiim.org/pdfa/ns/field#",
+    "http://ns.adobe.com/photoshop/1.0/",
+    "http://ns.adobe.com/camera-raw-settings/1.0/",
+    "http://ns.adobe.com/exif/1.0/",
+    "http://ns.adobe.com/tiff/1.0/",
+    "http://ns.adobe.com/exif/1.0/aux/",
+    "http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/",
+    "http://www.aiim.org/pdfua/ns/id/",
+    "http://www.npes.org/pdfx/ns/id/",
+}
+
+
+def xmp_namespace(key):
+    """The namespace URI of a pikepdf metadata key, Clark or prefix form."""
+    if key.startswith("{"):
+        return key[1:].partition("}")[0]
+    prefix = key.split(":", 1)[0]
+    try:
+        from pikepdf.models.metadata import DEFAULT_NAMESPACES
+
+        return dict(DEFAULT_NAMESPACES).get(prefix, "")
+    except ImportError:
+        return ""
+
+
+def level_of(options):
+    return LEVELS[str(options.get("pdfa") or "4").lower()]
+
+
+def level_label(level):
+    return f"PDF/A-{level['part']}{level['conformance'] or ''}"
+
+
 FLAG_INVISIBLE, FLAG_HIDDEN, FLAG_PRINT, FLAG_NOVIEW, FLAG_TOGGLE = 1, 2, 4, 32, 256
 STRIP_CATEGORIES = ("actions", "multimedia", "hidden", "xfa", "attachments")
 # Metric-compatible families for the standard 14 fonts and their common aliases.
@@ -130,7 +230,7 @@ def strip_hint(category):
 # --- content traversal -----------------------------------------------------
 
 
-def content_streams(pdf):
+def content_streams(pdf, repairs=None):
     """Yield (owner, resources, owns_resources) for every content stream a viewer runs.
 
     Streams are reached through the operators that invoke them, so unused
@@ -141,6 +241,7 @@ def content_streams(pdf):
     never changes what another page draws.
     """
     bound, type3_bound = {}, {}
+    repairs = repairs if repairs is not None else {}
 
     def context_key(resources):
         return resources.objgen if getattr(resources, "is_indirect", False) else None
@@ -188,6 +289,8 @@ def content_streams(pdf):
         if previous is not False:
             if previous != context_key(resources):
                 font = clone_type3(font, resources, op, name)
+                kind = "cloned Type 3 fonts shared across resource contexts"
+                repairs[kind] = repairs.get(kind, 0) + 1
             own = font.Resources
         elif isinstance(own, Dictionary):
             if not own.is_indirect:
@@ -232,6 +335,8 @@ def content_streams(pdf):
             for entry, value in stream.items():
                 if entry != "/Length":
                     clone[entry] = value
+            kind = "cloned streams shared across resource contexts"
+            repairs[kind] = repairs.get(kind, 0) + 1
             holder = (
                 container if container is not None else own_container(resources, key)
             )
@@ -493,11 +598,12 @@ def annotations(pdf):
                 yield page, annot
 
 
-def forbidden_action(action):
+def forbidden_action(action, level=None):
     """Describe why an action chain is not allowed, or return None.
 
     Every action reachable through /Next is checked once; cycles are skipped.
     """
+    allowed = (level or LEVELS["4"])["actions"]
     pending, seen = [action], set()
     while pending:
         current = pending.pop()
@@ -510,7 +616,7 @@ def forbidden_action(action):
         if len(seen) > 100000:
             return "action chain with more than 100000 links"
         kind = pdf_name(current.get("/S"))
-        if kind not in ALLOWED_ACTIONS:
+        if kind not in allowed:
             return f"{kind or 'untyped'} action"
         if (
             kind == "/Named"
@@ -538,7 +644,7 @@ def outline_items(root):
             item = item.get("/Next")
 
 
-def strip_features(pdf, strip, problems):
+def strip_features(pdf, strip, problems, level=None):
     """Remove forbidden features whose --strip category was requested.
 
     Other forbidden features are appended to problems as actionable messages.
@@ -546,13 +652,14 @@ def strip_features(pdf, strip, problems):
     """
     strip = set(strip)
     root = pdf.Root
+    level = level or LEVELS["4"]
 
     def report(text):
         if problems is not None:
             problems.append(text)
 
     def action_holder(holder, where):
-        reason = forbidden_action(holder.get("/A"))
+        reason = forbidden_action(holder.get("/A"), level)
         if reason:
             if "actions" in strip:
                 del holder["/A"]
@@ -566,7 +673,8 @@ def strip_features(pdf, strip, problems):
         bad = [
             key
             for key, value in aa.items()
-            if (allowed is not None and key not in allowed) or forbidden_action(value)
+            if (allowed is not None and key not in allowed)
+            or forbidden_action(value, level)
         ]
         if not bad:
             return
@@ -581,17 +689,30 @@ def strip_features(pdf, strip, problems):
             )
 
     if isinstance(root.get("/OpenAction"), Dictionary):
-        reason = forbidden_action(root.OpenAction)
+        reason = forbidden_action(root.OpenAction, level)
         if reason and "actions" in strip:
             del root["/OpenAction"]
         elif reason:
             report(f"the document open action is a {reason}; {strip_hint('actions')}")
-    additional_actions(root, "the document catalog", ALLOWED_ADDITIONAL_ACTIONS)
+    names = root.get("/Names")
+    if (
+        not level["javascript_names"]
+        and isinstance(names, Dictionary)
+        and "/JavaScript" in names
+    ):
+        if "actions" in strip:
+            del names["/JavaScript"]
+        else:
+            report(
+                f"the document has document-level JavaScript; {strip_hint('actions')}"
+            )
+    additional_actions(root, "the document catalog", level["catalog_page_aa"])
     for item in outline_items(root):
         action_holder(item, f"outline item {objref(item)}")
+    widget_aa = None if level["widget_aa"] else set()
     for page in pdf.pages:
         additional_actions(
-            page.obj, f"page {objref(page.obj)}", ALLOWED_ADDITIONAL_ACTIONS
+            page.obj, f"page {objref(page.obj)}", level["catalog_page_aa"]
         )
         kept, changed = [], False
         for annot in page.obj.get("/Annots") or []:
@@ -603,14 +724,16 @@ def strip_features(pdf, strip, problems):
             if annotation_category(subtype) in strip:
                 changed = True
                 continue
-            if subtype not in ALLOWED_ANNOTATIONS:
+            if subtype not in level["annotations"]:
                 category = (
                     "multimedia" if subtype in FORBIDDEN_ANNOTATIONS else "annotations"
                 )
                 if category in strip:
                     changed = True
                     continue
-                report(f"{where} is not allowed in PDF/A-4; {strip_hint(category)}")
+                report(
+                    f"{where} is not allowed in {level_label(level)}; {strip_hint(category)}"
+                )
             if subtype == "/FileAttachment" and "attachments" in strip:
                 changed = True
                 continue
@@ -625,11 +748,24 @@ def strip_features(pdf, strip, problems):
                         del annot["/A"]
                     else:
                         report(f"{where} has an action; {strip_hint('actions')}")
-                additional_actions(annot, where)
+                additional_actions(annot, where, widget_aa)
             else:
                 action_holder(annot, where)
-                additional_actions(annot, where, ALLOWED_ADDITIONAL_ACTIONS)
+                additional_actions(annot, where, level["catalog_page_aa"])
             kept.append(annot)
+        # A popup without its parent annotation keeps the parent reachable.
+        kept_ids = {a.objgen for a in kept if a.is_indirect}
+        orphans = [
+            a
+            for a in kept
+            if a.get("/Subtype") == Name.Popup
+            and isinstance(a.get("/Parent"), Dictionary)
+            and a.Parent.is_indirect
+            and a.Parent.objgen not in kept_ids
+        ]
+        if orphans:
+            kept = [a for a in kept if a not in orphans]
+            changed = True
         if changed:
             if kept:
                 page.obj.Annots = Array(kept)
@@ -644,7 +780,7 @@ def strip_features(pdf, strip, problems):
                 report(f"the form has XFA data; {strip_hint('xfa')}")
         for field in form_fields(acroform):
             action_holder(field, f"form field {objref(field)}")
-            additional_actions(field, f"form field {objref(field)}")
+            additional_actions(field, f"form field {objref(field)}", widget_aa)
     if "attachments" in strip:
         names = root.get("/Names")
         if isinstance(names, Dictionary) and "/EmbeddedFiles" in names:
@@ -676,26 +812,38 @@ def form_fields(acroform):
 # --- structure -------------------------------------------------------------
 
 
-def repair_structure(pdf, notes):
+def repair_structure(pdf, notes, level=None, repairs=None):
+    level = level or LEVELS["4"]
+    repairs = repairs if repairs is not None else {}
+
+    def count(kind, n=1):
+        if n:
+            repairs[kind] = repairs.get(kind, 0) + n
+
     root = pdf.Root
     for key in ("/Requirements", "/Version", "/NeedsRendering"):
         if key in root:
             del root[key]
+            count(f"removed catalog {key}")
     names = root.get("/Names")
     if isinstance(names, Dictionary) and "/AlternatePresentations" in names:
         del names["/AlternatePresentations"]
+        count("removed alternate presentations")
     for page in pdf.pages:
         if "/PresSteps" in page.obj:
             del page.obj["/PresSteps"]
+            count("removed page presentation steps")
     perms = root.get("/Perms")
     if isinstance(perms, Dictionary):
-        for key in [k for k in perms if k != "/DocMDP"]:
+        for key in [k for k in perms if k not in level["perms"]]:
             del perms[key]
+            count("removed permission entries")
         if len(perms) == 0:
             del root["/Perms"]
     acroform = root.get("/AcroForm")
     if isinstance(acroform, Dictionary) and "/NeedAppearances" in acroform:
         del acroform["/NeedAppearances"]
+        count("cleared NeedAppearances")
     repair_optional_content(root)
     recompressed = 0
     for obj in pdf.objects:
@@ -721,25 +869,37 @@ def repair_structure(pdf, notes):
                 for key in ("/Alternates", "/OPI"):
                     if key in obj:
                         del obj[key]
+                        count(f"removed image {key}")
                 if obj.get("/Interpolate", False):
                     obj.Interpolate = False
+                    count("cleared Interpolate on images")
             elif subtype == Name.Form:
                 for key in ("/OPI", "/Ref"):
                     if key in obj:
                         del obj[key]
-    if recompressed:
-        notes.append(f"re-encoded {recompressed} LZW streams with Flate")
+                        count(f"removed form {key}")
+                if obj.get("/Subtype2") == Name.PS:
+                    del obj["/Subtype2"]
+                    count("removed PostScript form subtypes")
+        elif isinstance(obj, Dictionary) and obj.get("/Type") == Name.FontDescriptor:
+            # Optional character-set declarations must match the program exactly.
+            for key in ("/CharSet", "/CIDSet"):
+                if key in obj:
+                    del obj[key]
+                    count(f"removed font descriptor {key}")
+    count("re-encoded LZW streams with Flate", recompressed)
     # Traverse completely before binding: a stream reached from a second context
     # must still look resource-less so that it gets cloned.
-    for owner, resources, owns in list(content_streams(pdf)):
+    for owner, resources, owns in list(content_streams(pdf, repairs)):
         holder = owner.obj if isinstance(owner, pikepdf.Page) else owner
         if not owns and isinstance(resources, Dictionary):
             holder.Resources = resources
+            count("bound inherited resources to streams")
         if not isinstance(resources, Dictionary):
             continue
         for state in (resources.get("/ExtGState") or {}).values():
             if isinstance(state, Dictionary):
-                repair_graphics_state(state)
+                count("repaired graphics states", repair_graphics_state(state))
         # Font repairs address fonts by object number, so direct ones become indirect.
         fonts = resources.get("/Font")
         if isinstance(fonts, Dictionary):
@@ -749,7 +909,9 @@ def repair_structure(pdf, notes):
 
 
 def repair_graphics_state(state):
-    for key in ("/TR", "/HTO"):
+    """Remove transfer functions and halftone settings PDF/A forbids. Returns 0 or 1."""
+    before = len(state)
+    for key in ("/TR", "/HTO", "/HTP"):
         if key in state:
             del state[key]
     if "/TR2" in state and state.get("/TR2") != Name.Default:
@@ -764,6 +926,7 @@ def repair_graphics_state(state):
         valid = halftone is None or isinstance(halftone, Name)
     if not valid:
         del state["/HT"]
+    return int(len(state) != before)
 
 
 def repair_optional_content(root):
@@ -810,30 +973,51 @@ def collect_references(item, found, depth=0):
 
 
 def file_specifications(pdf):
-    """File specification dictionaries from the name tree, AF arrays, and annotations."""
+    """File specification dictionaries from the name tree, AF arrays, and annotations.
+
+    Specifications become indirect objects so that one specification can be
+    shared by the name tree, an annotation, and an AF array by identity.
+    """
     specs, seen = [], set()
 
-    def add(spec):
+    def add(spec, store):
         if not isinstance(spec, Dictionary) or "/EF" not in spec:
             return
-        # Direct specifications cannot be reached twice; indirect ones can.
-        if spec.is_indirect:
-            if spec.objgen in seen:
-                return
-            seen.add(spec.objgen)
+        if not spec.is_indirect:
+            spec = store(pdf.make_indirect(spec))
+        if spec.objgen in seen:
+            return
+        seen.add(spec.objgen)
         specs.append(spec)
 
     names = pdf.Root.get("/Names")
     if isinstance(names, Dictionary) and "/EmbeddedFiles" in names:
-        for spec in pikepdf.NameTree(names.EmbeddedFiles).values():
-            add(spec)
+        tree = pikepdf.NameTree(names.EmbeddedFiles)
+        for key, spec in list(tree.items()):
+
+            def into_tree(indirect, key=key):
+                tree[key] = indirect
+                return tree[key]
+
+            add(spec, into_tree)
     for holder in associated_file_holders(pdf):
-        files = holder.AF
-        for spec in files if isinstance(files, Array) else [files]:
-            add(spec)
+        files = holder.AF if isinstance(holder.AF, Array) else Array([holder.AF])
+        holder.AF = files
+        for index, spec in enumerate(list(holder.AF)):
+
+            def into_array(indirect, holder=holder, index=index):
+                holder.AF[index] = indirect
+                return holder.AF[index]
+
+            add(spec, into_array)
     for _, annot in annotations(pdf):
         if annot.get("/Subtype") == Name.FileAttachment:
-            add(annot.get("/FS"))
+
+            def into_annot(indirect, annot=annot):
+                annot.FS = indirect
+                return annot.FS
+
+            add(annot.get("/FS"), into_annot)
     return specs
 
 
@@ -850,11 +1034,20 @@ def associated_file_holders(pdf):
             yield holder
 
 
-def repair_embedded_files(pdf, notes):
-    """Normalize file specifications. Returns True when the file needs PDF/A-4f."""
+def repair_embedded_files(pdf, notes, level):
+    """Normalize file specifications. Returns True when the file carries attachments.
+
+    PDF/A-4 becomes 4f. PDF/A-3 requires every embedded file to be an associated
+    file. PDF/A-2 only permits attachments that are PDF/A themselves, which the
+    converter cannot establish, so it refuses them.
+    """
     specs = file_specifications(pdf)
     if not specs:
         return False
+    if level["attachments"] == "pdfa-only":
+        raise ConversionError(
+            f"{len(specs)} embedded files: PDF/A-2 only allows attachments that are PDF/A themselves; use --pdfa 3b, or --strip attachments"
+        )
     if not isinstance(pdf.Root.get("/Names"), Dictionary):
         pdf.Root.Names = Dictionary()
     names = pdf.Root.Names
@@ -885,7 +1078,34 @@ def repair_embedded_files(pdf, notes):
             while key in tree:
                 key += " (copy)"
             tree[key] = spec
-    notes.append(f"{len(specs)} embedded files; targeting PDF/A-4f")
+    if level["attachments"] == "associated":
+        # A file attachment annotation associates its own file; everything else
+        # is associated with the document.
+        for _, annot in annotations(pdf):
+            spec = annot.get("/FS")
+            if annot.get("/Subtype") == Name.FileAttachment and isinstance(
+                spec, Dictionary
+            ):
+                files = annot.get("/AF")
+                files = list(files) if isinstance(files, Array) else []
+                if spec.objgen not in {
+                    f.objgen for f in files if isinstance(f, Dictionary)
+                }:
+                    annot.AF = Array(files + [spec])
+        associated = set()
+        for holder in associated_file_holders(pdf):
+            for spec in holder.AF if isinstance(holder.AF, Array) else [holder.AF]:
+                if isinstance(spec, Dictionary) and spec.is_indirect:
+                    associated.add(spec.objgen)
+        loose = [s for s in specs if s.objgen not in associated]
+        if loose:
+            existing = pdf.Root.get("/AF")
+            pdf.Root.AF = Array(
+                (list(existing) if isinstance(existing, Array) else []) + loose
+            )
+        notes.append(f"{len(specs)} embedded files associated with the document")
+    else:
+        notes.append(f"{len(specs)} embedded files; targeting PDF/A-4f")
     return True
 
 
@@ -909,7 +1129,7 @@ def missing_appearances(pdf):
     return found
 
 
-def generate_appearances(source, staged):
+def generate_appearances(source, staged, object_streams=True):
     """Create missing appearance streams with MuPDF. Returns failures."""
     import pymupdf
 
@@ -953,7 +1173,7 @@ def generate_appearances(source, staged):
                         )
         if regenerate:
             document.need_appearances(False)
-        document.save(staged, garbage=1, deflate=True)
+        document.save(staged, garbage=1, deflate=True, use_objstms=int(object_streams))
     return failures
 
 
@@ -1821,22 +2041,34 @@ def repair_simple_widths(pdf, font, key, program, codes, notes):
 
 
 def charstring_with_width(glyph, width, private, global_subrs):
+    """Redraw a charstring with a new advance. A Type 2 charstring stores the
+    advance relative to nominalWidthX and omits it when it equals defaultWidthX."""
     from fontTools.pens.t2CharStringPen import T2CharStringPen
 
-    pen = T2CharStringPen(width, None)
+    nominal = getattr(private, "nominalWidthX", 0) if private is not None else 0
+    default = getattr(private, "defaultWidthX", 0) if private is not None else 0
+    encoded = None if width == default else width - nominal
+    pen = T2CharStringPen(encoded, None)
     glyph.draw(pen)
     return pen.getCharString(private=private, globalSubrs=global_subrs)
 
 
 def repair_cff_widths(font, program, data, codes, wanted, notes):
-    from fontTools.cffLib import CFFFontSet
+    from fontTools.ttLib import TTFont, newTable
 
-    cff = CFFFontSet()
+    # A bare CFF program compiles through a font holder, which fontTools needs
+    # for bounding-box recalculation.
+    holder, table = TTFont(sfntVersion="OTTO"), newTable("CFF ")
     try:
-        cff.decompile(io.BytesIO(data), None)
+        table.decompile(data, holder)
     except Exception:  # noqa: BLE001 -- unreadable programs are left for the validator
         return
+    holder["CFF "] = table
+    cff = table.cff
     top = cff[0]
+    # Charstring widths are in font units; the FontMatrix maps them to text space.
+    matrix = getattr(top, "FontMatrix", None) or [0.001, 0, 0, 0.001, 0, 0]
+    scale = float(matrix[0]) * 1000
     if hasattr(top, "ROS"):
         return
     from fontTools.pens.basePen import NullPen
@@ -1855,16 +2087,14 @@ def repair_cff_widths(font, program, data, codes, wanted, notes):
             continue
         charstring = glyph_set[name]
         charstring.draw(NullPen())
-        if abs(charstring.width - wanted(code)) <= 1:
+        if abs(charstring.width * scale - wanted(code)) <= 1:
             continue
         glyph_set[name] = charstring_with_width(
-            charstring, wanted(code), top.Private, cff.GlobalSubrs
+            charstring, round(wanted(code) / scale), top.Private, cff.GlobalSubrs
         )
         patched += 1
     if patched:
-        buffer = io.BytesIO()
-        cff.compile(buffer, None)
-        program.write(buffer.getvalue())
+        program.write(table.compile(holder))
         notes.append(f"aligned {patched} glyph widths in {font.get('/BaseFont')}")
 
 
@@ -1897,11 +2127,13 @@ def repair_type1_widths(pdf, font, descriptor, program, data, codes, wanted, not
         else standard_encodings()["/StandardEncoding"]
     )
     names = simple_encoding(font, builtin)
+    matrix = t1.font.get("FontMatrix", [0.001, 0, 0, 0.001, 0, 0])
+    scale = float(matrix[0]) * 1000  # font units to text space
     mismatched = {}
     for code in codes:
         name = names[code] if code < 256 else None
-        if name in glyph_set and abs(glyph_set[name].width - wanted(code)) > 1:
-            mismatched[name] = wanted(code)
+        if name in glyph_set and abs(glyph_set[name].width * scale - wanted(code)) > 1:
+            mismatched[name] = round(wanted(code) / scale)
     if not mismatched:
         return
     charstrings = {}
@@ -1918,10 +2150,7 @@ def repair_type1_widths(pdf, font, descriptor, program, data, codes, wanted, not
     )
     builder.setupCFF(
         str(font.get("/BaseFont", "/Font"))[1:].split("+")[-1],
-        {
-            "FullName": info.get("FullName", ""),
-            "FontMatrix": t1.font.get("FontMatrix", [0.001, 0, 0, 0.001, 0, 0]),
-        },
+        {"FullName": info.get("FullName", ""), "FontMatrix": list(matrix)},
         charstrings,
         {},
     )
@@ -2017,31 +2246,49 @@ def repair_to_unicode(font, notes):
 # --- metadata --------------------------------------------------------------
 
 
-def write_metadata(pdf, attachments):
-    """Identify the file as PDF/A-4 (or 4f) in XMP and drop the Info dictionary."""
+def write_metadata(pdf, level, attachments, notes):
+    """Identify the file's PDF/A level in XMP. PDF/A-4 drops the Info dictionary."""
     info = pdf.trailer.get("/Info")
     try:
-        identify(pdf, info, attachments)
+        identify(pdf, info, level, attachments, notes)
     except Exception:  # noqa: BLE001 -- unreadable XMP is replaced by a fresh packet
         if "/Metadata" in pdf.Root:
             del pdf.Root["/Metadata"]
-        identify(pdf, info, attachments)
-    if "/Info" in pdf.trailer:
+        identify(pdf, info, level, attachments, notes)
+    if level["part"] == 4 and "/Info" in pdf.trailer:
         del pdf.trailer["/Info"]
 
 
-def identify(pdf, info, attachments):
+def identify(pdf, info, level, attachments, notes):
     with pdf.open_metadata(
         set_pikepdf_as_editor=False, update_docinfo=False, strict=False
     ) as meta:
         if isinstance(info, Dictionary):
             meta.load_from_docinfo(info, raise_failure=False)
-        meta["pdfaid:part"] = "4"
-        meta["pdfaid:rev"] = "2020"
-        if attachments:
-            meta["pdfaid:conformance"] = "F"
+        if level["predefined_xmp"] and "pdfaExtension:schemas" not in meta:
+            # Without an extension schema, only predefined schemas may appear.
+            dropped = [
+                key
+                for key in list(meta.keys())
+                if xmp_namespace(key) not in PREDEFINED_XMP_NAMESPACES
+            ]
+            for key in dropped:
+                del meta[key]
+            if dropped:
+                notes.append(
+                    "removed XMP properties without an extension schema: "
+                    + ", ".join(sorted(dropped)[:8])
+                )
+        meta["pdfaid:part"] = str(level["part"])
+        conformance = level["conformance"] or ("F" if attachments else None)
+        if conformance:
+            meta["pdfaid:conformance"] = conformance
         elif "pdfaid:conformance" in meta:
             del meta["pdfaid:conformance"]
+        if level["part"] == 4:
+            meta["pdfaid:rev"] = "2020"
+        elif "pdfaid:rev" in meta:
+            del meta["pdfaid:rev"]
         for key in ("pdfaid:amd", "pdfaid:corr"):
             if key in meta:
                 del meta[key]
@@ -2055,7 +2302,8 @@ def convert(source, output, options, message):
 
     work = os.path.dirname(output)
     strip = [s for s in options.get("strip", "").split(",") if s]
-    problems, notes = [], []
+    level = level_of(options)
+    problems, notes, repairs = [], [], {}
     staged = source
     with pikepdf.open(source) as probe:
         # MuPDF only sees indirect annotation dictionaries.
@@ -2080,30 +2328,43 @@ def convert(source, output, options, message):
     if needs_appearances:
         source = staged
         staged = os.path.join(work, "appearances.pdf")
-        failures = generate_appearances(source, staged)
+        failures = generate_appearances(
+            source, staged, options.get("object_streams", True)
+        )
         if failures:
             problems.extend(
                 f"{failure}; use --flatten annotations or --strip annotations"
                 for failure in failures
             )
     with pikepdf.open(staged) as pdf:
-        strip_features(pdf, strip, problems)
-        repair_structure(pdf, notes)
+        strip_features(pdf, strip, problems, level)
+        repair_structure(pdf, notes, level, repairs)
         attachments = (
-            repair_embedded_files(pdf, notes) if "attachments" not in strip else False
+            repair_embedded_files(pdf, notes, level)
+            if "attachments" not in strip
+            else False
         )
         repair_fonts(pdf, options, notes)
         ensure_output_intent(pdf, options, notes)
         repair_annotations(pdf, problems)
         if problems:
-            raise ConversionError("cannot produce PDF/A-4:\n  " + "\n  ".join(problems))
-        write_metadata(pdf, attachments)
+            raise ConversionError(
+                f"cannot produce {level_label(level)}:\n  " + "\n  ".join(problems)
+            )
+        write_metadata(pdf, level, attachments, notes)
         pdf.save(
             output,
-            min_version="2.0",
-            object_stream_mode=pikepdf.ObjectStreamMode.generate,
+            force_version=level["version"],
+            object_stream_mode=pikepdf.ObjectStreamMode.generate
+            if options.get("object_streams", True)
+            else pikepdf.ObjectStreamMode.disable,
         )
     if options.get("verbose"):
+        label = level_label(level)
         for note in notes:
-            message("PDF/A-4: " + note)
-    return "4f" if attachments else "4"
+            message(f"{label}: {note}")
+        for kind, number in sorted(repairs.items()):
+            message(f"{label}: {kind}: {number}")
+    if level["part"] == 4:
+        return "4f" if attachments else "4"
+    return f"{level['part']}{level['conformance'].lower()}"
