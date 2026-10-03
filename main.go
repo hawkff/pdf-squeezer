@@ -258,7 +258,11 @@ func (v *verifier) check(ctx context.Context, s *staged) error {
 		return verdict
 	}
 	inputs, err := validatePDFA(ctx, s.flavour, []string{s.input}, v.stderr)
-	if err == nil && inputs[s.input] == nil {
+	if err != nil {
+		// A rejected output is published only with proof that the input did not conform.
+		return errors.Join(verdict, err)
+	}
+	if inputs[s.input] == nil {
 		return fmt.Errorf("compression broke the input's %s conformance; use --pdfa to repair it or report this:\n%w", label, verdict)
 	}
 	fmt.Fprintf(v.stderr, "warning: %s declares %s but does not conform to it; the output is not verified\n", s.input, label)
@@ -319,7 +323,7 @@ func configuration(password string) *model.Configuration {
 
 // prepare compresses and transforms input into a staged file that pdfcpu has
 // validated. The caller confirms PDF/A with veraPDF when needed and publishes.
-func prepare(ctx context.Context, input, output string, opts options, stderr io.Writer) (*staged, error) {
+func prepare(ctx context.Context, input, output string, opts options, stderr io.Writer) (result *staged, err error) {
 	stderr = &lockedWriter{writer: stderr}
 	logf := func(format string, args ...any) {
 		if opts.verbose {
@@ -354,7 +358,7 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 		return nil, err
 	}
 	defer func() {
-		if err != nil {
+		if err != nil { // the named result: every failed return reaches it
 			os.RemoveAll(work)
 		}
 	}()
