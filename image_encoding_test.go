@@ -250,26 +250,42 @@ func TestDuplicateMaskEncodingWork(t *testing.T) {
 		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
 		fmt.Sprintf("<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 7 0 R /Length %d >>\nstream\n%s\nendstream", len(body), body),
 		fmt.Sprintf("<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 8 0 R /Length %d >>\nstream\n%s\nendstream", len(body), body), maskObject, maskObject)
-	pdf, err := api.ReadAndValidate(t.Context(), bytes.NewReader(data), configuration(""))
-	if err != nil {
-		t.Fatal(err)
-	}
-	jobs := 0
-	stats, err := optimizeImages(t.Context(), pdf, options{imageMemory: 512, imageQuality: 75, imageCodecs: "flate", force: true, reduceBits: true}, func(string, ...any) { jobs++ })
-	if err != nil || stats.seen != 4 || stats.changed != 4 || jobs != 3 {
-		t.Fatalf("mask work: %v, jobs=%d, %v", stats, jobs, err)
-	}
-	for _, nr := range []int{7, 8} {
-		sd, _ := imageStream(pdf.Table[nr])
-		if err := sd.Decode(); err != nil || *sd.IntEntry("BitsPerComponent") != 16 || !bytes.Equal(sd.Content, mask) {
-			t.Fatal("shared mask changed precision", err)
-		}
-	}
-	for nr, want := range map[int]int{5: 7, 6: 8} {
-		sd, _ := imageStream(pdf.Table[nr])
-		if sd.IndirectRefEntry("SMask").ObjectNumber.Value() != want {
-			t.Fatal("mask references changed before final deduplication")
-		}
+	for _, cached := range []int{0, 7, 8} {
+		t.Run(fmt.Sprintf("cached=%d", cached), func(t *testing.T) {
+			pdf, err := api.ReadAndValidate(t.Context(), bytes.NewReader(data), configuration(""))
+			if err != nil {
+				t.Fatal(err)
+			}
+			alternate := bytes.Repeat([]byte{0x33, 0x77}, 4096)
+			wantJobs := 3
+			if cached != 0 {
+				sd, _ := imageStream(pdf.Table[cached])
+				sd.Content = alternate
+				pdf.Table[cached].Object = sd
+				wantJobs = 4
+			}
+			jobs := 0
+			stats, err := optimizeImages(t.Context(), pdf, options{imageMemory: 512, imageQuality: 75, imageCodecs: "flate", force: true, reduceBits: true}, func(string, ...any) { jobs++ })
+			if err != nil || stats.seen != 4 || stats.changed != 4 || jobs != wantJobs {
+				t.Fatalf("mask work: %v, jobs=%d, %v", stats, jobs, err)
+			}
+			for _, nr := range []int{7, 8} {
+				want := mask
+				if nr == cached {
+					want = alternate
+				}
+				sd, _ := imageStream(pdf.Table[nr])
+				if err := sd.Decode(); err != nil || *sd.IntEntry("BitsPerComponent") != 16 || !bytes.Equal(sd.Content, want) {
+					t.Fatal("shared mask changed samples or precision", err)
+				}
+			}
+			for nr, want := range map[int]int{5: 7, 6: 8} {
+				sd, _ := imageStream(pdf.Table[nr])
+				if sd.IndirectRefEntry("SMask").ObjectNumber.Value() != want {
+					t.Fatal("mask references changed before final deduplication")
+				}
+			}
+		})
 	}
 }
 
