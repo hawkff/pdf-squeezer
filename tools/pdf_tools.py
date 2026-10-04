@@ -151,7 +151,6 @@ def placements(pdf, lossless=False):
         active = active | {key}
         instructions = pikepdf.parse_content_stream(owner)
         streams[key] = (owner, resources, instructions)
-        collect_images(resources.get("/Pattern"), blocked)
         stack, path, pending_clip = [], None, False
         borrowed_key = None
         for instruction in instructions:
@@ -939,7 +938,6 @@ def font_glyph_usage(pdf):
             raise ValueError("font content traversal exceeds safety limit")
         active = active | {obj.objgen}
         visited_forms.add(obj.objgen)
-        block_graph(resources.get("/Pattern"))
         stack = []
         for instruction in pikepdf.parse_content_stream(owner):
             if not hasattr(instruction, "operator"):

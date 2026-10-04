@@ -231,6 +231,56 @@ func TestMetadataOnUntypedAnnotation(t *testing.T) {
 	}
 }
 
+func TestMetadataEditingPreservesUnidentifiedStreams(t *testing.T) {
+	const payload = "unrelated application data"
+	for _, flags := range [][]string{{"--privacy"}, {"--strip", "metadata"}, {"--metadata", "Title=Updated"}, {"--timestamps", "now"}, {"--timestamps", "modified"}} {
+		t.Run(strings.Join(flags, " "), func(t *testing.T) {
+			dir := t.TempDir()
+			input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+			writeFile(t, input, buildPDF(0,
+				"<< /Type /Catalog /Pages 2 0 R >>",
+				"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+				"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] /Resources << /XObject << /Fm 6 0 R >> >> /Annots [4 0 R] /Contents 7 0 R >>",
+				"<< /Type /Annot /Subtype /Text /Rect [0 0 10 10] /Contents (Note) /Metadata 5 0 R >>",
+				fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(payload), payload),
+				"<< /Subtype /Form /BBox [0 0 64 64] /Resources << >> /Metadata 5 0 R /Length 4 >>\nstream\nq Q\nendstream",
+				"<< /Length 7 >>\nstream\n/Fm Do\nendstream"))
+			if err := run(t.Context(), append(flags, "-o", output, input), io.Discard, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			pdf := readContext(t, output, "")
+			var owners []types.Dict
+			for _, entry := range pdf.Table {
+				if entry == nil || entry.Free {
+					continue
+				}
+				switch obj := entry.Object.(type) {
+				case types.Dict:
+					if obj["Subtype"] == types.Name("Text") {
+						owners = append(owners, obj)
+					}
+				case types.StreamDict:
+					if obj.Dict["Subtype"] == types.Name("Form") {
+						owners = append(owners, obj.Dict)
+					}
+				}
+			}
+			if len(owners) != 2 {
+				t.Fatalf("expected annotation and form, got %d", len(owners))
+			}
+			for _, d := range owners {
+				data, _, err := pdf.DereferenceStreamDict(d["Metadata"])
+				if err != nil || data == nil {
+					t.Fatalf("unidentified stream was removed: %v", err)
+				}
+				if err := data.Decode(); err != nil || string(data.Content) != payload {
+					t.Fatalf("application data changed: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestPieceInfoPreservation(t *testing.T) {
 	for _, flags := range [][]string{nil, {"--compression", "light"}, {"--compression", "balanced"}, {"--compression", "medium"}, {"--compression", "strong"}, {"--compression", "heavy"}, {"--mono-codecs", "ccitt"}, {"--privacy"}, {"--strip", "piece-info"}} {
 		t.Run(strings.Join(flags, " "), func(t *testing.T) {

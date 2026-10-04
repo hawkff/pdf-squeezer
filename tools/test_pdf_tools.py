@@ -307,6 +307,46 @@ class PDFToolsTests(unittest.TestCase):
                 self.assertIn(program, blocked)
                 pdf.close()
 
+    def test_repeated_forms_do_not_rescan_pattern_resources(self):
+        pdf = pikepdf.Pdf.new()
+        self.addCleanup(pdf.close)
+        image = image_object(pdf, Image.new("RGB", (64, 64), (30, 80, 140)))
+        font = cid_font(pdf)
+        pattern = pdf.make_stream(b"q 64 0 0 64 0 0 cm /Im Do Q")
+        pattern.PatternType = 1
+        pattern.Resources = pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(Im=image), Font=pikepdf.Dictionary(F1=font)
+        )
+        form = pdf.make_stream(b"q Q")
+        form.Subtype, form.BBox = pikepdf.Name.Form, [0, 0, 64, 64]
+        form.Resources = pikepdf.Dictionary(Pattern=pikepdf.Dictionary(Tile=pattern))
+        page = text_page(
+            pdf,
+            {"F1": font},
+            b"q 64 0 0 64 0 0 cm /Im Do Q BT /F1 12 Tf <0001> Tj ET "
+            + b"/Fm Do " * 200,
+        )
+        page.Resources.XObject = pikepdf.Dictionary(Im=image, Fm=form)
+        original = pikepdf.Object.items
+        for analyze in (tools.placements, tools.font_glyph_usage):
+            with self.subTest(analyze=analyze.__name__):
+                scanned = []
+
+                def counted(obj, scanned=scanned):
+                    if obj.objgen == pattern.objgen:
+                        scanned.append(obj.objgen)
+                    return original(obj)
+
+                with mock.patch.object(pikepdf.Object, "items", counted):
+                    result = analyze(pdf)
+                self.assertEqual(len(scanned), 1)
+                if analyze is tools.placements:
+                    self.assertNotIn(image.objgen, result[0])
+                else:
+                    program = font.DescendantFonts[0].FontDescriptor.FontFile2.objgen
+                    self.assertEqual(result[0][program], {1})
+                    self.assertIn(program, result[1])
+
     def test_form_borrowing_page_resources_preserves_images(self):
         pdf = pikepdf.Pdf.new()
         form = pdf.make_stream(b"q 128 0 0 128 0 0 cm /Im Do Q")
@@ -1315,6 +1355,65 @@ class PDFToolsTests(unittest.TestCase):
                 self.assertEqual(names[code], "W")
         self.assert_rendering_close(self.source, self.output)
         self.assert_pdfa("4")
+
+    def test_pdfa_malformed_descriptor_uses_guarded_missing_width(self):
+        for descriptor in (42, pikepdf.Name.Invalid):
+            with self.subTest(descriptor=str(descriptor)):
+                pdf = pikepdf.Pdf.new()
+                font = simple_font(
+                    pdf,
+                    "Helvetica",
+                    FontDescriptor=descriptor,
+                    FirstChar=65,
+                    LastChar=66,
+                    Widths=[667, 667],
+                )
+                text_page(
+                    pdf,
+                    {"F1": font},
+                    b"BT /F1 24 Tf (A) Tj 3 Tr (W) Tj 0 Tr (B) Tj ET",
+                )
+                tools.pdfa.repair_fonts(pdf, options(), [])
+                self.assertEqual(float(font.Widths[87 - int(font.FirstChar)]), 0)
+                self.assertIsInstance(font.FontDescriptor, pikepdf.Dictionary)
+                pdf.close()
+
+    def test_pdfa_standard_font_without_widths_keeps_intrinsic_advances(self):
+        for missing in (0, 500):
+            with self.subTest(missing=missing):
+                pdf = pikepdf.Pdf.new()
+                path, _ = tools.pdfa.substitute_path("Helvetica", options())
+                descriptor = tools.pdfa.descriptor_for(
+                    pdf, tools.pdfa.load_font_file(path), "Helvetica", False, False
+                )
+                descriptor.MissingWidth = missing
+                font = simple_font(pdf, "Helvetica", FontDescriptor=descriptor)
+                text_page(
+                    pdf,
+                    {"F1": font},
+                    b"BT /F1 24 Tf 10 50 Td (A) Tj 3 Tr (W) Tj 0 Tr (B) Tj ET",
+                )
+                pdf.save(self.source)
+                pdf.close()
+                self.convert_pdfa()
+                self.assert_rendering_close(self.source, self.output)
+                positions = []
+                for path in (self.source, self.output):
+                    with pymupdf.open(path) as document:
+                        positions.append(
+                            [
+                                char[2][0]
+                                for span in document[0].get_texttrace()
+                                for char in span["chars"]
+                            ]
+                        )
+                self.assertEqual(len(positions[0]), 3)
+                for before, after in zip(*positions, strict=True):
+                    self.assertAlmostEqual(before, after, delta=0.05)
+                with pikepdf.Pdf.open(self.output) as result:
+                    font = result.pages[0].Resources.Font.F1
+                    self.assertEqual(float(font.Widths[87 - int(font.FirstChar)]), 944)
+                self.assert_pdfa("4")
 
     def test_pdfa_unknown_font_usage_after_budget_keeps_standard_font(self):
         pdf = pikepdf.Pdf.new()

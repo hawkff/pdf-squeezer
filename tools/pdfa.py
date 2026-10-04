@@ -1608,12 +1608,9 @@ def embed_simple_font(pdf, font, codes, invisible_codes, options, notes):
         ):
             width = float(existing[code - first])
         elif isinstance(existing, Array):
-            width = (
-                float(descriptor.get("/MissingWidth", 0))
-                if descriptor is not None
-                else 0
-            )
+            width = missing_width
         elif glyph is not None:
+            # Without /Widths, known glyphs retain the font's intrinsic advance.
             width = round(tt["hmtx"][glyph][0] * scale)
         elif isinstance(descriptor, Dictionary) and "/MissingWidth" in descriptor:
             width = float(descriptor.MissingWidth)

@@ -277,14 +277,14 @@ func transformDocument(ctx context.Context, pdf *model.Context, opts options) er
 			}
 		}
 		_, stream := entry.Object.(types.StreamDict)
-		// Resource names are arbitrary. An untyped stream needs an information
-		// object owner or an XML/XMP subtype, not just a resource named Metadata.
+		// Identify metadata by the stream's type or subtype. The owner's type
+		// does not make an unrelated stream under a Metadata key into XMP.
 		if opts.privacy || len(opts.metadata) > 0 || updateDates || listContains(opts.strip, "metadata") {
 			if metadata, _, err := pdf.DereferenceStreamDict(d["Metadata"]); err == nil && metadata != nil {
 				metadataType, err := pdf.Dereference(metadata.Dict["Type"])
 				metadataSubtype, _ := pdf.Dereference(metadata.Dict["Subtype"])
 				xmp := metadataSubtype == types.Name("XML") || metadataSubtype == types.Name("XMP")
-				if err == nil && (metadataType == types.Name("Metadata") || metadataType == nil && (typ != "" || stream || xmp)) {
+				if err == nil && (metadataType == types.Name("Metadata") || metadataType == nil && xmp) {
 					delete(d, "Metadata")
 				}
 			}
