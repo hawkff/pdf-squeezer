@@ -396,38 +396,38 @@ def instructions(owner):
 
 
 def font_usage(pdf):
-    """Codes or CIDs drawn with each font outside rendering mode 3.
+    """Return visible and mode-3 codes per font, keeping embedding separate from advances.
 
     A font's value of None means its usage could not be determined, so every
-    code counts. The whole result is None when the document is too large to
-    walk, which callers treat the same way for every font. Forms inherit the
-    caller's font and rendering mode; patterns, glyphs, and appearances start
-    with none.
+    code counts. Both results are None when the document is too large to walk.
+    Forms inherit the caller's font and rendering mode; patterns, glyphs, and
+    appearances start with none.
     """
-    used, visited, budget, truncated = {}, set(), [200000], []
+    used, invisible, visited, budget, truncated = {}, {}, set(), [200000], []
 
     def record(font, text, render_mode):
-        if font is None or not font.is_indirect or render_mode == 3:
+        if font is None or not font.is_indirect:
             return
         key = font.objgen
+        usage = invisible if render_mode == 3 else used
         if font.get("/Subtype") == Name.Type0:
             encoding = font.get("/Encoding")
             if encoding not in (Name("/Identity-H"), Name("/Identity-V")):
-                used[key] = None
+                usage[key] = None
                 return
             raw = bytes(text)
             if len(raw) % 2:
-                used[key] = None
+                usage[key] = None
                 return
             codes = {
                 int.from_bytes(raw[i : i + 2], "big") for i in range(0, len(raw), 2)
             }
         else:
             codes = set(bytes(text))
-        current = used.get(key, set())
+        current = usage.get(key, set())
         if current is not None:
             current.update(codes)
-            used[key] = current
+            usage[key] = current
 
     def walk(owner, resources, font, render_mode, depth):
         holder = owner.obj if isinstance(owner, pikepdf.Page) else owner
@@ -511,7 +511,7 @@ def font_usage(pdf):
                 for stream in streams:
                     if isinstance(stream, Stream):
                         walk(stream, stream.get("/Resources", resources), None, 0, 1)
-    return None if budget[0] <= 0 or truncated else used
+    return (None, None) if budget[0] <= 0 or truncated else (used, invisible)
 
 
 def color_family(space, resources, depth=0):
@@ -1498,7 +1498,7 @@ def program_stream(pdf, tt):
     return stream, "/FontFile2", Name.TrueType
 
 
-def embed_simple_font(pdf, font, codes, options, notes):
+def embed_simple_font(pdf, font, codes, invisible_codes, options, notes):
     from fontTools import agl
 
     path, user_supplied = substitute_path(font.get("/BaseFont", "/Unknown"), options)
@@ -1534,17 +1534,35 @@ def embed_simple_font(pdf, font, codes, options, notes):
     }
     first, last = int(font.get("/FirstChar", 0)), int(font.get("/LastChar", -1))
     existing = font.get("/Widths")
+    unknown_usage = codes is None and invisible_codes is None
+    missing_width = (
+        float(descriptor.get("/MissingWidth", 0))
+        if isinstance(descriptor, Dictionary)
+        else 0
+    )
     if isinstance(existing, Array) and last >= first:
         document = {
             code: float(existing[code - first])
             for code in mapping
             if first <= code <= last and code - first < len(existing)
         }
+        if unknown_usage:
+            # Outside /Widths the document uses MissingWidth, not the substitute's
+            # advance. Without usage information we cannot discard those metrics.
+            document.update(
+                {code: missing_width for code in mapping if code not in document}
+            )
         mismatched = {
             code: width
             for code, width in document.items()
             if abs(width - widths[code]) > 1
         }
+        if mismatched and unknown_usage:
+            raise ConversionError(
+                f"font usage could not be determined and document widths for {name} "
+                f"conflict with substitute metrics at {len(mismatched)} codes; "
+                "re-export with embedded fonts or pass --font-file with matching original metrics"
+            )
         if mismatched and not user_supplied:
             raise ConversionError(
                 f"the document's widths for {name} differ from the metric-compatible substitute at {len(mismatched)} codes (first: {sorted(mismatched)[:5]}); pass --font-file '{name}=/path/to/the/original/font'"
@@ -1564,6 +1582,45 @@ def embed_simple_font(pdf, font, codes, options, notes):
             notes.append(
                 f"aligned {len(targets)} glyph widths of {path.rsplit('/', 1)[-1]} to {name}"
             )
+        if unknown_usage:
+            widths.update(document)
+    # Mode 3 still advances the text matrix. Its codes need PDF widths and names,
+    # but no outlines, and must not trigger substitute-glyph or metric refusals.
+    invisible_names = {}
+    if invisible_codes is None:
+        invisible_codes = {code for code, glyph_name in enumerate(names) if glyph_name}
+        if isinstance(existing, Array):
+            # An unnamed code can still carry an explicit advance. Retain only
+            # metrics that differ from the default, not synthetic unused .notdefs.
+            invisible_codes.update(
+                code
+                for code in range(
+                    max(0, first), min(256, last + 1, first + len(existing))
+                )
+                if float(existing[code - first]) != missing_width
+            )
+    for code in invisible_codes - set(mapping):
+        glyph = glyph_for_name(tt, names[code]) if names[code] else None
+        if (
+            isinstance(existing, Array)
+            and first <= code <= last
+            and code - first < len(existing)
+        ):
+            width = float(existing[code - first])
+        elif isinstance(existing, Array):
+            width = missing_width
+        elif glyph is not None:
+            # Without /Widths, known glyphs retain the font's intrinsic advance.
+            width = round(tt["hmtx"][glyph][0] * scale)
+        elif isinstance(descriptor, Dictionary) and "/MissingWidth" in descriptor:
+            width = float(descriptor.MissingWidth)
+        else:
+            raise ConversionError(
+                f"cannot determine the advance of invisible code {code} in {name}; "
+                "re-export with explicit font /Widths, or pass --font-file with the original font metrics"
+            )
+        widths[code] = width
+        invisible_names[code] = names[code] or ".notdef"
     subset_font(tt, sorted(set(mapping.values()) | {".notdef"}))
     stream, key, subtype = program_stream(pdf, tt)
     ps_name = (
@@ -1580,7 +1637,7 @@ def embed_simple_font(pdf, font, codes, options, notes):
             del descriptor[old]
     descriptor[key] = stream
     descriptor.FontName = Name("/" + ps_name)
-    descriptor.MissingWidth = 0
+    descriptor.MissingWidth = missing_width if unknown_usage else 0
     if subtype == Name.TrueType:
         descriptor.Flags = (int(descriptor.get("/Flags", 0)) | 32) & ~4
     font.BaseFont = Name("/" + ps_name)
@@ -1604,15 +1661,17 @@ def embed_simple_font(pdf, font, codes, options, notes):
         font.Encoding = Dictionary(
             Type=Name.Encoding,
             BaseEncoding=Name.WinAnsiEncoding,
-            Differences=differences_array(differences),
+            Differences=differences_array(differences | invisible_names),
         )
     else:
         font.Encoding = Dictionary(
-            Type=Name.Encoding, Differences=differences_array(mapping)
+            Type=Name.Encoding, Differences=differences_array(mapping | invisible_names)
         )
-    span = range(min(mapping), max(mapping) + 1) if mapping else range(0)
+    span = range(min(widths), max(widths) + 1) if widths else range(0)
     font.FirstChar, font.LastChar = span.start, span.stop - 1
-    font.Widths = Array([widths.get(code, 0) for code in span])
+    font.Widths = Array(
+        [widths.get(code, missing_width if unknown_usage else 0) for code in span]
+    )
     notes.append(f"embedded {path.rsplit('/', 1)[-1]} for {name}")
 
 
@@ -1748,7 +1807,7 @@ def program_of(descriptor):
 
 
 def repair_fonts(pdf, options, notes):
-    usage = font_usage(pdf)
+    usage, invisible = font_usage(pdf)
     for obj in list(pdf.objects):
         if not isinstance(obj, Dictionary) or "/BaseFont" not in obj:
             continue
@@ -1779,7 +1838,14 @@ def repair_fonts(pdf, options, notes):
             continue
         key, program = program_of(obj.get("/FontDescriptor"))
         if program is None:
-            embed_simple_font(pdf, obj, used, options, notes)
+            embed_simple_font(
+                pdf,
+                obj,
+                used,
+                invisible.get(obj.objgen, set()) if invisible is not None else None,
+                options,
+                notes,
+            )
         else:
             repair_embedded_simple_font(pdf, obj, key, program, used, notes)
 

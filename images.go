@@ -97,6 +97,9 @@ func optimizeImages(ctx context.Context, pdf *model.Context, opts options, logf 
 		sd, _ := imageStream(pdf.Table[nr])
 		j := imageJob{objNr: nr, entry: pdf.Table[nr], sd: sd, softMask: softMasks[nr]}
 		j.reason = precheck(&sd)
+		if j.reason == "" && filterKind(sd.FilterPipeline) == "jpeg" {
+			j.reason = jpegDecodeParameters(pdf, &sd)
+		}
 		if j.reason == "" {
 			j.comps, j.device, j.reason = components(pdf, &sd)
 			if defaultColors && j.comps == 3 {
@@ -277,6 +280,38 @@ func imageDecode(pdf *model.Context, sd *types.StreamDict, comps int, mask bool)
 	return invert, ""
 }
 
+// Go's JPEG decoder cannot apply PDF ColorTransform overrides. Preserve any
+// explicit override rather than guessing whether JPEG markers agree with it.
+func jpegDecodeParameters(pdf *model.Context, sd *types.StreamDict) string {
+	obj, err := pdf.Dereference(sd.Dict["DecodeParms"])
+	if err != nil {
+		return "jpeg decode parameters"
+	}
+	if array, ok := obj.(types.Array); ok {
+		if len(array) == 0 {
+			return ""
+		}
+		if len(array) != 1 {
+			return "jpeg decode parameters"
+		}
+		obj, err = pdf.Dereference(array[0])
+		if err != nil {
+			return "jpeg decode parameters"
+		}
+	}
+	if obj == nil {
+		return ""
+	}
+	parms, ok := obj.(types.Dict)
+	if !ok {
+		return "jpeg decode parameters"
+	}
+	if _, explicit := parms["ColorTransform"]; explicit {
+		return "jpeg color transform"
+	}
+	return ""
+}
+
 func reencode(ctx context.Context, job *imageJob, opts options) encoding {
 	sd := &job.sd
 	defer func() { sd.Content = nil }()
@@ -342,6 +377,9 @@ func reencode(ctx context.Context, job *imageJob, opts options) encoding {
 		}
 		if samples == nil || actual != comps {
 			return preserve("jpeg color model")
+		}
+		if int64(len(samples)) != int64(w)*int64(h)*int64(comps) {
+			return preserve("length mismatch")
 		}
 		bits = 8
 	default:
@@ -441,7 +479,7 @@ func reencode(ctx context.Context, job *imageJob, opts options) encoding {
 		img = rgba
 	}
 	// JPEG is usually cheaper. Bound competing encoders by its actual payload.
-	if bits == 8 && !bilevel && !job.softMask && !opts.lossless && listContains(opts.imageCodecs, "jpeg") {
+	if w < 65536 && h < 65536 && bits == 8 && !bilevel && !job.softMask && !opts.lossless && listContains(opts.imageCodecs, "jpeg") {
 		var buf bytes.Buffer
 		if err := jpeg.Encode(contextWriter{ctx, &buf}, img, &jpeg.Options{Quality: opts.imageQuality}); err != nil {
 			return encoding{err: err}
@@ -633,7 +671,15 @@ func jpegSamples(ctx context.Context, img image.Image) ([]byte, int, error) {
 	b := img.Bounds()
 	switch img := img.(type) {
 	case *image.Gray:
-		return img.Pix, 1, nil
+		out := make([]byte, 0, b.Dx()*b.Dy())
+		for y := b.Min.Y; y < b.Max.Y; y++ {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+			offset := img.PixOffset(b.Min.X, y)
+			out = append(out, img.Pix[offset:offset+b.Dx()]...)
+		}
+		return out, 1, nil
 	case *image.YCbCr:
 		out := make([]byte, 0, b.Dx()*b.Dy()*3)
 		for y := b.Min.Y; y < b.Max.Y; y++ {

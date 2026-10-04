@@ -232,6 +232,175 @@ func TestJPEGSamplesYCbCr(t *testing.T) {
 	}
 }
 
+func TestJPEGSamplesGray(t *testing.T) {
+	img := image.NewGray(image.Rect(-3, 5, 70, 78))
+	for i := range img.Pix {
+		img.Pix[i] = byte(i*17 + i/img.Stride)
+	}
+	var encoded bytes.Buffer
+	if err := jpeg.Encode(&encoded, img.SubImage(image.Rect(0, 8, 65, 73)), &jpeg.Options{Quality: 95}); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := jpeg.Decode(&encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, sample := range map[string]*image.Gray{
+		"packed": img, "subimage": img.SubImage(image.Rect(0, 8, 65, 73)).(*image.Gray), "decoded": decoded.(*image.Gray),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var want []byte
+			bounds := sample.Bounds()
+			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+				for x := bounds.Min.X; x < bounds.Max.X; x++ {
+					want = append(want, sample.GrayAt(x, y).Y)
+				}
+			}
+			got, comps, err := jpegSamples(t.Context(), sample)
+			if err != nil || comps != 1 || !bytes.Equal(got, want) {
+				t.Fatalf("gray samples differ: got %d bytes, want %d, components %d, error %v", len(got), len(want), comps, err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			if _, _, err := jpegSamples(ctx, sample); !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancellation: %v", err)
+			}
+		})
+	}
+}
+
+func TestReencodeGrayJPEG(t *testing.T) {
+	for _, white := range []bool{false, true} {
+		t.Run(fmt.Sprintf("white=%v", white), func(t *testing.T) {
+			img := image.NewGray(image.Rect(0, 0, 65, 65))
+			for i := range img.Pix {
+				img.Pix[i] = byte((i%65 + i/65) * 2)
+				if white {
+					img.Pix[i] = 255
+				}
+			}
+			var raw bytes.Buffer
+			if err := jpeg.Encode(&raw, img, &jpeg.Options{Quality: 95}); err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := jpeg.Decode(bytes.NewReader(raw.Bytes()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			data := imagePDF(8, "DeviceGray", "/Filter /DCTDecode", raw.Bytes())
+			data = bytes.Replace(data, []byte("/Width 64 /Height 64"), []byte("/Width 65 /Height 65"), 1)
+			pdf, err := api.ReadAndValidate(t.Context(), bytes.NewReader(data), configuration(""))
+			if err != nil {
+				t.Fatal(err)
+			}
+			stats, err := optimizeImages(t.Context(), pdf, options{imageMemory: 512, imageCodecs: "flate", force: true}, func(string, ...any) {})
+			if err != nil || stats.changed != 1 {
+				t.Fatalf("reencode: %v, %v", stats, err)
+			}
+			sd := firstImage(t, pdf)
+			if err := sd.Decode(); err != nil {
+				t.Fatal(err)
+			}
+			bits := *sd.IntEntry("BitsPerComponent")
+			if !white && bits != 8 || white && bits != 1 {
+				t.Fatalf("unexpected bit depth %d", bits)
+			}
+			for y := range 65 {
+				for x := range 65 {
+					var got byte
+					if bits == 1 {
+						if sd.Content[y*9+x/8]&(0x80>>uint(x%8)) != 0 {
+							got = 255
+						}
+					} else {
+						got = sd.Content[y*65+x]
+					}
+					if want := decoded.(*image.Gray).GrayAt(x, y).Y; got != want {
+						t.Fatalf("pixel (%d,%d): got %d, want %d", x, y, got, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestJPEGColorTransformPreservation(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 64, 64))
+	for i := 0; i < len(img.Pix); i += 4 {
+		img.Pix[i], img.Pix[i+1], img.Pix[i+2], img.Pix[i+3] = 30, 80, 140, 255
+	}
+	var raw bytes.Buffer
+	if err := jpeg.Encode(&raw, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := jpeg.Decode(bytes.NewReader(raw.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _, err := jpegSamplesBaseline(t.Context(), decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, transform := range []int{0, 1} {
+		for _, form := range []string{"direct", "indirect dictionary", "indirect value", "array", "indirect array", "indirect array dictionary", "absent", "empty", "empty array", "null array"} {
+			t.Run(fmt.Sprintf("%d/%s", transform, form), func(t *testing.T) {
+				dict := fmt.Sprintf("<< /ColorTransform %d >>", transform)
+				extra := "/Filter /DCTDecode /DecodeParms "
+				var more []string
+				preserved := true
+				switch form {
+				case "direct":
+					extra += dict
+				case "indirect dictionary":
+					extra += "6 0 R"
+					more = []string{dict}
+				case "indirect value":
+					extra += "<< /ColorTransform 6 0 R >>"
+					more = []string{fmt.Sprint(transform)}
+				case "array":
+					extra = "/Filter [/DCTDecode] /DecodeParms [" + dict + "]"
+				case "indirect array":
+					extra = "/Filter [/DCTDecode] /DecodeParms 6 0 R"
+					more = []string{"[" + dict + "]"}
+				case "indirect array dictionary":
+					extra = "/Filter [/DCTDecode] /DecodeParms [6 0 R]"
+					more = []string{dict}
+				case "absent":
+					extra, preserved = "/Filter /DCTDecode", false
+				case "empty":
+					extra, preserved = extra+"<< >>", false
+				case "empty array":
+					extra, preserved = extra+"[]", false
+				case "null array":
+					extra, preserved = extra+"[null]", false
+				}
+				pdf, err := api.ReadAndValidate(t.Context(), bytes.NewReader(imagePDF(8, "DeviceRGB", extra, raw.Bytes(), more...)), configuration(""))
+				if err != nil {
+					t.Fatal(err)
+				}
+				before := firstImage(t, pdf).Dict.PDFString()
+				stats, err := optimizeImages(t.Context(), pdf, options{imageMemory: 512, imageCodecs: "flate", force: true}, func(string, ...any) {})
+				if err != nil {
+					t.Fatal(err)
+				}
+				sd := firstImage(t, pdf)
+				if preserved {
+					if stats.changed != 0 || stats.preserved["jpeg color transform"] != 1 || !bytes.Equal(sd.Raw, raw.Bytes()) || sd.Dict.PDFString() != before {
+						t.Fatalf("explicit transform changed: %v, %s", stats, sd.Dict)
+					}
+				} else {
+					if stats.changed != 1 || *sd.NameEntry("Filter") != "FlateDecode" {
+						t.Fatalf("default transform not reencoded: %v", stats)
+					}
+					if err := sd.Decode(); err != nil || !bytes.Equal(sd.Content, want) {
+						t.Fatalf("default transform changed samples: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func BenchmarkJPEGSamplesYCbCr(b *testing.B) {
 	img := image.NewYCbCr(image.Rect(0, 0, 512, 512), image.YCbCrSubsampleRatio420)
 	for j, plane := range [][]byte{img.Y, img.Cb, img.Cr} {
