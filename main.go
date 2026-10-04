@@ -512,7 +512,7 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 		}
 	}
 	// Optimize structure first to avoid re-encoding duplicate image objects.
-	if err := api.OptimizeContext(ctx, pdf); err != nil {
+	if err := optimizeDocument(ctx, pdf); err != nil {
 		return nil, err
 	}
 	if opts.images {
@@ -528,6 +528,10 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 		}
 	}
 	if err := transformDocument(ctx, pdf, opts); err != nil {
+		return nil, err
+	}
+	// An initial external rewrite may leave non-PieceInfo aliases lazy too.
+	if err := materializeWriteRoots(ctx, pdf); err != nil {
 		return nil, err
 	}
 	if err := deduplicateStreams(ctx, pdf); err != nil {
@@ -561,6 +565,9 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 			defer in.Close()
 			final, err := api.ReadAndValidate(ctx, in, configuration(""))
 			if err != nil {
+				return err
+			}
+			if err := materializeWriteRoots(ctx, final); err != nil {
 				return err
 			}
 			if err := deduplicateStreams(ctx, final); err != nil {

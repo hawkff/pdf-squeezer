@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
@@ -234,6 +235,50 @@ func TestReencodeMatchesFullCandidates(t *testing.T) {
 						}
 					}
 				}
+			}
+		}
+	}
+}
+
+func TestReencodeJPEGDimensionLimit(t *testing.T) {
+	for _, size := range []image.Point{{X: 65536, Y: 1}, {X: 1, Y: 65536}} {
+		for _, comps := range []int{1, 3} {
+			for _, codecs := range []string{"flate,jpeg", "flate", "jpeg"} {
+				t.Run(fmt.Sprintf("%dx%d/%d/%s", size.X, size.Y, comps, codecs), func(t *testing.T) {
+					samples := bytes.Repeat([]byte{30}, size.X*size.Y*comps)
+					space := "DeviceGray"
+					if comps == 3 {
+						space = "DeviceRGB"
+						for i := 1; i < len(samples); i += 3 {
+							samples[i] = 80
+						}
+					}
+					sd := types.StreamDict{
+						Dict: types.Dict{"Width": types.Integer(size.X), "Height": types.Integer(size.Y), "BitsPerComponent": types.Integer(8), "ColorSpace": types.Name(space), "Filter": types.Name("FlateDecode")},
+						Raw:  deflate(t, samples), FilterPipeline: []types.PDFFilter{{Name: "FlateDecode"}},
+					}
+					before, raw := sd.Dict.PDFString(), bytes.Clone(sd.Raw)
+					job := imageJob{comps: comps, device: true, sd: sd}
+					out := reencode(t.Context(), &job, options{imageCodecs: codecs, imageQuality: 75, force: true})
+					if out.err != nil {
+						t.Fatal(out.err)
+					}
+					if codecs == "jpeg" {
+						if out.reason != "no permitted codec" || !bytes.Equal(job.sd.Raw, raw) || job.sd.Dict.PDFString() != before {
+							t.Fatalf("JPEG-only did not preserve: %+v", out)
+						}
+						return
+					}
+					if out.reason != "" || out.filter != "FlateDecode" {
+						t.Fatalf("Flate not selected: %+v", out)
+					}
+					entry := &model.XRefTableEntry{}
+					applyEncoding(entry, sd, out)
+					result := entry.Object.(types.StreamDict)
+					if err := result.Decode(); err != nil || !bytes.Equal(result.Content, samples) {
+						t.Fatalf("Flate changed samples: %v", err)
+					}
+				})
 			}
 		}
 	}

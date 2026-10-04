@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -180,6 +181,240 @@ func TestFinalDeduplicationAcrossLosslessFilters(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("got %d image objects, wanted one", count)
+	}
+}
+
+func TestStreamDeduplicationMixedFilters(t *testing.T) {
+	data := bytes.Repeat([]byte("equivalent stream samples\n"), 256)
+	compressed := deflate(t, data)
+	pdf, err := api.ReadAndValidate(t.Context(), bytes.NewReader(testPDF(0)), configuration(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refs types.Array
+	for _, sd := range []types.StreamDict{
+		{Raw: data},
+		{Raw: []byte(hex.EncodeToString(data) + ">"), FilterPipeline: []types.PDFFilter{{Name: "ASCIIHexDecode"}}},
+		{Raw: compressed, FilterPipeline: []types.PDFFilter{{Name: "FlateDecode"}}},
+		{Raw: []byte(hex.EncodeToString(compressed) + ">"), FilterPipeline: []types.PDFFilter{{Name: "ASCIIHexDecode"}, {Name: "FlateDecode"}}},
+		{Raw: data}, // Exact alias of the first stream must follow the smaller winner.
+	} {
+		sd.Dict = types.Dict{"TestGroup": types.Name("mixed")}
+		if len(sd.FilterPipeline) > 0 {
+			var filters types.Array
+			for _, filter := range sd.FilterPipeline {
+				filters = append(filters, types.Name(filter.Name))
+			}
+			sd.Dict["Filter"] = filters
+		}
+		ref, err := pdf.IndRefForNewObject(sd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		refs = append(refs, *ref)
+	}
+	winner := refs[2]
+	// Identical opaque bytes with different codec parameters must stay distinct.
+	for _, transform := range []int{0, 1} {
+		parms := types.Dict{"ColorTransform": types.Integer(transform)}
+		sd := types.StreamDict{Dict: types.Dict{"TestGroup": types.Name("mixed"), "Filter": types.Name("DCTDecode"), "DecodeParms": parms}, Raw: compressed, FilterPipeline: []types.PDFFilter{{Name: "DCTDecode", DecodeParms: parms}}}
+		ref, err := pdf.IndRefForNewObject(sd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		refs = append(refs, *ref)
+	}
+	pdf.RootDict["TestStreams"] = refs
+	if err := deduplicateStreams(t.Context(), pdf); err != nil {
+		t.Fatal(err)
+	}
+	for i, ref := range refs[:5] {
+		if ref != winner {
+			t.Errorf("mixed-filter stream %d did not select the smallest encoding", i)
+		}
+	}
+	if refs[5] == refs[6] || refs[5] == winner || refs[6] == winner {
+		t.Fatal("specialized codec parameters were discarded")
+	}
+}
+
+func TestPieceInfoTraversalLimits(t *testing.T) {
+	var nested types.Object = types.Dict{}
+	for range 102 {
+		nested = types.Dict{"Nested": nested}
+	}
+	pdf := &model.Context{XRefTable: &model.XRefTable{Table: map[int]*model.XRefTableEntry{
+		1: {Object: types.Dict{"PieceInfo": nested}},
+	}}}
+	if err := transformDocument(t.Context(), pdf, options{}); err == nil || !strings.Contains(err.Error(), "materialization limit") {
+		t.Fatalf("deep private graph was not bounded: %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := transformDocument(ctx, pdf, options{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation lost: %v", err)
+	}
+}
+
+func TestMaterializeWriteRootsLimits(t *testing.T) {
+	var deep types.Object = types.Dict{}
+	for range 102 {
+		deep = types.Dict{"Nested": deep}
+	}
+	stream := types.StreamDict{Dict: types.Dict{"Back": *types.NewIndirectRef(1, 0)}, Raw: []byte("not Flate data"), FilterPipeline: []types.PDFFilter{{Name: "FlateDecode"}}}
+	root := types.Dict{"Stream": *types.NewIndirectRef(2, 0)}
+	pdf := &model.Context{XRefTable: &model.XRefTable{Root: types.NewIndirectRef(1, 0), Table: map[int]*model.XRefTableEntry{
+		1: {Object: root}, 2: {Object: stream}, 3: {Object: deep},
+	}}}
+	if err := materializeWriteRoots(t.Context(), pdf); err != nil {
+		t.Fatalf("walk followed an unreachable graph or decoded a stream: %v", err)
+	}
+	if sd := pdf.Table[2].Object.(types.StreamDict); sd.Content != nil || !bytes.Equal(sd.Raw, stream.Raw) {
+		t.Fatal("materialization changed stream payloads")
+	}
+	pdf.Info = types.NewIndirectRef(3, 0)
+	if err := materializeWriteRoots(t.Context(), pdf); err == nil || !strings.Contains(err.Error(), "materialization limit") {
+		t.Fatalf("reachable Info graph was not bounded: %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := materializeWriteRoots(ctx, pdf); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation lost: %v", err)
+	}
+}
+
+func TestMaterializeLongIndirectChain(t *testing.T) {
+	const count = 256
+	pdf := &model.Context{XRefTable: &model.XRefTable{Table: map[int]*model.XRefTableEntry{}}}
+	for n := 1; n < count; n++ {
+		pdf.Table[n] = &model.XRefTableEntry{Object: types.Dict{"Next": types.Array{*types.NewIndirectRef(n+1, 0)}}}
+	}
+	stream := types.StreamDict{Dict: types.Dict{"Back": *types.NewIndirectRef(1, 0)}, Raw: []byte("encoded payload"), FilterPipeline: []types.PDFFilter{{Name: "FlateDecode"}}}
+	pdf.Table[count] = &model.XRefTableEntry{Object: stream}
+	seen := map[int]bool{}
+	if err := materializeObjectGraph(t.Context(), pdf, *types.NewIndirectRef(1, 0), seen, 0); err != nil {
+		t.Fatalf("long indirect chain refused: %v", err)
+	}
+	if len(seen) != count {
+		t.Fatalf("visited %d indirect objects, want %d", len(seen), count)
+	}
+	if sd := pdf.Table[count].Object.(types.StreamDict); sd.Content != nil || !bytes.Equal(sd.Raw, stream.Raw) {
+		t.Fatal("materialization decoded or changed the terminal stream")
+	}
+}
+
+func TestLongIndirectChainRewrite(t *testing.T) {
+	const count = 256
+	const marker = "synthetic long-chain private value"
+	const payload = "synthetic long-chain child stream"
+	content, form := "/Fm Do\n", "q Q\n"
+	objects := []string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] /Resources << /XObject << /Fm 5 0 R >> >> /Contents 4 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		fmt.Sprintf("<< /Subtype /Form /BBox [0 0 64 64] /Resources << >> /Chain 6 0 R /Length %d >>\nstream\n%sendstream", len(form), form),
+	}
+	for n := range count {
+		next := fmt.Sprintf("/Next %d 0 R", n+7)
+		if n == count-1 {
+			next = fmt.Sprintf("/Value (%s) /Payload %d 0 R", marker, count+6)
+		}
+		objects = append(objects, fmt.Sprintf("<< /Index %d %s >>", n, next))
+	}
+	objects = append(objects, fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(payload), payload))
+	for _, rewrite := range []string{"native", "encrypt", "monochrome"} {
+		t.Run(rewrite, func(t *testing.T) {
+			if rewrite == "monochrome" && os.Getenv("PDF_SQUEEZER_INTEGRATION") != "1" {
+				t.Skip("optional tool integration")
+			}
+			dir := t.TempDir()
+			input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+			writeFile(t, input, buildPDF(64000, objects...))
+			args, password := []string{"--force-recompression"}, ""
+			if rewrite == "encrypt" {
+				password = "example-owner"
+				owner := filepath.Join(dir, "owner.txt")
+				writeFile(t, owner, []byte(password+"\n"))
+				args = append(args, "--encrypt-owner-file", owner)
+			} else if rewrite == "monochrome" {
+				args = append(args, "--mono-codecs", "ccitt")
+			}
+			if err := run(t.Context(), append(args, "-o", output, input), io.Discard, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			pdf := readContext(t, output, password)
+			if rewrite == "encrypt" {
+				if pdf.Encrypt == nil || bytes.Contains(readFile(t, output), []byte(marker)) || bytes.Contains(readFile(t, output), []byte(payload)) {
+					t.Fatal("long-chain private data was not encrypted")
+				}
+			}
+			forms := pageFormResources(t, pdf)
+			sd, _, err := pdf.DereferenceStreamDict(forms["Fm"])
+			if err != nil || sd == nil {
+				t.Fatalf("form missing: %v", err)
+			}
+			ref := sd.Dict["Chain"]
+			var tail types.Dict
+			for n := range count {
+				tail, err = pdf.DereferenceDict(ref)
+				if err != nil || tail["Index"] != types.Integer(n) {
+					t.Fatalf("chain node %d changed: %v", n, err)
+				}
+				ref = tail["Next"]
+			}
+			if value, err := pdf.DereferenceText(tail["Value"]); err != nil || value != marker {
+				t.Fatalf("terminal private value changed: %q, %v", value, err)
+			}
+			child, _, err := pdf.DereferenceStreamDict(tail["Payload"])
+			if err != nil || child == nil {
+				t.Fatalf("terminal private stream missing: %v", err)
+			}
+			if err := child.Decode(); err != nil || string(child.Content) != payload {
+				t.Fatalf("terminal private stream changed: %v", err)
+			}
+		})
+	}
+}
+
+func TestStreamDeduplicationSkipsSingletonDecode(t *testing.T) {
+	compressed := deflate(t, bytes.Repeat([]byte("x"), 8<<20))
+	pdf := singletonStreams(compressed, 1)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if err := deduplicateStreams(t.Context(), pdf); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	// Decoding this stream needs at least 8 MiB. Dictionary grouping should
+	// allocate less than 1 MiB, without a timing-dependent assertion.
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated >= 1<<20 {
+		t.Fatalf("singleton allocated %d bytes; it should not be decoded", allocated)
+	}
+}
+
+func singletonStreams(raw []byte, count int) *model.Context {
+	pdf := &model.Context{XRefTable: &model.XRefTable{Table: map[int]*model.XRefTableEntry{}}}
+	for n := range count {
+		pdf.Table[n+1] = &model.XRefTableEntry{Object: types.StreamDict{
+			Dict: types.Dict{"TestGroup": types.Integer(n), "Filter": types.Name("FlateDecode")},
+			Raw:  raw, FilterPipeline: []types.PDFFilter{{Name: "FlateDecode"}},
+		}}
+	}
+	return pdf
+}
+
+func BenchmarkStreamDeduplicationSingletons(b *testing.B) {
+	raw, err := deflateSamples(b.Context(), bytes.Repeat([]byte("x"), 256<<10), false, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	pdf := singletonStreams(raw, 16)
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := deduplicateStreams(b.Context(), pdf); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -843,19 +1078,19 @@ func TestLosslessKeepsRGBColorSpace(t *testing.T) {
 }
 
 func TestStripDoesNotRemoveNamedResources(t *testing.T) {
-	for _, name := range []string{"B", "Metadata"} {
+	for _, name := range []string{"B", "Metadata", "PieceInfo"} {
 		t.Run(name, func(t *testing.T) {
 			content := "q 64 0 0 64 0 0 cm /" + name + " Do Q"
 			pdf := buildPDF(0,
 				"<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
 				"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] /Resources << /XObject 6 0 R >> /Contents 4 0 R >>",
 				fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
-				"<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /BitsPerComponent 8 /ColorSpace /DeviceGray /Length 4096 >>\nstream\n"+strings.Repeat("x", 4096)+"\nendstream",
+				"<< /Subtype /Image /Width 64 /Height 64 /BitsPerComponent 8 /ColorSpace /DeviceGray /Length 4096 >>\nstream\n"+strings.Repeat("x", 4096)+"\nendstream",
 				"<< /"+name+" 5 0 R >>")
 			dir := t.TempDir()
 			input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
 			writeFile(t, input, pdf)
-			if err := run(t.Context(), []string{"--strip", "threads,metadata", "-o", output, input}, io.Discard, io.Discard); err != nil {
+			if err := run(t.Context(), []string{"--strip", "threads,metadata,piece-info", "-o", output, input}, io.Discard, io.Discard); err != nil {
 				t.Fatal(err)
 			}
 			firstImage(t, readContext(t, output, ""))

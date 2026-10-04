@@ -155,6 +155,412 @@ func TestPrivacy(t *testing.T) {
 	}
 }
 
+func TestMetadataStreamTypeRemoval(t *testing.T) {
+	for _, typeEntry := range []string{"/Type /Metadata", "/Type 8 0 R", ""} {
+		for _, flags := range [][]string{{"--privacy"}, {"--strip", "metadata"}, {"--metadata", "Title=Updated"}, {"--timestamps", "now"}, {"--timestamps", "modified"}} {
+			t.Run(typeEntry+"/"+strings.Join(flags, " "), func(t *testing.T) {
+				dir := t.TempDir()
+				input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+				writeFile(t, input, metadataPDFWithType(typeEntry))
+				if err := run(t.Context(), append(flags, "-o", output, input), io.Discard, io.Discard); err != nil {
+					t.Fatal(err)
+				}
+				pdf := readContext(t, output, "")
+				for n, entry := range pdf.Table {
+					if entry == nil || entry.Free {
+						continue
+					}
+					switch o := entry.Object.(type) {
+					case types.Dict:
+						if _, found := o["Metadata"]; found {
+							t.Errorf("object %d retains XMP reference", n)
+						}
+					case types.StreamDict:
+						if err := o.Decode(); err == nil && bytes.Contains(o.Content, []byte("xpacket")) {
+							t.Errorf("object %d retains identifying XMP bytes", n)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestMetadataOnUntypedAnnotation(t *testing.T) {
+	for _, subtype := range []string{"/XML", "6 0 R", "/XMP"} {
+		for _, flags := range [][]string{{"--privacy"}, {"--strip", "metadata"}, {"--metadata", "Title=Updated"}, {"--timestamps", "now"}, {"--timestamps", "modified"}} {
+			t.Run(subtype+"/"+strings.Join(flags, " "), func(t *testing.T) {
+				const xmp = "<private>Identifying annotation metadata</private>"
+				dir := t.TempDir()
+				input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+				writeFile(t, input, buildPDF(0,
+					"<< /Type /Catalog /Pages 2 0 R >>",
+					"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+					"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] /Resources << >> /Annots [4 0 R] >>",
+					"<< /Subtype /Text /Rect [0 0 10 10] /Contents (Note) /Metadata 5 0 R >>",
+					fmt.Sprintf("<< /Subtype %s /Length %d >>\nstream\n%s\nendstream", subtype, len(xmp), xmp),
+					"/XML"))
+				if err := run(t.Context(), append(flags, "-o", output, input), io.Discard, io.Discard); err != nil {
+					t.Fatal(err)
+				}
+				pdf := readContext(t, output, "")
+				foundAnnotation := false
+				for _, entry := range pdf.Table {
+					if entry == nil || entry.Free {
+						continue
+					}
+					switch o := entry.Object.(type) {
+					case types.Dict:
+						if o["Subtype"] == types.Name("Text") {
+							foundAnnotation = true
+							if _, found := o["Metadata"]; found {
+								t.Error("untyped annotation retains XMP reference")
+							}
+						}
+					case types.StreamDict:
+						if err := o.Decode(); err == nil && bytes.Contains(o.Content, []byte(xmp)) {
+							t.Error("identifying annotation XMP remains")
+						}
+					}
+				}
+				if !foundAnnotation {
+					t.Fatal("annotation removed instead of its metadata")
+				}
+			})
+		}
+	}
+}
+
+func TestPieceInfoPreservation(t *testing.T) {
+	for _, flags := range [][]string{nil, {"--compression", "light"}, {"--compression", "balanced"}, {"--compression", "medium"}, {"--compression", "strong"}, {"--compression", "heavy"}, {"--mono-codecs", "ccitt"}, {"--privacy"}, {"--strip", "piece-info"}} {
+		t.Run(strings.Join(flags, " "), func(t *testing.T) {
+			if len(flags) == 2 && listContains("medium,strong,heavy,ccitt", flags[1]) && os.Getenv("PDF_SQUEEZER_INTEGRATION") != "1" {
+				t.Skip("optional tool integration")
+			}
+			dir := t.TempDir()
+			input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+			original := pieceInfoPDF()
+			writeFile(t, input, original)
+			if err := run(t.Context(), append(flags, "-o", output, input), io.Discard, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Equal(readFile(t, output), original) {
+				t.Fatal("size fallback hid the optimization result")
+			}
+			if os.Getenv("PDF_SQUEEZER_INTEGRATION") == "1" {
+				if messages, err := exec.Command("qpdf", "--check", output).CombinedOutput(); err != nil {
+					t.Fatalf("qpdf check: %v\n%s", err, messages)
+				}
+			}
+			pdf := readContext(t, output, "")
+			page, err := pdf.DereferenceDict(pdf.RootDict["TestPage"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			form, _, err := pdf.DereferenceStreamDict(pdf.RootDict["TestForm"])
+			if err != nil || form == nil {
+				t.Fatalf("form missing: %v", err)
+			}
+			stripped := len(flags) > 0 && (flags[0] == "--privacy" || flags[0] == "--strip")
+			for i, owner := range []types.Dict{pdf.RootDict, page, form.Dict} {
+				if stripped {
+					if _, found := owner["PieceInfo"]; found {
+						t.Errorf("owner %d retains PieceInfo", i)
+					}
+					continue
+				}
+				piece, err := pdf.DereferenceDict(owner["PieceInfo"])
+				if err != nil || piece == nil {
+					t.Fatalf("owner %d lost PieceInfo: %v", i, err)
+				}
+				app, err := pdf.DereferenceDict(piece["ExampleApp"])
+				if err != nil || app == nil {
+					t.Fatalf("owner %d lost application data: %v", i, err)
+				}
+				private, _, err := pdf.DereferenceStreamDict(app["Private"])
+				if err != nil || private == nil {
+					t.Fatalf("owner %d lost private stream %v: %v", i, app["Private"], err)
+				}
+				if err := private.Decode(); err != nil || string(private.Content) != fmt.Sprintf("private-%d", i) {
+					t.Fatalf("owner %d private bytes changed: %v", i, err)
+				}
+				if private.Dict["Shared"] != pdf.RootDict["PrivateAlias"] {
+					t.Fatal("private stream graph lost its shared reference")
+				}
+			}
+			shared, _, err := pdf.DereferenceStreamDict(pdf.RootDict["PrivateAlias"])
+			if err != nil || shared == nil {
+				t.Fatalf("shared stream freed: %v", err)
+			}
+			if err := shared.Decode(); err != nil || string(shared.Content) != "shared-private" {
+				t.Fatalf("shared private bytes changed: %v", err)
+			}
+			if stripped {
+				for _, entry := range pdf.Table {
+					if entry == nil || entry.Free {
+						continue
+					}
+					if sd, ok := entry.Object.(types.StreamDict); ok {
+						if err := sd.Decode(); err == nil && bytes.Contains(sd.Content, []byte("private-")) {
+							t.Fatal("stripped private stream remains reachable")
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestPieceInfoEncryption(t *testing.T) {
+	const marker = "0123456789abcdef0123456789abcdef"
+	const payload = "synthetic private child stream"
+	content, form := "/Fm Do\n", "q Q\n"
+	dir := t.TempDir()
+	input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "encrypted.pdf")
+	owner, user := filepath.Join(dir, "owner.txt"), filepath.Join(dir, "user.txt")
+	writeFile(t, owner, []byte("example-owner\n"))
+	writeFile(t, user, []byte("example-reader\n"))
+	writeFile(t, input, buildPDF(64000,
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] /Resources << /XObject << /Fm 5 0 R >> >> /Contents 4 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		fmt.Sprintf("<< /Subtype /Form /BBox [0 0 64 64] /Resources << >> /PieceInfo 6 0 R /LastModified 9 0 R /Length %d >>\nstream\n%sendstream", len(form), form),
+		fmt.Sprintf("<< /App << /LastModified 9 0 R /Private (%s) /Payload 7 0 R >> >>", marker),
+		"<< /Stream 8 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(payload), payload),
+		"(D:20260101120000Z)"))
+	if err := run(t.Context(), []string{"--encrypt-user-file", user, "--encrypt-owner-file", owner, "-o", output, input}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, plaintext := range []string{marker, payload} {
+		if bytes.Contains(readFile(t, output), []byte(plaintext)) {
+			t.Errorf("encrypted output exposes synthetic plaintext %q", plaintext)
+		}
+	}
+	pdf := readContext(t, output, "example-owner")
+	if pdf.Encrypt == nil || !pdf.AES4Strings || len(pdf.EncKey) != 32 {
+		t.Fatal("expected AES-256 encryption")
+	}
+	if os.Getenv("PDF_SQUEEZER_INTEGRATION") == "1" {
+		decrypted := filepath.Join(dir, "decrypted.pdf")
+		if messages, err := exec.Command("qpdf", "--password-file="+owner, "--decrypt", output, decrypted).CombinedOutput(); err != nil {
+			t.Fatalf("independent decryption: %v\n%s", err, messages)
+		}
+		pdf = readContext(t, decrypted, "")
+	}
+	forms := pageFormResources(t, pdf)
+	sd, _, err := pdf.DereferenceStreamDict(forms["Fm"])
+	if err != nil || sd == nil {
+		t.Fatalf("form missing: %v", err)
+	}
+	piece, err := pdf.DereferenceDict(sd.Dict["PieceInfo"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := pdf.DereferenceDict(piece["App"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, err := pdf.DereferenceText(app["Private"]); err != nil || value != marker {
+		t.Errorf("decrypted private value = %q: %v", value, err)
+	}
+	if value, err := pdf.DereferenceText(app["LastModified"]); err != nil || value != "D:20260101120000Z" {
+		t.Errorf("decrypted private date = %q: %v", value, err)
+	}
+	private, err := pdf.DereferenceDict(app["Payload"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, _, err := pdf.DereferenceStreamDict(private["Stream"])
+	if err != nil || child == nil {
+		t.Fatalf("decrypted private child stream missing: %v", err)
+	}
+	if err := child.Decode(); err != nil || string(child.Content) != payload {
+		t.Fatalf("decrypted private child bytes changed: %v", err)
+	}
+}
+
+func TestPieceInfoDistinctFormBindings(t *testing.T) {
+	content, form := "/A Do /B Do\n", "q Q\n"
+	objects := []string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] /Resources << /XObject << /A 5 0 R /B 6 0 R >> >> /Contents 4 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+	}
+	for _, value := range []string{"private-A", "private-B"} {
+		objects = append(objects, fmt.Sprintf("<< /Subtype /Form /BBox [0 0 64 64] /Resources << >> /LastModified (D:20260101120000Z) /PieceInfo << /App << /LastModified (D:20260101120000Z) /Private (%s) >> >> /pdfSqueezerPieceInfo 99 /pdfSqueezerPieceInfo_ 88 /Length %d >>\nstream\n%sendstream", value, len(form), form))
+	}
+	dir := t.TempDir()
+	input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+	writeFile(t, input, buildPDF(64000, objects...))
+	if err := run(t.Context(), []string{"-o", output, input}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	pdf := readContext(t, output, "")
+	forms := pageFormResources(t, pdf)
+	if forms["A"] == forms["B"] {
+		t.Error("distinct private data merged into one resource binding")
+	}
+	for _, name := range []string{"A", "B"} {
+		sd, _, err := pdf.DereferenceStreamDict(forms[name])
+		if err != nil || sd == nil {
+			t.Fatalf("form %s missing: %v", name, err)
+		}
+		piece, err := pdf.DereferenceDict(sd.Dict["PieceInfo"])
+		if err != nil {
+			t.Fatal(err)
+		}
+		app, err := pdf.DereferenceDict(piece["App"])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if value, err := pdf.DereferenceText(app["Private"]); err != nil || value != "private-"+name {
+			t.Errorf("resource %s private value = %q: %v", name, value, err)
+		}
+		if sd.Dict["pdfSqueezerPieceInfo"] != types.Integer(99) || sd.Dict["pdfSqueezerPieceInfo_"] != types.Integer(88) {
+			t.Error("existing form extension entries changed")
+		}
+		if _, found := sd.Dict["pdfSqueezerPieceInfo__"]; found {
+			t.Error("temporary form identity escaped into the output")
+		}
+	}
+}
+
+func TestPieceInfoStripSharedLazyGraph(t *testing.T) {
+	requireTool(t, "qpdf")
+	content, form := "/Fm Do\n", "q Q\n"
+	const payload = "shared lazy dictionary child"
+	const marker = "0123456789abcdef0123456789abcdef"
+	for _, flags := range [][]string{{"--strip", "piece-info"}, {"--privacy"}} {
+		for _, rewrite := range []string{"native", "encrypt", "monochrome"} {
+			t.Run(strings.Join(flags, " ")+"/"+rewrite, func(t *testing.T) {
+				if rewrite == "monochrome" && os.Getenv("PDF_SQUEEZER_INTEGRATION") != "1" {
+					t.Skip("optional tool integration")
+				}
+				dir := t.TempDir()
+				plain, input, output := filepath.Join(dir, "plain.pdf"), filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+				writeFile(t, plain, buildPDF(0,
+					"<< /Type /Catalog /Pages 2 0 R /PieceInfo 6 0 R >>",
+					"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+					"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] /Resources << /XObject << /Fm 5 0 R >> >> /Contents 4 0 R >>",
+					fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+					fmt.Sprintf("<< /Subtype /Form /BBox [0 0 64 64] /Resources << >> /SharedPrivate 7 0 R /Length %d >>\nstream\n%sendstream", len(form), form),
+					"<< /App << /LastModified (D:20260101120000Z) /Private 7 0 R >> >>",
+					fmt.Sprintf("<< /Value (%s) /Payload 8 0 R >>", marker),
+					fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(payload), payload)))
+				if messages, err := exec.Command("qpdf", "--object-streams=generate", plain, input).CombinedOutput(); err != nil {
+					t.Fatalf("prepare object streams: %v\n%s", err, messages)
+				}
+				before := readContext(t, input, "")
+				forms := pageFormResources(t, before)
+				sd, _, err := before.DereferenceStreamDict(forms["Fm"])
+				if err != nil || sd == nil {
+					t.Fatalf("form missing: %v", err)
+				}
+				shared := sd.Dict["SharedPrivate"].(types.IndirectRef)
+				if _, lazy := before.Table[shared.ObjectNumber.Value()].Object.(types.LazyObjectStreamObject); !lazy {
+					t.Fatal("fixture did not retain a lazy private dictionary")
+				}
+				args := append([]string{}, flags...)
+				password := ""
+				if rewrite == "encrypt" {
+					password = "example-owner"
+					owner := filepath.Join(dir, "owner.txt")
+					writeFile(t, owner, []byte(password+"\n"))
+					args = append(args, "--encrypt-owner-file", owner)
+				}
+				if rewrite == "monochrome" {
+					args = append(args, "--mono-codecs", "ccitt")
+				}
+				if err := run(t.Context(), append(args, "-o", output, input), io.Discard, io.Discard); err != nil {
+					t.Fatal(err)
+				}
+				if rewrite == "encrypt" {
+					for _, plaintext := range []string{marker, payload} {
+						if bytes.Contains(readFile(t, output), []byte(plaintext)) {
+							t.Errorf("encrypted shared graph exposes synthetic plaintext %q", plaintext)
+						}
+					}
+				}
+				pdf := readContext(t, output, password)
+				if rewrite == "encrypt" && pdf.Encrypt == nil {
+					t.Fatal("shared graph output is not encrypted")
+				}
+				if _, found := pdf.RootDict["PieceInfo"]; found {
+					t.Fatal("PieceInfo was not stripped")
+				}
+				forms = pageFormResources(t, pdf)
+				sd, _, err = pdf.DereferenceStreamDict(forms["Fm"])
+				if err != nil || sd == nil {
+					t.Fatalf("form missing: %v", err)
+				}
+				private, err := pdf.DereferenceDict(sd.Dict["SharedPrivate"])
+				if err != nil {
+					t.Fatal(err)
+				}
+				if value, err := pdf.DereferenceText(private["Value"]); err != nil || value != marker {
+					t.Errorf("shared private value = %q: %v", value, err)
+				}
+				child, _, err := pdf.DereferenceStreamDict(private["Payload"])
+				if err != nil || child == nil {
+					t.Fatalf("shared private child lost after stripping: %v", err)
+				}
+				if err := child.Decode(); err != nil || string(child.Content) != payload {
+					t.Fatalf("shared private child bytes changed: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func pageFormResources(t *testing.T, pdf *model.Context) types.Dict {
+	t.Helper()
+	pages, err := pdf.DereferenceDict(pdf.RootDict["Pages"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	kids, err := pdf.DereferenceArray(pages["Kids"])
+	if err != nil || len(kids) != 1 {
+		t.Fatalf("expected one page: %v", err)
+	}
+	page, err := pdf.DereferenceDict(kids[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources, err := pdf.DereferenceDict(page["Resources"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	forms, err := pdf.DereferenceDict(resources["XObject"])
+	if err != nil || forms == nil {
+		t.Fatalf("XObject resources missing: %v", err)
+	}
+	return forms
+}
+
+func pieceInfoPDF() []byte {
+	content, form := "/Fm Do\n", "q Q\n"
+	objects := []string{
+		"<< /Type /Catalog /Pages 2 0 R /PieceInfo 6 0 R /TestPage 3 0 R /TestForm 5 0 R /PrivateAlias 12 0 R /Names << /EmbeddedFiles << /Names [(private.bin) 13 0 R] >> >> >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] /Resources << /XObject << /Fm 5 0 R >> >> /Contents 4 0 R /PieceInfo 7 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		fmt.Sprintf("<< /Subtype /Form /BBox [0 0 64 64] /Resources << >> /PieceInfo 8 0 R /Length %d >>\nstream\n%sendstream", len(form), form),
+	}
+	for i := range 3 {
+		objects = append(objects, fmt.Sprintf("<< /ExampleApp << /LastModified (D:20260101120000Z) /Private %d 0 R >> >>", 9+i))
+	}
+	for i := range 3 {
+		data := fmt.Sprintf("private-%d", i)
+		objects = append(objects, fmt.Sprintf("<< /Shared 12 0 R /Back 6 0 R /Length %d >>\nstream\n%s\nendstream", len(data), data))
+	}
+	objects = append(objects, "<< /Type /EmbeddedFile /Length 14 >>\nstream\nshared-private\nendstream",
+		"<< /Type /Filespec /F (private.bin) /EF << /F 12 0 R >> >>")
+	return buildPDF(64000, objects...)
+}
+
 func TestRejectsInvalidArguments(t *testing.T) {
 	for _, args := range [][]string{
 		{}, {"one.pdf", "two.pdf"}, {"--engine", "other", "input.pdf"},
@@ -363,7 +769,11 @@ func brokenImagePDF() []byte {
 // metadataPDF carries metadata in every place the privacy flag must clear: the Info dict,
 // a document XMP stream, and page-level XMP, piece info, and modification date.
 func metadataPDF() []byte {
-	content := "BT /F1 12 Tf 20 100 Td (Squeeze this PDF.) Tj ET\n"
+	return metadataPDFWithType("/Type /Metadata")
+}
+
+func metadataPDFWithType(typeEntry string) []byte {
+	content := "BT /F1 12 Tf 20 100 Td (Squeeze this PDF.) Tj ET /Fm Do\n"
 	xmp := `<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/">` +
 		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" ` +
 		`xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:creator><rdf:Seq><rdf:li>Jane Example</rdf:li></rdf:Seq>` +
@@ -371,12 +781,14 @@ func metadataPDF() []byte {
 	pdf := buildPDF(0,
 		"<< /Type /Catalog /Pages 2 0 R /Metadata 7 0 R >>",
 		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R"+
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> /XObject << /Fm 9 0 R >> >> /Contents 5 0 R"+
 			" /Metadata 7 0 R /LastModified (D:20260101120000Z) /PieceInfo << /ExampleApp << /LastModified (D:20260101120000Z) /Private (Trace) >> >> >>",
 		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
 		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
 		"<< /Title (Secret Report) /Author (Jane Example) /Creator (Example Writer) /Producer (Example Writer) /CreationDate (D:20260101120000Z) /ModDate (D:20260101120000Z) >>",
-		fmt.Sprintf("<< /Type /Metadata /Subtype /XML /Length %d >>\nstream\n%s\nendstream", len(xmp), xmp),
+		fmt.Sprintf("<< %s /Subtype /XML /Length %d >>\nstream\n%s\nendstream", typeEntry, len(xmp), xmp),
+		"/Metadata",
+		"<< /Subtype /Form /BBox [0 0 200 200] /Resources << >> /Metadata 7 0 R /Length 4 >>\nstream\nq Q\nendstream",
 	)
 	// The trailer follows the xref table, so adding /Info there leaves the offsets intact.
 	return bytes.Replace(pdf, []byte("/Root 1 0 R"), []byte("/Root 1 0 R /Info 6 0 R"), 1)

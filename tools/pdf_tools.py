@@ -151,6 +151,7 @@ def placements(pdf, lossless=False):
         active = active | {key}
         instructions = pikepdf.parse_content_stream(owner)
         streams[key] = (owner, resources, instructions)
+        collect_images(resources.get("/Pattern"), blocked)
         stack, path, pending_clip = [], None, False
         borrowed_key = None
         for instruction in instructions:
@@ -350,6 +351,8 @@ def placements(pdf, lossless=False):
             continue
         for key in ("/SMask", "/Mask", "/Pattern", "/Alternates"):
             collect_images(obj.get(key), blocked)
+        if obj.get("/PatternType") == 1:
+            collect_images(obj, blocked)
         if obj.get("/Subtype") == pikepdf.Name.Form and obj.objgen not in streams:
             collect_images(obj, blocked)
     collect_images(pdf.Root.get("/AcroForm"), blocked)
@@ -610,6 +613,19 @@ def process_images(pdf, options):
         encoded = dct or any(str(f) == "/JPXDecode" for f in filters)
         if options["lossless"] and encoded:
             reason = "lossy original"
+        if dct:
+            parms = obj.get("/DecodeParms")
+            if not isinstance(parms, pikepdf.Array):
+                parms = [parms]
+            # Pillow's JPEG decoder ignores the PDF ColorTransform override.
+            # Preserve explicit values, including 1, rather than guess its effect.
+            if any(
+                str(filter_name) == "/DCTDecode"
+                and isinstance(parameters, pikepdf.Dictionary)
+                and "/ColorTransform" in parameters
+                for filter_name, parameters in zip(filters, parms)
+            ):
+                reason = "explicit DCT ColorTransform"
         if reason:
             preserved[reason] = preserved.get(reason, 0) + 1
             continue
@@ -923,6 +939,7 @@ def font_glyph_usage(pdf):
             raise ValueError("font content traversal exceeds safety limit")
         active = active | {obj.objgen}
         visited_forms.add(obj.objgen)
+        block_graph(resources.get("/Pattern"))
         stack = []
         for instruction in pikepdf.parse_content_stream(owner):
             if not hasattr(instruction, "operator"):
@@ -962,6 +979,8 @@ def font_glyph_usage(pdf):
             continue
         for key in ("/Pattern", "/SMask"):
             block_graph(obj.get(key))
+        if obj.get("/PatternType") == 1:
+            block_graph(obj)
         if obj.get("/Subtype") == pikepdf.Name.Form and obj.objgen not in visited_forms:
             block_graph(obj)
         if obj.get("/Type") == pikepdf.Name.Font and obj.get("/Subtype") not in (

@@ -241,6 +241,72 @@ class PDFToolsTests(unittest.TestCase):
             self.assertLess(int(images[0].Width), 128)
             self.assertGreater(int(images[0].Width), 80)
 
+    def test_crop_preserves_images_shared_with_tiling_patterns(self):
+        for indirect in (False, True):
+            with self.subTest(indirect=indirect):
+                pdf = pikepdf.Pdf.new()
+                image = image_object(
+                    pdf,
+                    Image.frombytes(
+                        "RGB", (128, 128), random.Random(19).randbytes(128 * 128 * 3)
+                    ),
+                )
+                pattern = pdf.make_stream(b"q 128 0 0 128 0 0 cm /Im Do Q")
+                pattern.Type = pikepdf.Name.Pattern
+                pattern.PatternType, pattern.PaintType, pattern.TilingType = 1, 1, 1
+                pattern.BBox = pikepdf.Array([0, 0, 128, 128])
+                pattern.XStep, pattern.YStep = 128, 128
+                pattern.Resources = pikepdf.Dictionary(
+                    XObject=pikepdf.Dictionary(Im=image)
+                )
+                page = pdf.add_blank_page(page_size=(256, 128))
+                page.Resources = pikepdf.Dictionary(
+                    XObject=pikepdf.Dictionary(Im=image),
+                    Pattern=pikepdf.Dictionary(Tile=pattern),
+                )
+                if indirect:
+                    page.Resources = pdf.make_indirect(page.Resources)
+                    pattern.Resources = pdf.make_indirect(pattern.Resources)
+                self.assertEqual(page.Resources.is_indirect, indirect)
+                self.assertEqual(pattern.Resources.is_indirect, indirect)
+                page.Contents = pdf.make_stream(
+                    b"q 0 0 64 64 re W n 128 0 0 128 -32 -32 cm /Im Do Q "
+                    b"/Pattern cs /Tile scn 128 0 128 128 re f"
+                )
+                pdf.save(self.source, compress_streams=False)
+                pdf.close()
+                before = rendered(self.source)
+                tools.transform(
+                    self.source,
+                    self.output,
+                    options(clip=True, lossless=True, codecs="flate"),
+                )
+                self.assertEqual(before, rendered(self.output))
+                with pikepdf.Pdf.open(self.output) as result:
+                    image = result.pages[0].Resources.XObject.Im
+                    self.assertEqual((int(image.Width), int(image.Height)), (128, 128))
+
+    def test_font_glyph_usage_blocks_tiling_pattern_consumers(self):
+        for indirect in (False, True):
+            with self.subTest(indirect=indirect):
+                pdf = pikepdf.Pdf.new()
+                font = cid_font(pdf)
+                pattern = pdf.make_stream(b"BT /F1 12 Tf <0002> Tj ET")
+                pattern.PatternType = 1
+                pattern.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+                page = text_page(pdf, {"F1": font}, b"BT /F1 12 Tf <0001> Tj ET")
+                page.Resources.Pattern = pikepdf.Dictionary(Tile=pattern)
+                if indirect:
+                    page.Resources = pdf.make_indirect(page.Resources)
+                    pattern.Resources = pdf.make_indirect(pattern.Resources)
+                self.assertEqual(page.Resources.is_indirect, indirect)
+                self.assertEqual(pattern.Resources.is_indirect, indirect)
+                used, blocked = tools.font_glyph_usage(pdf)
+                program = font.DescendantFonts[0].FontDescriptor.FontFile2.objgen
+                self.assertEqual(used[program], {1})
+                self.assertIn(program, blocked)
+                pdf.close()
+
     def test_form_borrowing_page_resources_preserves_images(self):
         pdf = pikepdf.Pdf.new()
         form = pdf.make_stream(b"q 128 0 0 128 0 0 cm /Im Do Q")
@@ -579,6 +645,104 @@ class PDFToolsTests(unittest.TestCase):
             self.assertEqual(
                 pdf.pages[0].Resources.XObject.Im.Filter, pikepdf.Name.FlateDecode
             )
+
+    def test_process_images_preserves_explicit_dct_color_transform(self):
+        image = Image.new("RGB", (64, 64), (30, 80, 140))
+        jpeg = io.BytesIO()
+        image.save(jpeg, format="JPEG", quality=90)
+        for representation in ("direct", "indirect", "array", "pipeline"):
+            for transform in (None, "empty", 0, 1):
+                for placement in (False, True):
+                    with self.subTest(
+                        representation=representation,
+                        transform=transform,
+                        placement=placement,
+                    ):
+                        self.save_image(
+                            image, b"q 64 0 0 64 -16 -16 cm /Im Do Q", (32, 32)
+                        )
+                        with pikepdf.Pdf.open(
+                            self.source, allow_overwriting_input=True
+                        ) as pdf:
+                            stream = pdf.pages[0].Resources.XObject.Im
+                            parms = None
+                            if transform is not None:
+                                parms = pikepdf.Dictionary()
+                                if transform != "empty":
+                                    parms.ColorTransform = transform
+                            if (
+                                representation in ("indirect", "pipeline")
+                                and parms is not None
+                            ):
+                                parms = pdf.make_indirect(parms)
+                            filters, data = pikepdf.Name.DCTDecode, jpeg.getvalue()
+                            if representation in ("array", "pipeline"):
+                                filters, parms = (
+                                    pikepdf.Array([filters]),
+                                    pikepdf.Array([parms]),
+                                )
+                            if representation == "pipeline":
+                                filters.insert(0, pikepdf.Name.FlateDecode)
+                                # A similarly named entry on the Flate filter
+                                # must not count as a DCT override.
+                                parms.insert(0, pikepdf.Dictionary(ColorTransform=0))
+                                data = zlib.compress(data)
+                            stream.write(data, filter=filters, decode_parms=parms)
+                            pdf.save(
+                                self.source,
+                                stream_decode_level=pikepdf.StreamDecodeLevel.none,
+                            )
+                        before = rendered(self.source)
+                        tools.transform(
+                            self.source,
+                            self.output,
+                            options(
+                                extended=not placement,
+                                geometry=placement,
+                                clip=placement,
+                                dpi=36 if placement else 0,
+                                codecs="flate",
+                                force=True,
+                            ),
+                        )
+                        self.assertEqual(before, rendered(self.output))
+                        with pikepdf.Pdf.open(self.output) as result:
+                            stream = result.pages[0].Resources.XObject.Im
+                            if transform in (0, 1):
+                                # Saving can remove the outer Flate wrapper; the
+                                # JPEG payload and its DCT parameters must survive.
+                                filters = stream.Filter
+                                filters = (
+                                    list(filters)
+                                    if isinstance(filters, pikepdf.Array)
+                                    else [filters]
+                                )
+                                self.assertIn(pikepdf.Name.DCTDecode, filters)
+                                parms = stream.DecodeParms
+                                parms = (
+                                    list(parms)
+                                    if isinstance(parms, pikepdf.Array)
+                                    else [parms]
+                                )
+                                self.assertEqual(
+                                    parms[
+                                        filters.index(pikepdf.Name.DCTDecode)
+                                    ].ColorTransform,
+                                    transform,
+                                )
+                                data = stream.read_raw_bytes()
+                                if filters[0] == pikepdf.Name.FlateDecode:
+                                    data = zlib.decompress(data)
+                                self.assertEqual(data, jpeg.getvalue())
+                                self.assertEqual(
+                                    (int(stream.Width), int(stream.Height)), (64, 64)
+                                )
+                            else:
+                                self.assertEqual(
+                                    stream.Filter, pikepdf.Name.FlateDecode
+                                )
+                                if placement:
+                                    self.assertLess(int(stream.Width), 64)
 
     def test_encoded_images_keep_decode_semantics(self):
         for mode, fmt, decode in (
@@ -1026,6 +1190,302 @@ class PDFToolsTests(unittest.TestCase):
                     int(helvetica.Widths[code - int(helvetica.FirstChar)]), 0
                 )
         self.assert_rendering_close(self.source, self.output)
+        self.assert_pdfa("4")
+
+    def test_pdfa_mixed_visible_and_invisible_text_keeps_advances(self):
+        liberation = fontconfig_file("Liberation Sans")
+        if not liberation:
+            self.skipTest("Liberation Sans is not installed")
+        # The explicit substitute has no W outline; mode 3 must not require one.
+        subset = tools.pdfa.load_font_file(liberation)
+        tools.pdfa.subset_font(subset, [".notdef", "A", "B"])
+        subset_path = str(Path(tools.WORK) / "visible-only.ttf")
+        subset.save(subset_path)
+        for level in ("2b", "3b", "4"):
+            for font_files in ({}, {"Helvetica": subset_path}):
+                for glyph_name in ("W", "UnavailableInvisibleGlyph"):
+                    with self.subTest(
+                        level=level, font_files=font_files, glyph=glyph_name
+                    ):
+                        pdf = pikepdf.Pdf.new()
+                        widths = [0] * (87 - 65 + 1)
+                        widths[0], widths[1], widths[-1] = 667, 667, 944
+                        font = simple_font(
+                            pdf,
+                            "Helvetica",
+                            FirstChar=65,
+                            LastChar=87,
+                            Widths=widths,
+                            Encoding=pikepdf.Dictionary(
+                                BaseEncoding=pikepdf.Name.WinAnsiEncoding,
+                                Differences=[87, pikepdf.Name("/" + glyph_name)],
+                            ),
+                        )
+                        text_page(
+                            pdf,
+                            {"F1": font},
+                            b"BT /F1 24 Tf 10 50 Td (A) Tj 3 Tr (WWWW) Tj 0 Tr (B) Tj ET",
+                        )
+                        pdf.save(self.source)
+                        pdf.close()
+                        self.convert_pdfa(pdfa=level, font_files=font_files)
+                        self.assert_rendering_close(self.source, self.output)
+                        with (
+                            pymupdf.open(self.source) as before,
+                            pymupdf.open(self.output) as after,
+                        ):
+
+                            def positions(doc):
+                                return [
+                                    char[2]
+                                    for span in doc[0].get_texttrace()
+                                    for char in span["chars"]
+                                ]
+
+                            for a, b in zip(
+                                positions(before), positions(after), strict=True
+                            ):
+                                self.assertAlmostEqual(a[0], b[0], delta=0.05)
+                                self.assertAlmostEqual(a[1], b[1], delta=0.05)
+                        with pikepdf.Pdf.open(self.output) as result:
+                            font = result.pages[0].Resources.Font.F1
+                            self.assertEqual(
+                                float(font.Widths[87 - int(font.FirstChar)]), 944
+                            )
+                            self.assertEqual(
+                                tools.pdfa.simple_encoding(font, [None] * 256)[87],
+                                glyph_name,
+                            )
+                        # PDF/A forbids arbitrary names in TrueType Differences,
+                        # even for invisible codes. Preserve them, not a new mapping;
+                        # the CLI's validator will refuse that unsupported conversion.
+                        if not font_files or glyph_name == "W":
+                            self.assert_pdfa(level)
+
+    def test_pdfa_font_usage_tracks_invisible_codes_through_forms_and_restore(self):
+        pdf = pikepdf.Pdf.new()
+        first, second = simple_font(pdf, "Helvetica"), simple_font(pdf, "Courier")
+        form = pdf.make_stream(b"BT [(W) 10 (X)] TJ (Y) ' 0 0 (Z) \" ET")
+        form.Subtype, form.BBox = pikepdf.Name.Form, pikepdf.Array([0, 0, 200, 100])
+        page = text_page(
+            pdf,
+            {"F1": first},
+            b"BT /F1 12 Tf (A) Tj q 3 Tr ET /Fm Do BT /G gs (I) Tj Q (B) Tj ET",
+        )
+        page.Resources.XObject = pikepdf.Dictionary(Fm=form)
+        page.Resources.ExtGState = pikepdf.Dictionary(
+            G=pikepdf.Dictionary(Font=[second, 12])
+        )
+        used, invisible = tools.pdfa.font_usage(pdf)
+        self.assertEqual(used, {first.objgen: {65, 66}})
+        self.assertEqual(invisible, {first.objgen: set(b"WXYZ"), second.objgen: {73}})
+        pdf.close()
+
+    def test_pdfa_invisible_codes_keep_missing_width_and_encoding(self):
+        pdf = pikepdf.Pdf.new()
+        path, _ = tools.pdfa.substitute_path("Helvetica", options())
+        descriptor = tools.pdfa.descriptor_for(
+            pdf, tools.pdfa.load_font_file(path), "Helvetica", False, False
+        )
+        descriptor.MissingWidth = 944
+        font = simple_font(
+            pdf,
+            "Helvetica",
+            FontDescriptor=descriptor,
+            FirstChar=65,
+            LastChar=66,
+            Widths=[667, 667],
+            Encoding=pikepdf.Dictionary(
+                Differences=[1, pikepdf.Name.W, 255, pikepdf.Name.W]
+            ),
+        )
+        text_page(
+            pdf,
+            {"F1": font},
+            b"BT /F1 24 Tf 10 50 Td (A) Tj 3 Tr <01ff> Tj 0 Tr (B) Tj ET",
+        )
+        pdf.save(self.source)
+        pdf.close()
+        self.convert_pdfa()
+        with pikepdf.Pdf.open(self.output) as result:
+            font = result.pages[0].Resources.Font.F1
+            names = tools.pdfa.simple_encoding(font, [None] * 256)
+            for code in (1, 255):
+                self.assertEqual(float(font.Widths[code - int(font.FirstChar)]), 944)
+                self.assertEqual(names[code], "W")
+        self.assert_rendering_close(self.source, self.output)
+        self.assert_pdfa("4")
+
+    def test_pdfa_unknown_font_usage_after_budget_keeps_standard_font(self):
+        pdf = pikepdf.Pdf.new()
+        page = text_page(
+            pdf,
+            {"F1": simple_font(pdf, "Helvetica")},
+            b"BT /F1 24 Tf 10 50 Td (AB) Tj ET",
+        )
+        # Exhaust the real usage budget without making every conversion pass
+        # parse a large synthetic stream. The resulting fallback is unchanged.
+        instruction = pikepdf.parse_content_stream(page)[0]
+        with mock.patch.object(
+            tools.pdfa, "instructions", return_value=[instruction] * 200000
+        ):
+            usage = tools.pdfa.font_usage(pdf)
+        self.assertEqual(usage, (None, None))
+        pdf.save(self.source)
+        pdf.close()
+        with mock.patch.object(tools.pdfa, "font_usage", return_value=usage):
+            self.convert_pdfa()
+        self.assert_rendering_close(self.source, self.output)
+        with pikepdf.Pdf.open(self.output) as result:
+            font = result.pages[0].Resources.Font.F1
+            self.assertGreater(int(font.FirstChar), 0)
+            self.assertNotIn(pikepdf.Name("/.notdef"), font.Encoding.Differences)
+        self.assert_pdfa("4")
+
+    def test_pdfa_unknown_font_usage_keeps_explicit_and_default_advances(self):
+        for default in (0, 500):
+            with self.subTest(default=default):
+                pdf = pikepdf.Pdf.new()
+                path, _ = tools.pdfa.substitute_path("Helvetica", options())
+                descriptor = tools.pdfa.descriptor_for(
+                    pdf, tools.pdfa.load_font_file(path), "Helvetica", False, False
+                )
+                descriptor.MissingWidth = default
+                names = [pikepdf.Name("/.notdef")] * 256
+                names[65], names[66], names[87] = (
+                    pikepdf.Name.A,
+                    pikepdf.Name.B,
+                    pikepdf.Name.UnavailableInvisibleGlyph,
+                )
+                names[1], names[70] = pikepdf.Name.uniE000, pikepdf.Name.uniE001
+                widths = [default] * 23
+                widths[0], widths[1], widths[5], widths[6], widths[22] = (
+                    667,
+                    667,
+                    0,
+                    250,
+                    944,
+                )
+                font = simple_font(
+                    pdf,
+                    "Helvetica",
+                    FontDescriptor=descriptor,
+                    FirstChar=65,
+                    LastChar=87,
+                    Widths=widths,
+                    Encoding=pikepdf.Dictionary(Differences=[0] + names),
+                )
+                text_page(
+                    pdf,
+                    {"F1": font},
+                    b"BT /F1 24 Tf 10 50 Td (A) Tj 3 Tr <014657> Tj 0 Tr (B) Tj ET",
+                )
+                pdf.save(self.source)
+                pdf.close()
+                with mock.patch.object(
+                    tools.pdfa, "font_usage", return_value=(None, None)
+                ):
+                    self.convert_pdfa()
+                self.assert_rendering_close(self.source, self.output)
+                with pikepdf.Pdf.open(self.output) as result:
+                    font = result.pages[0].Resources.Font.F1
+                    self.assertEqual(float(font.FontDescriptor.MissingWidth), default)
+                    for code, width in (
+                        (1, default),
+                        (70, 0),
+                        (71, 250),
+                        (72, default),
+                        (87, 944),
+                    ):
+                        self.assertEqual(
+                            float(font.Widths[code - int(font.FirstChar)]), width
+                        )
+                    names = tools.pdfa.simple_encoding(font, [None] * 256)
+                    self.assertEqual(names[87], "UnavailableInvisibleGlyph")
+                    self.assertIsNone(names[71])
+                self.assert_pdfa("4")
+
+    def test_pdfa_unknown_font_usage_refuses_conflicting_default_metrics(self):
+        for default in (0, 500):
+            with self.subTest(default=default):
+                pdf = pikepdf.Pdf.new()
+                path, _ = tools.pdfa.substitute_path("Helvetica", options())
+                descriptor = tools.pdfa.descriptor_for(
+                    pdf, tools.pdfa.load_font_file(path), "Helvetica", False, False
+                )
+                descriptor.MissingWidth = default
+                font = simple_font(
+                    pdf,
+                    "Helvetica",
+                    FontDescriptor=descriptor,
+                    FirstChar=65,
+                    LastChar=66,
+                    Widths=[667, 667],
+                )
+                text_page(pdf, {"F1": font}, b"BT /F1 24 Tf (AB) Tj ET")
+                pdf.save(self.source)
+                pdf.close()
+                with (
+                    mock.patch.object(
+                        tools.pdfa, "font_usage", return_value=(None, None)
+                    ),
+                    self.assertRaisesRegex(
+                        tools.pdfa.ConversionError,
+                        "font usage could not be determined.*conflict",
+                    ),
+                ):
+                    self.convert_pdfa(font_files={"Helvetica": path})
+
+    def test_pdfa_invisible_advance_without_metrics_fails_closed(self):
+        liberation = fontconfig_file("Liberation Sans")
+        if not liberation:
+            self.skipTest("Liberation Sans is not installed")
+        subset = tools.pdfa.load_font_file(liberation)
+        tools.pdfa.subset_font(subset, [".notdef", "A", "B"])
+        subset_path = str(Path(tools.WORK) / "visible-only.ttf")
+        subset.save(subset_path)
+        pdf = pikepdf.Pdf.new()
+        font = simple_font(pdf, "Helvetica")
+        text_page(
+            pdf,
+            {"F1": font},
+            b"BT /F1 24 Tf 10 50 Td (A) Tj 3 Tr (W) Tj 0 Tr (B) Tj ET",
+        )
+        pdf.save(self.source)
+        # A complete substitute supplies standard-font metrics without /Widths.
+        self.convert_pdfa()
+        self.assert_rendering_close(self.source, self.output)
+        with pikepdf.Pdf.open(self.output) as result:
+            font = result.pages[0].Resources.Font.F1
+            self.assertEqual(float(font.Widths[87 - int(font.FirstChar)]), 944)
+        with self.assertRaisesRegex(
+            tools.pdfa.ConversionError, "advance of invisible code 87.*font metrics"
+        ):
+            self.convert_pdfa(font_files={"Helvetica": subset_path})
+        # Explicit zero is a known advance, not a missing metric.
+        font = pdf.pages[0].Resources.Font.F1
+        font.FirstChar, font.LastChar, font.Widths = (
+            65,
+            87,
+            pikepdf.Array([667, 667] + [0] * 21),
+        )
+        pdf.save(self.source)
+        pdf.close()
+        self.convert_pdfa(font_files={"Helvetica": subset_path})
+        self.assert_rendering_close(self.source, self.output)
+        self.assert_pdfa("4")
+
+    def test_pdfa_invisible_only_font_does_not_need_a_substitute(self):
+        pdf = pikepdf.Pdf.new()
+        font = simple_font(
+            pdf, "UnavailableInvisibleFont", FirstChar=87, LastChar=87, Widths=[944]
+        )
+        text_page(pdf, {"F1": font}, b"BT /F1 12 Tf 3 Tr (WWWW) Tj ET")
+        pdf.save(self.source)
+        pdf.close()
+        self.convert_pdfa()
+        with pikepdf.Pdf.open(self.output) as result:
+            self.assertNotIn("/FontDescriptor", result.pages[0].Resources.Font.F1)
         self.assert_pdfa("4")
 
     def test_pdfa4_font_widths_must_match_or_come_from_font_file(self):

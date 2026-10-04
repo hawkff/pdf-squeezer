@@ -35,7 +35,178 @@ func stripMetadata(pdf *model.Context) error {
 	return nil
 }
 
+// pdfcpu v0.16 deletes PieceInfo and frees its entire referenced graph during
+// optimization. Detach the entries first, then restore them before writing so
+// private streams (including shared objects) remain live. Explicit stripping
+// happens later in transformDocument without freeing potentially shared objects.
+func optimizeDocument(ctx context.Context, pdf *model.Context) error {
+	type pieceInfo struct {
+		dict   types.Dict
+		value  types.Object
+		marked bool
+	}
+	// A temporary identity prevents Forms with detached private data from
+	// comparing equal. Choose a key absent from every stream dictionary.
+	const prefix = "pdfSqueezerPieceInfo"
+	marker := prefix
+	for _, entry := range pdf.Table {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if entry == nil || entry.Free {
+			continue
+		}
+		if sd, ok := entry.Object.(types.StreamDict); ok {
+			for key := range sd.Dict {
+				if strings.HasPrefix(key, prefix) && len(key) >= len(marker) {
+					marker = key + "_"
+				}
+			}
+		}
+	}
+	var saved []pieceInfo
+	defer func() {
+		for _, item := range saved {
+			item.dict["PieceInfo"] = item.value
+			if item.marked {
+				delete(item.dict, marker)
+			}
+		}
+	}()
+	for n, entry := range pdf.Table {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if entry == nil || entry.Free {
+			continue
+		}
+		var d types.Dict
+		switch o := entry.Object.(type) {
+		case types.Dict:
+			d = o
+		case types.StreamDict:
+			d = o.Dict
+		}
+		if value, found := d["PieceInfo"]; found {
+			typ, _ := pdf.Dereference(d["Type"])
+			subtype, _ := pdf.Dereference(d["Subtype"])
+			_, stream := entry.Object.(types.StreamDict)
+			if typ == types.Name("Catalog") || typ == types.Name("Page") || stream && subtype == types.Name("Form") {
+				saved = append(saved, pieceInfo{d, value, stream})
+				delete(d, "PieceInfo")
+				if stream {
+					d[marker] = types.Integer(n)
+				}
+			}
+		}
+	}
+	return api.OptimizeContext(ctx, pdf)
+}
+
+// The pdfcpu writer copies lazy object-stream dictionaries without traversing
+// or encrypting their values. Resolve them before writing their graphs.
+func materializeObjectGraph(ctx context.Context, pdf *model.Context, obj types.Object, seen map[int]bool, depth int) error {
+	var pending []types.IndirectRef
+	var walkDirect func(types.Object, int) error
+	walkDirect = func(obj types.Object, depth int) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if ref, ok := obj.(types.IndirectRef); ok {
+			n := ref.ObjectNumber.Value()
+			if !seen[n] {
+				seen[n] = true
+				pending = append(pending, ref)
+			}
+			return nil
+		}
+		if depth > 100 {
+			return errors.New("object nesting exceeds materialization limit")
+		}
+		switch o := obj.(type) {
+		case types.StreamDict:
+			return walkDirect(o.Dict, depth+1)
+		case types.Dict:
+			for _, value := range o {
+				if err := walkDirect(value, depth+1); err != nil {
+					return err
+				}
+			}
+		case types.Array:
+			for _, value := range o {
+				if err := walkDirect(value, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := walkDirect(obj, depth); err != nil {
+		return err
+	}
+	for len(pending) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		i := len(pending) - 1
+		ref := pending[i]
+		pending = pending[:i]
+		value, err := pdf.Dereference(ref)
+		if err != nil {
+			return err
+		}
+		// Indirect links start a new direct object; chain length is not nesting.
+		if err := walkDirect(value, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// After a re-read, surviving aliases may no longer have a PieceInfo discovery
+// root. Materialize reachable dictionaries for writing, without decoding streams.
+func materializeWriteRoots(ctx context.Context, pdf *model.Context) error {
+	seen := map[int]bool{}
+	for _, ref := range []*types.IndirectRef{pdf.Root, pdf.Info} {
+		if ref != nil {
+			if err := materializeObjectGraph(ctx, pdf, *ref, seen, 0); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func materializeDocumentPieceInfo(ctx context.Context, pdf *model.Context) error {
+	seen := map[int]bool{}
+	for _, entry := range pdf.Table {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if entry == nil || entry.Free {
+			continue
+		}
+		var d types.Dict
+		switch o := entry.Object.(type) {
+		case types.Dict:
+			d = o
+		case types.StreamDict:
+			d = o.Dict
+		}
+		if value, found := d["PieceInfo"]; found {
+			if err := materializeObjectGraph(ctx, pdf, value, seen, 0); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func transformDocument(ctx context.Context, pdf *model.Context, opts options) error {
+	// Resolve shared descendants before stripping removes their discovery root.
+	if err := materializeDocumentPieceInfo(ctx, pdf); err != nil {
+		return err
+	}
 	if opts.privacy {
 		if err := stripMetadata(pdf); err != nil {
 			return err
@@ -99,21 +270,28 @@ func transformDocument(ctx context.Context, pdf *model.Context, opts options) er
 		default:
 			continue
 		}
-		// Resource names are arbitrary. A resource named /Metadata or /B must
-		// not be mistaken for a metadata field or a page's article-bead array.
+		typ := ""
+		if name, err := pdf.Dereference(d["Type"]); err == nil {
+			if name, ok := name.(types.Name); ok {
+				typ = string(name)
+			}
+		}
+		_, stream := entry.Object.(types.StreamDict)
+		// Resource names are arbitrary. An untyped stream needs an information
+		// object owner or an XML/XMP subtype, not just a resource named Metadata.
 		if opts.privacy || len(opts.metadata) > 0 || updateDates || listContains(opts.strip, "metadata") {
 			if metadata, _, err := pdf.DereferenceStreamDict(d["Metadata"]); err == nil && metadata != nil {
-				if typ := metadata.NameEntry("Type"); typ != nil && *typ == "Metadata" {
+				metadataType, err := pdf.Dereference(metadata.Dict["Type"])
+				metadataSubtype, _ := pdf.Dereference(metadata.Dict["Subtype"])
+				xmp := metadataSubtype == types.Name("XML") || metadataSubtype == types.Name("XMP")
+				if err == nil && (metadataType == types.Name("Metadata") || metadataType == nil && (typ != "" || stream || xmp)) {
 					delete(d, "Metadata")
 				}
 			}
 		}
-		typ := ""
-		if name := d.NameEntry("Type"); name != nil {
-			typ = *name
-		}
 		if opts.privacy || listContains(opts.strip, "piece-info") {
-			if typ == "Catalog" || typ == "Page" || typ == "XObject" {
+			subtype, _ := pdf.Dereference(d["Subtype"])
+			if typ == "Catalog" || typ == "Page" || typ == "XObject" || stream && (subtype == types.Name("Form") || subtype == types.Name("Image")) {
 				delete(d, "PieceInfo")
 				delete(d, "LastModified")
 			}
@@ -278,9 +456,9 @@ func streamDigest(key string, data []byte) [32]byte {
 	return digest
 }
 
-// streamIdentity only normalizes generalized lossless filters. Encoded image
-// filters retain their Filter/DecodeParms, including bitonal polarity and globals.
-func streamIdentity(sd types.StreamDict) (string, []byte, error) {
+// normalizedStreamDictionary only normalizes generalized lossless filters.
+// Encoded image filters retain parameters, including bitonal polarity and globals.
+func normalizedStreamDictionary(sd types.StreamDict) (types.Dict, bool) {
 	d := streamDictionary(sd)
 	normalize := true
 	for _, f := range sd.FilterPipeline {
@@ -290,14 +468,21 @@ func streamIdentity(sd types.StreamDict) (string, []byte, error) {
 			normalize = false
 		}
 	}
+	if normalize {
+		delete(d, "Filter")
+		delete(d, "DecodeParms")
+	}
+	return d, normalize
+}
+
+func streamIdentity(sd types.StreamDict) (string, []byte, error) {
+	d, normalize := normalizedStreamDictionary(sd)
 	data := sd.Raw
 	if normalize {
 		if err := sd.DecodeWithLimit(32 << 20); err != nil {
 			return "", nil, err
 		}
 		data = sd.Content
-		delete(d, "Filter")
-		delete(d, "DecodeParms")
 	}
 	return d.PDFString(), data, nil
 }
@@ -307,15 +492,12 @@ func deduplicateStreams(ctx context.Context, pdf *model.Context) error {
 	rawSeen := map[[32]byte]int{}
 	replace := map[int]types.IndirectRef{}
 	var ids []int
-	for n := range pdf.Table {
-		ids = append(ids, n)
-	}
-	sort.Ints(ids)
-	for _, n := range ids {
+	keys := map[int]string{}
+	peers := map[string]int{}
+	for n, e := range pdf.Table {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		e := pdf.Table[n]
 		if e == nil || e.Free {
 			continue
 		}
@@ -326,6 +508,23 @@ func deduplicateStreams(ctx context.Context, pdf *model.Context) error {
 		if typ := sd.NameEntry("Type"); typ != nil && (*typ == "XRef" || *typ == "ObjStm") {
 			continue
 		}
+		d, _ := normalizedStreamDictionary(sd)
+		key := d.PDFString()
+		keys[n] = key
+		peers[key]++
+		ids = append(ids, n)
+	}
+	sort.Ints(ids)
+	for _, n := range ids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// Different normalized dictionaries cannot match, regardless of bytes.
+		if peers[keys[n]] < 2 {
+			continue
+		}
+		e := pdf.Table[n]
+		sd := e.Object.(types.StreamDict)
 		// Exact encodings need no decoding, including aliases re-encoded together.
 		rawKey := streamDictionary(sd).PDFString()
 		rawDigest := streamDigest(rawKey, sd.Raw)
@@ -446,11 +645,8 @@ func encryptPDF(ctx context.Context, input, output string, opts options) error {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(output, os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return err
-	}
 	conf := configuration("")
+	conf.Cmd = model.ENCRYPT
 	conf.UserPW, conf.OwnerPW = opts.encryptUser, opts.encryptOwner
 	conf.EncryptUsingAES, conf.EncryptKeyLength = true, 256
 	conf.Permissions = model.PermissionsAll
@@ -460,6 +656,19 @@ func encryptPDF(ctx context.Context, input, output string, opts options) error {
 	if opts.permissions == "none" {
 		conf.Permissions = model.PermissionsNone
 	}
-	err = api.Encrypt(ctx, in, out, conf)
+	// Use the same preparation as api.Encrypt, but resolve reachable dictionaries
+	// in the context that will be encrypted, not just in the preceding stage.
+	pdf, err := api.ReadValidateAndOptimize(ctx, in, conf, nil)
+	if err != nil {
+		return err
+	}
+	if err := materializeWriteRoots(ctx, pdf); err != nil {
+		return err
+	}
+	out, err := os.OpenFile(output, os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	err = api.WriteContext(ctx, pdf, out)
 	return errors.Join(err, out.Close())
 }
