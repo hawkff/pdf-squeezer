@@ -444,12 +444,7 @@ func extract(ctx context.Context, input, output string, opts options, stderr io.
 		if err := pythonPDF(ctx, "text", input, staged, opts, stderr); err != nil {
 			return err
 		}
-		source, err := os.Open(staged)
-		if err != nil {
-			return err
-		}
-		defer source.Close()
-		_, err = writeNew(ctx, output, source)
+		_, err = publishFile(ctx, staged, output)
 		return err
 	}
 	if opts.inline {

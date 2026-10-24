@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	stdlog "log"
 	"os"
 	"os/exec"
@@ -293,12 +294,7 @@ func (v *verifier) check(ctx context.Context, s *staged) error {
 
 func publish(ctx context.Context, s *staged, opts options) (int64, int64, error) {
 	defer s.cleanup()
-	source, err := os.Open(s.path)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer source.Close()
-	written, err := writeNew(ctx, s.output, source)
+	written, err := publishFile(ctx, s.path, s.output)
 	if err == nil && opts.timestamps == "preserve" {
 		if err = os.Chtimes(s.output, s.info.ModTime(), s.info.ModTime()); err != nil {
 			err = errors.Join(err, os.Remove(s.output))
@@ -444,6 +440,13 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 		}
 		pdf = nil
 	}
+	// A finished stage goes once the next one exists. The input snapshot stays for
+	// encryption, the size fallback, and conformance checks.
+	discard := func(path string) {
+		if path != original {
+			os.Remove(path)
+		}
+	}
 	apply := func(label string, process func(string, string) error) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -456,6 +459,7 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 		if err := process(current, next); err != nil {
 			return fmt.Errorf("%s: %w", label, err)
 		}
+		discard(current)
 		current, pdf = next, nil
 		return nil
 	}
@@ -538,6 +542,7 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 	if err != nil {
 		return nil, err
 	}
+	discard(current)
 	current, pdf = next, nil
 	if opts.monoCodecs != "flate" {
 		err = apply("encoding monochrome images", func(in, out string) error { return pythonPDF(ctx, "monochrome", in, out, opts, stderr) })
@@ -748,7 +753,39 @@ func ghostscript(ctx context.Context, input string, output *os.File, opts option
 	return nil
 }
 
-// ponytail: a crash during the exclusive copy can leave partial output; use a no-replace rename for atomic publication.
+// publishFile hard-links a finished staged file to path. The name appears
+// atomically and the link fails if path exists. Filesystems without hard links
+// get an exclusive copy instead.
+func publishFile(ctx context.Context, staged, path string) (int64, error) {
+	// Tools may create stages with any mode. Outputs stay private, with their data on disk before the name.
+	if err := os.Chmod(staged, 0600); err != nil {
+		return 0, err
+	}
+	source, err := os.OpenFile(staged, os.O_RDWR, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if err := errors.Join(source.Sync(), ctx.Err()); err != nil {
+		return 0, err
+	}
+	err = link(staged, path)
+	if err == nil {
+		return info.Size(), nil
+	}
+	if errors.Is(err, fs.ErrExist) {
+		return 0, fmt.Errorf("create output: %w", err)
+	}
+	return writeNew(ctx, path, source)
+}
+
+var link = os.Link // tests replace it to reach the copy fallback
+
+// shortcut: hard-link publication falls back to this copy, which a crash can leave partial; add a no-replace rename where the platform has one.
 func writeNew(ctx context.Context, path string, source io.Reader) (written int64, err error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
