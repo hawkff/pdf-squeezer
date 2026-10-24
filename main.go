@@ -159,7 +159,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		out := stderr
 		if opts.jobs > 1 && len(files) > 1 {
 			// Parallel files share stderr, so every line names its file.
-			out = &lockedWriter{writer: &prefixWriter{writer: stderr, prefix: files[i].path + ": "}}
+			prefixed := &prefixWriter{writer: stderr, prefix: files[i].path + ": "}
+			defer prefixed.Close() // tools and image workers have finished by then
+			out = &lockedWriter{writer: prefixed}
 		}
 		if opts.extract != "" {
 			return result{err: extract(ctx, files[i].path, outputs[i], opts, out)}

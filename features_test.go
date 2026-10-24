@@ -540,16 +540,21 @@ func TestParallelJobsKeepInputOrder(t *testing.T) {
 	assertNoTemps(t, output)
 }
 
-func TestPrefixWriterStartsEveryLine(t *testing.T) {
+func TestPrefixWriterPassesWholeLines(t *testing.T) {
 	var out bytes.Buffer
 	w := &prefixWriter{writer: &out, prefix: "a.pdf: "}
-	for _, chunk := range []string{"one\ntw", "o\n", "", "three"} {
-		if n, err := w.Write([]byte(chunk)); err != nil || n != len(chunk) {
-			t.Fatalf("Write(%q) = %d, %v", chunk, n, err)
+	for _, step := range []struct{ chunk, want string }{
+		{"one\ntw", "a.pdf: one\n"}, // an unfinished line waits for its newline
+		{"o\n", "a.pdf: one\na.pdf: two\n"},
+		{"", "a.pdf: one\na.pdf: two\n"},
+		{"three", "a.pdf: one\na.pdf: two\n"},
+	} {
+		if n, err := w.Write([]byte(step.chunk)); err != nil || n != len(step.chunk) || out.String() != step.want {
+			t.Fatalf("Write(%q) = %d, %v; got %q, want %q", step.chunk, n, err, out.String(), step.want)
 		}
 	}
-	if want := "a.pdf: one\na.pdf: two\na.pdf: three"; out.String() != want {
-		t.Fatalf("got %q, want %q", out.String(), want)
+	if err := w.Close(); err != nil || out.String() != "a.pdf: one\na.pdf: two\na.pdf: three\n" {
+		t.Fatalf("Close: %v; got %q", err, out.String())
 	}
 }
 

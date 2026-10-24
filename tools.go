@@ -58,29 +58,40 @@ func (w *lockedWriter) Write(p []byte) (int, error) {
 	return w.writer.Write(p)
 }
 
-// prefixWriter starts every line with prefix. It is not safe for concurrent use.
+// prefixWriter starts every line with prefix and passes on whole lines only,
+// so lines from writers that share a stream cannot mix. Close writes an
+// unfinished last line. It is not safe for concurrent use.
 type prefixWriter struct {
-	writer io.Writer
-	prefix string
-	inLine bool // the last write ended without a newline
+	writer  io.Writer
+	prefix  string
+	partial []byte // the unfinished last line
 }
 
 func (w *prefixWriter) Write(p []byte) (int, error) {
+	w.partial = append(w.partial, p...)
 	var out []byte
-	for _, line := range bytes.SplitAfter(p, []byte("\n")) {
-		if len(line) == 0 {
-			continue
+	for {
+		i := bytes.IndexByte(w.partial, '\n')
+		if i < 0 {
+			break
 		}
-		if !w.inLine {
-			out = append(out, w.prefix...)
-		}
-		out = append(out, line...)
-		w.inLine = line[len(line)-1] != '\n'
+		out = append(append(out, w.prefix...), w.partial[:i+1]...)
+		w.partial = w.partial[i+1:]
 	}
-	if _, err := w.writer.Write(out); err != nil {
-		return 0, err
+	if len(out) > 0 {
+		if _, err := w.writer.Write(out); err != nil {
+			return 0, err
+		}
 	}
 	return len(p), nil
+}
+
+func (w *prefixWriter) Close() error {
+	if len(w.partial) == 0 {
+		return nil
+	}
+	_, err := w.Write([]byte("\n"))
+	return err
 }
 
 func toolError(ctx context.Context, name string, err error, output *boundedBuffer, stderr io.Writer, secrets ...string) error {
