@@ -14,12 +14,13 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Set the CI_RUNNER repository variable to move the Linux jobs to another runner label.
 env:
   TARGETS: linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 jobs:
   check:
-    runs-on: namespace-profile-default
+    runs-on: ${{ vars.CI_RUNNER || 'namespace-profile-default' }}
     # Debian 13 ships Ghostscript 10, whose PDF interpreter the image-skipping test targets.
     container: debian:trixie
     timeout-minutes: 15
@@ -120,7 +121,7 @@ jobs:
 
   image:
     needs: check
-    runs-on: namespace-profile-default
+    runs-on: ${{ vars.CI_RUNNER || 'namespace-profile-default' }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -151,7 +152,7 @@ jobs:
   release:
     if: github.ref_type == 'tag'
     needs: [check, macos, image]
-    runs-on: namespace-profile-default
+    runs-on: ${{ vars.CI_RUNNER || 'namespace-profile-default' }}
     timeout-minutes: 15
     permissions:
       contents: write
