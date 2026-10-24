@@ -99,7 +99,7 @@ jobs:
         run: |
           brew install qpdf ghostscript poppler jbig2dec jbig2enc fontconfig
           # The same metric-compatible fonts as the Linux job, so PDF/A picks the same substitutes.
-          brew install --cask font-urw-base35 font-liberation
+          brew install --cask font-urw-base35 font-liberation font-dejavu
       - name: Install optional Python tools
         run: |
           python3 -m venv "$RUNNER_TEMP/pdf-tools"

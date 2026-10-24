@@ -870,8 +870,8 @@ class PDFToolsTests(unittest.TestCase):
         self.assertEqual(rendered(self.source), rendered(self.output))
 
     def test_subset_fonts_preserves_text_and_rendering(self):
-        font = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
-        if not font.exists():
+        font = fontconfig_file("DejaVu Sans")
+        if not font:
             self.skipTest("DejaVu font fixture is not installed")
         with pymupdf.open() as doc:
             page = doc.new_page(width=240, height=120)
@@ -893,8 +893,8 @@ class PDFToolsTests(unittest.TestCase):
         from fontTools import subset
         from fontTools.ttLib import TTFont
 
-        font = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
-        if not font.exists():
+        font = fontconfig_file("DejaVu Sans")
+        if not font:
             self.skipTest("DejaVu font fixture is not installed")
         with pymupdf.open() as doc:
             for text in ("ABC", "XYZ"):
@@ -955,8 +955,8 @@ class PDFToolsTests(unittest.TestCase):
         from fontTools import subset
         from fontTools.ttLib import TTFont
 
-        path = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
-        if not path.exists():
+        path = fontconfig_file("DejaVu Sans")
+        if not path:
             self.skipTest("DejaVu font fixture is not installed")
         pdf = pikepdf.Pdf.new()
         for text in ("X", "A"):
@@ -1698,8 +1698,15 @@ class PDFToolsTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(tools.pdfa.ConversionError, "--output-intent"):
             self.convert_pdfa()
+        # Ghostscript installs a CMYK profile under its own share directory.
+        roots = {Path("/usr/share/ghostscript")}
+        if shutil.which("gs"):
+            gs = Path(shutil.which("gs")).resolve()
+            roots.add(gs.parents[1] / "share" / "ghostscript")
         profiles = sorted(
-            Path("/usr/share/ghostscript").glob("*/iccprofiles/default_cmyk.icc")
+            profile
+            for root in roots
+            for profile in root.glob("*/iccprofiles/default_cmyk.icc")
         )
         if not profiles:
             self.skipTest("no CMYK ICC profile is available")
