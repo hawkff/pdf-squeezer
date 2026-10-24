@@ -520,6 +520,9 @@ func TestParallelJobsKeepInputOrder(t *testing.T) {
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("reports out of order:\n%s", &stdout)
 	}
+	if !strings.Contains(stderr.String(), filepath.Join(dir, "05.pdf")+": input: ") {
+		t.Fatalf("parallel lines do not name their file:\n%s", &stderr)
+	}
 	for _, path := range want {
 		text := fmt.Sprintf("Document %s text.", filepath.Base(path)[:2])
 		found := false
@@ -535,6 +538,19 @@ func TestParallelJobsKeepInputOrder(t *testing.T) {
 		}
 	}
 	assertNoTemps(t, output)
+}
+
+func TestPrefixWriterStartsEveryLine(t *testing.T) {
+	var out bytes.Buffer
+	w := &prefixWriter{writer: &out, prefix: "a.pdf: "}
+	for _, chunk := range []string{"one\ntw", "o\n", "", "three"} {
+		if n, err := w.Write([]byte(chunk)); err != nil || n != len(chunk) {
+			t.Fatalf("Write(%q) = %d, %v", chunk, n, err)
+		}
+	}
+	if want := "a.pdf: one\na.pdf: two\na.pdf: three"; out.String() != want {
+		t.Fatalf("got %q, want %q", out.String(), want)
+	}
 }
 
 func TestProfilesBatchAndTimestamps(t *testing.T) {
@@ -968,7 +984,7 @@ func TestDeclaredPDFA1KeepsClassicCrossReference(t *testing.T) {
 	if bytes.Contains(data, []byte("/XRef")) || bytes.Contains(data, []byte("/ObjStm")) {
 		t.Fatal("PDF/A-1 input was written with cross-reference or object streams")
 	}
-	if !strings.Contains(messages.String(), input+": input declares PDF/A-1B") || !strings.Contains(messages.String(), "not verified") {
+	if !strings.Contains(messages.String(), "declares PDF/A-1B") || !strings.Contains(messages.String(), "not verified") {
 		t.Fatalf("missing preservation messages:\n%s", &messages)
 	}
 	broken := filepath.Join(dir, "broken.pdf")
@@ -976,7 +992,7 @@ func TestDeclaredPDFA1KeepsClassicCrossReference(t *testing.T) {
 	if err := run(t.Context(), []string{"--privacy", "-o", broken, input}, io.Discard, &messages); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(messages.String(), "warning: "+input+" declares PDF/A-1B and --privacy removes what it requires") {
+	if !strings.Contains(messages.String(), "--privacy removes what it requires") {
 		t.Fatalf("missing conflict warning:\n%s", &messages)
 	}
 }

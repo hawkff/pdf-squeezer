@@ -58,6 +58,31 @@ func (w *lockedWriter) Write(p []byte) (int, error) {
 	return w.writer.Write(p)
 }
 
+// prefixWriter starts every line with prefix. It is not safe for concurrent use.
+type prefixWriter struct {
+	writer io.Writer
+	prefix string
+	inLine bool // the last write ended without a newline
+}
+
+func (w *prefixWriter) Write(p []byte) (int, error) {
+	var out []byte
+	for _, line := range bytes.SplitAfter(p, []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		if !w.inLine {
+			out = append(out, w.prefix...)
+		}
+		out = append(out, line...)
+		w.inLine = line[len(line)-1] != '\n'
+	}
+	if _, err := w.writer.Write(out); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
 func toolError(ctx context.Context, name string, err error, output *boundedBuffer, stderr io.Writer, secrets ...string) error {
 	text := output.String()
 	for _, secret := range secrets {
