@@ -117,6 +117,52 @@ func TestExternalToolsUseInputSnapshot(t *testing.T) {
 	}
 }
 
+func TestToolsKeepScratchFilesInStaging(t *testing.T) {
+	for _, mode := range []string{"ghostscript", "python"} {
+		t.Run(mode, func(t *testing.T) {
+			binary, args := "gs", []string{"--engine", "ghostscript"}
+			if mode == "python" {
+				if os.Getenv("PDF_SQUEEZER_INTEGRATION") != "1" {
+					t.Skip("optional tool integration")
+				}
+				requirePythonTools(t)
+				binary, args = os.Getenv("PDF_SQUEEZER_PYTHON"), []string{"--extract", "text"}
+				if binary == "" {
+					binary = "python3"
+				}
+			}
+			requireTool(t, binary)
+			real, err := exec.LookPath(binary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir, tools := t.TempDir(), t.TempDir()
+			input, output, record := filepath.Join(dir, "input.pdf"), filepath.Join(dir, "output"), filepath.Join(tools, "record")
+			writeFile(t, input, testPDF(64000))
+			// Ghostscript must read the staged path, not a pipe it would spool to a temporary copy.
+			stub := filepath.Join(tools, "gs")
+			writeFile(t, stub, []byte("#!/bin/sh\nif [ \"$TEST_MODE\" = ghostscript ] && [ -n \"$(head -c 1)\" ]; then exit 92; fi\nprintf '%s\\n' \"$TMPDIR\" > \"$TEST_RECORD\"\nexec \"$TEST_TOOL\" \"$@\"\n"))
+			if err := os.Chmod(stub, 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("TEST_MODE", mode)
+			t.Setenv("TEST_RECORD", record)
+			t.Setenv("TEST_TOOL", real)
+			t.Setenv("PATH", tools+string(os.PathListSeparator)+os.Getenv("PATH"))
+			if mode == "python" {
+				t.Setenv("PDF_SQUEEZER_PYTHON", stub)
+			}
+			if err := run(t.Context(), append(args, "-o", output, input), io.Discard, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			if scratch := strings.TrimSpace(string(readFile(t, record))); !strings.HasPrefix(scratch, filepath.Join(dir, ".pdf-squeezer-")) {
+				t.Fatalf("%s scratch directory %q is outside the private staging directory", mode, scratch)
+			}
+			assertNoTemps(t, dir)
+		})
+	}
+}
+
 func TestExpandInputsSkipsSpecialFiles(t *testing.T) {
 	dir := t.TempDir()
 	pipe := filepath.Join(dir, "pipe.pdf")

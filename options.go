@@ -597,7 +597,12 @@ func expandInputs(ctx context.Context, inputs []string, recursive bool) ([]input
 			}
 			continue
 		}
-		err = filepath.WalkDir(input, func(path string, d os.DirEntry, err error) error {
+		// WalkDir does not descend into a symlinked root: walk its target, report the named path.
+		root, err := filepath.EvalSymlinks(input)
+		if err != nil {
+			return nil, err
+		}
+		err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
@@ -605,7 +610,7 @@ func expandInputs(ctx context.Context, inputs []string, recursive bool) ([]input
 				return err
 			}
 			if d.IsDir() {
-				if path != input && (!recursive || strings.HasPrefix(d.Name(), ".")) {
+				if path != root && (!recursive || strings.HasPrefix(d.Name(), ".")) {
 					return filepath.SkipDir
 				}
 				return nil
@@ -613,11 +618,11 @@ func expandInputs(ctx context.Context, inputs []string, recursive bool) ([]input
 			if !d.Type().IsRegular() || !strings.EqualFold(filepath.Ext(path), ".pdf") || strings.HasPrefix(d.Name(), ".") || generatedPDF(d.Name()) {
 				return nil
 			}
-			rel, err := filepath.Rel(input, path)
+			rel, err := filepath.Rel(root, path)
 			if err != nil {
 				return err
 			}
-			return add(path, rel)
+			return add(filepath.Join(input, rel), rel)
 		})
 		if err != nil {
 			return nil, err
