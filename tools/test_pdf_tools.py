@@ -1443,67 +1443,80 @@ class PDFToolsTests(unittest.TestCase):
         self.assert_pdfa("4")
 
     def test_pdfa_unknown_font_usage_keeps_explicit_and_default_advances(self):
+        substitutes = [{}]
+        liberation = fontconfig_file("Liberation Sans")
+        if liberation:
+            substitutes.append({"Helvetica": liberation})  # a TrueType program
         for default in (0, 500):
-            with self.subTest(default=default):
-                pdf = pikepdf.Pdf.new()
-                path, _ = tools.pdfa.substitute_path("Helvetica", options())
-                descriptor = tools.pdfa.descriptor_for(
-                    pdf, tools.pdfa.load_font_file(path), "Helvetica", False, False
-                )
-                descriptor.MissingWidth = default
-                names = [pikepdf.Name("/.notdef")] * 256
-                names[65], names[66], names[87] = (
-                    pikepdf.Name.A,
-                    pikepdf.Name.B,
-                    pikepdf.Name.UnavailableInvisibleGlyph,
-                )
-                names[1], names[70] = pikepdf.Name.uniE000, pikepdf.Name.uniE001
-                widths = [default] * 23
-                widths[0], widths[1], widths[5], widths[6], widths[22] = (
-                    667,
-                    667,
-                    0,
-                    250,
-                    944,
-                )
-                font = simple_font(
-                    pdf,
-                    "Helvetica",
-                    FontDescriptor=descriptor,
-                    FirstChar=65,
-                    LastChar=87,
-                    Widths=widths,
-                    Encoding=pikepdf.Dictionary(Differences=[0] + names),
-                )
-                text_page(
-                    pdf,
-                    {"F1": font},
-                    b"BT /F1 24 Tf 10 50 Td (A) Tj 3 Tr <014657> Tj 0 Tr (B) Tj ET",
-                )
-                pdf.save(self.source)
-                pdf.close()
-                with mock.patch.object(
-                    tools.pdfa, "font_usage", return_value=(None, None)
-                ):
-                    self.convert_pdfa()
-                self.assert_rendering_close(self.source, self.output)
-                with pikepdf.Pdf.open(self.output) as result:
-                    font = result.pages[0].Resources.Font.F1
-                    self.assertEqual(float(font.FontDescriptor.MissingWidth), default)
-                    for code, width in (
-                        (1, default),
-                        (70, 0),
-                        (71, 250),
-                        (72, default),
-                        (87, 944),
+            for font_files in substitutes:
+                with self.subTest(default=default, font_files=font_files):
+                    pdf = pikepdf.Pdf.new()
+                    path, _ = tools.pdfa.substitute_path("Helvetica", options())
+                    descriptor = tools.pdfa.descriptor_for(
+                        pdf, tools.pdfa.load_font_file(path), "Helvetica", False, False
+                    )
+                    descriptor.MissingWidth = default
+                    names = [pikepdf.Name("/.notdef")] * 256
+                    names[65], names[66], names[87] = (
+                        pikepdf.Name.A,
+                        pikepdf.Name.B,
+                        pikepdf.Name.UnavailableInvisibleGlyph,
+                    )
+                    names[1], names[70] = pikepdf.Name.uniE000, pikepdf.Name.uniE001
+                    widths = [default] * 23
+                    widths[0], widths[1], widths[5], widths[6], widths[22] = (
+                        667,
+                        667,
+                        0,
+                        250,
+                        944,
+                    )
+                    font = simple_font(
+                        pdf,
+                        "Helvetica",
+                        FontDescriptor=descriptor,
+                        FirstChar=65,
+                        LastChar=87,
+                        Widths=widths,
+                        Encoding=pikepdf.Dictionary(Differences=[0] + names),
+                    )
+                    text_page(
+                        pdf,
+                        {"F1": font},
+                        b"BT /F1 24 Tf 10 50 Td (A) Tj 3 Tr <014657> Tj 0 Tr (B) Tj ET",
+                    )
+                    pdf.save(self.source)
+                    pdf.close()
+                    with mock.patch.object(
+                        tools.pdfa, "font_usage", return_value=(None, None)
                     ):
+                        self.convert_pdfa(font_files=font_files)
+                    self.assert_rendering_close(self.source, self.output)
+                    with pikepdf.Pdf.open(self.output) as result:
+                        font = result.pages[0].Resources.Font.F1
+                        truetype = font.Subtype == pikepdf.Name.TrueType
                         self.assertEqual(
-                            float(font.Widths[code - int(font.FirstChar)]), width
+                            float(font.FontDescriptor.MissingWidth), default
                         )
-                    names = tools.pdfa.simple_encoding(font, [None] * 256)
-                    self.assertEqual(names[87], "UnavailableInvisibleGlyph")
-                    self.assertIsNone(names[71])
-                self.assert_pdfa("4")
+                        for code, width in (
+                            (1, default),
+                            (70, 0),
+                            (71, 250),
+                            (72, default),
+                            (87, 944),
+                        ):
+                            self.assertEqual(
+                                float(font.Widths[code - int(font.FirstChar)]), width
+                            )
+                        names = tools.pdfa.simple_encoding(font, [None] * 256)
+                        self.assertEqual(names[87], "UnavailableInvisibleGlyph")
+                        # TrueType Differences admit only listed names, so the
+                        # unnamed code takes its WinAnsi name there.
+                        self.assertEqual(names[71], "G" if truetype else None)
+                    # Unlisted names such as /uniE000 stay, and veraPDF refuses
+                    # them in a TrueType font instead of the converter guessing.
+                    if not truetype:
+                        self.assert_pdfa("4")
 
     def test_pdfa_unknown_font_usage_keeps_partial_widths(self):
         for default in (0, 500):
@@ -2048,6 +2061,40 @@ class PDFToolsTests(unittest.TestCase):
                         )
                     else:
                         self.assertEqual(len(images), 1)
+
+    def test_pdfa_truetype_substitute_keeps_adobe_glyph_list_names(self):
+        liberation = fontconfig_file("Liberation Sans")
+        if not liberation:
+            self.skipTest("Liberation Sans is not installed")
+        pdf = pikepdf.Pdf.new()
+        fonts = {
+            # Without /Encoding the font uses StandardEncoding: 0xAE is fi, 0xAF is fl.
+            "F1": simple_font(pdf, "Helvetica"),
+            "F2": simple_font(
+                pdf,
+                "Helvetica",
+                Encoding=pikepdf.Dictionary(
+                    BaseEncoding=pikepdf.Name.WinAnsiEncoding,
+                    Differences=[0xC8, pikepdf.Name.uniFB01],
+                ),
+            ),
+        }
+        text_page(
+            pdf, fonts, b"BT /F1 24 Tf 10 50 Td (A\xae\xaf) Tj /F2 24 Tf (\xc8) Tj ET"
+        )
+        pdf.save(self.source)
+        pdf.close()
+        self.convert_pdfa(font_files={"Helvetica": liberation})
+        with pikepdf.Pdf.open(self.output) as result:
+            for key, codes, names in (
+                ("/F1", (0xAE, 0xAF), ["fi", "fl"]),
+                ("/F2", (0xC8,), ["fi"]),
+            ):
+                font = result.pages[0].Resources.Font[key]
+                self.assertEqual(font.Subtype, pikepdf.Name.TrueType)
+                encoding = tools.pdfa.simple_encoding(font, [None] * 256)
+                self.assertEqual([encoding[code] for code in codes], names)
+        self.assert_pdfa("4")
 
     def test_missing_optional_module_is_reported_without_traceback(self):
         scripts = Path(self.directory.name) / "scripts"
