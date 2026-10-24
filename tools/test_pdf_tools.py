@@ -2042,6 +2042,40 @@ class PDFToolsTests(unittest.TestCase):
                     else:
                         self.assertEqual(len(images), 1)
 
+    def test_pdfa_truetype_substitute_keeps_adobe_glyph_list_names(self):
+        liberation = fontconfig_file("Liberation Sans")
+        if not liberation:
+            self.skipTest("Liberation Sans is not installed")
+        pdf = pikepdf.Pdf.new()
+        fonts = {
+            # Without /Encoding the font uses StandardEncoding: 0xAE is fi, 0xAF is fl.
+            "F1": simple_font(pdf, "Helvetica"),
+            "F2": simple_font(
+                pdf,
+                "Helvetica",
+                Encoding=pikepdf.Dictionary(
+                    BaseEncoding=pikepdf.Name.WinAnsiEncoding,
+                    Differences=[0xC8, pikepdf.Name.uniFB01],
+                ),
+            ),
+        }
+        text_page(
+            pdf, fonts, b"BT /F1 24 Tf 10 50 Td (A\xae\xaf) Tj /F2 24 Tf (\xc8) Tj ET"
+        )
+        pdf.save(self.source)
+        pdf.close()
+        self.convert_pdfa(font_files={"Helvetica": liberation})
+        with pikepdf.Pdf.open(self.output) as result:
+            for key, codes, names in (
+                ("/F1", (0xAE, 0xAF), ["fi", "fl"]),
+                ("/F2", (0xC8,), ["fi"]),
+            ):
+                font = result.pages[0].Resources.Font[key]
+                self.assertEqual(font.Subtype, pikepdf.Name.TrueType)
+                encoding = tools.pdfa.simple_encoding(font, [None] * 256)
+                self.assertEqual([encoding[code] for code in codes], names)
+        self.assert_pdfa("4")
+
     def test_missing_optional_module_is_reported_without_traceback(self):
         scripts = Path(self.directory.name) / "scripts"
         scripts.mkdir()

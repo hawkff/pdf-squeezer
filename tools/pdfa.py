@@ -5,6 +5,7 @@ PDF/A-4 forbids are removed only through an explicit --strip category; otherwise
 the conversion stops with a message naming the object and the option.
 """
 
+import functools
 import hashlib
 import io
 import mimetypes
@@ -1426,6 +1427,31 @@ def glyph_for_name(tt, name):
     return None
 
 
+@functools.cache
+def adobe_glyph_names():
+    """Adobe Glyph List names by Unicode value, preferring the list for new fonts."""
+    from fontTools import agl
+
+    names = {}
+    for name, unicodes in sorted(agl.LEGACY_AGL2UV.items()):
+        if len(unicodes) == 1:
+            names.setdefault(unicodes[0], name)
+    names.update(agl.UV2AGL)
+    return names
+
+
+def agl_name(name):
+    """The Adobe Glyph List name for a glyph name, or None when the list has none."""
+    from fontTools import agl
+
+    if not name or name == ".notdef":
+        return None
+    if name in agl.LEGACY_AGL2UV:
+        return name
+    unicode = agl.toUnicode(name)
+    return adobe_glyph_names().get(ord(unicode)) if len(unicode) == 1 else None
+
+
 def subset_tag(data):
     return "".join(chr(65 + int(c, 16)) for c in hashlib.sha256(data).hexdigest()[:6])
 
@@ -1642,25 +1668,26 @@ def embed_simple_font(pdf, font, codes, invisible_codes, options, notes):
     font.BaseFont = Name("/" + ps_name)
     font.Subtype = subtype
     if subtype == Name.TrueType:
+        # PDF/A accepts only Adobe Glyph List names in TrueType Differences.
         base = standard_encodings()["/WinAnsiEncoding"]
         differences = {}
-        for code, glyph in mapping.items():
-            glyph_name = names[code]
-            if glyph_name not in agl.AGL2UV and not re.fullmatch(
-                r"uni[0-9A-F]{4}", glyph_name
-            ):
-                unicode = agl.toUnicode(glyph_name)
-                glyph_name = (
-                    agl.UV2AGL.get(ord(unicode), f"uni{ord(unicode):04X}")
-                    if len(unicode) == 1
-                    else None
-                )
+        for code in mapping:
+            glyph_name = agl_name(names[code])
+            if glyph_name is None:
+                # No listed name: keep the code's character and let veraPDF refuse it.
+                unicode = agl.toUnicode(names[code])
+                glyph_name = f"uni{ord(unicode):04X}" if len(unicode) == 1 else None
+            if glyph_name and glyph_name != base[code]:
+                differences[code] = glyph_name
+        for code, name in invisible_names.items():
+            # Unnamed invisible codes fall back to WinAnsi; other names are kept.
+            glyph_name = agl_name(name) or (name if name != ".notdef" else None)
             if glyph_name and glyph_name != base[code]:
                 differences[code] = glyph_name
         font.Encoding = Dictionary(
             Type=Name.Encoding,
             BaseEncoding=Name.WinAnsiEncoding,
-            Differences=differences_array(differences | invisible_names),
+            Differences=differences_array(differences),
         )
     else:
         font.Encoding = Dictionary(
