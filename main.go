@@ -115,6 +115,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		outputs[i] = output
 		reserved[output] = true
 	}
+	stderr = &lockedWriter{writer: stderr} // concurrent files share the stream
+	if opts.verbose {
+		log.SetCLILogger(stdlog.New(stderr, "", 0))
+		defer log.DisableLoggers()
+	}
 	var failures []error
 	var pending []*staged
 	verifier := &verifier{stderr: stderr}
@@ -138,36 +143,58 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		}
 		pending = nil
 	}
-	for i, file := range files {
+	type result struct {
+		s   *staged // nil for extraction
+		err error
+	}
+	process := func(i int) result {
 		if err := ctx.Err(); err != nil {
-			flush()
-			return errors.Join(append(failures, err)...)
+			return result{err: err}
 		}
-		output := outputs[i]
 		if outputDir {
-			if err := os.MkdirAll(filepath.Dir(output), 0700); err != nil {
-				failures = append(failures, err)
-				continue
+			if err := os.MkdirAll(filepath.Dir(outputs[i]), 0700); err != nil {
+				return result{err: err}
 			}
 		}
 		if opts.extract != "" {
-			if err := extract(ctx, file.path, output, opts, stderr); err != nil {
-				failures = append(failures, fmt.Errorf("%s: %w", file.path, err))
-				continue
+			return result{err: extract(ctx, files[i].path, outputs[i], opts, stderr)}
+		}
+		s, err := prepare(ctx, files[i].path, outputs[i], opts, stderr)
+		return result{s, err}
+	}
+	// Up to --jobs files are prepared at once; results are published in input order.
+	results := make([]chan result, len(files))
+	for i := range results {
+		results[i] = make(chan result, 1)
+	}
+	go func() {
+		slots := make(chan struct{}, opts.jobs)
+		for i := range files {
+			slots <- struct{}{}
+			go func() {
+				results[i] <- process(i)
+				<-slots
+			}()
+		}
+	}()
+	for i, file := range files {
+		r := <-results[i]
+		switch {
+		case ctx.Err() != nil:
+			if r.s != nil {
+				r.s.cleanup()
 			}
-			fmt.Fprintln(stdout, output)
-			continue
-		}
-		s, err := prepare(ctx, file.path, output, opts, stderr)
-		if err != nil {
-			failures = append(failures, fmt.Errorf("%s: %w", file.path, err))
-			continue
-		}
-		// veraPDF starts a JVM per invocation, so files that need it wait for a batch.
-		pending = append(pending, s)
-		if s.flavour == "" || len(pending) >= validationBatch {
-			verifier.validate(ctx, pending)
-			flush()
+		case r.err != nil:
+			failures = append(failures, fmt.Errorf("%s: %w", file.path, r.err))
+		case r.s == nil:
+			fmt.Fprintln(stdout, outputs[i])
+		default:
+			// veraPDF starts a JVM per invocation, so files that need it wait for a batch.
+			pending = append(pending, r.s)
+			if r.s.flavour == "" || len(pending) >= validationBatch {
+				verifier.validate(ctx, pending)
+				flush()
+			}
 		}
 	}
 	verifier.validate(ctx, pending)
@@ -375,10 +402,6 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 	}()
 	logf("input: %s (%d bytes)", input, info.Size())
 	logf("staging in %s", work)
-	if opts.verbose {
-		log.SetCLILogger(stdlog.New(stderr, "", 0))
-		defer log.DisableLoggers()
-	}
 	conf := configuration(opts.password)
 	pdf, err := api.ReadAndValidate(ctx, in, conf)
 	if err != nil {
