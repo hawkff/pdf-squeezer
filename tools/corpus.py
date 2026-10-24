@@ -17,6 +17,8 @@ import sys
 import time
 from pathlib import Path
 
+GRACE_SECONDS = 60  # after SIGTERM, before SIGKILL
+
 
 def classify(code, stderr):
     if code == 0:
@@ -65,7 +67,12 @@ def main():
     )
     for path in files:
         relative = path.relative_to(args.corpus)
-        output = args.results / relative.parent / f"{relative.stem}.pdfa{args.pdfa}.pdf"
+        # The input's own suffix keeps report.PDF and report.pdf apart.
+        output = (
+            args.results
+            / relative.parent
+            / f"{relative.stem}.pdfa{args.pdfa}{relative.suffix}"
+        )
         output.parent.mkdir(parents=True, exist_ok=True)
         if output.exists() and not args.overwrite:
             outcomes["skipped"] += 1
@@ -97,7 +104,7 @@ def main():
                 # staging files; SIGKILL would leave both behind.
                 process.terminate()
                 try:
-                    process.communicate(timeout=60)
+                    process.communicate(timeout=GRACE_SECONDS)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.communicate()
