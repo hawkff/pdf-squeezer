@@ -648,17 +648,21 @@ func stagingDir(output string) (string, func(), error) {
 	if utf8.ValidString(work) {
 		return work, func() { os.RemoveAll(work) }, nil
 	}
-	alias, err := os.MkdirTemp("", "pdf-squeezer-*")
-	if err == nil {
-		err = os.Symlink(work, filepath.Join(alias, "work"))
+	for _, base := range []string{os.TempDir(), "/tmp"} {
+		alias, err := os.MkdirTemp(base, "pdf-squeezer-*")
+		if err != nil {
+			continue
+		}
+		link := filepath.Join(alias, "work")
+		if !utf8.ValidString(link) || os.Symlink(work, link) != nil {
+			os.RemoveAll(alias)
+			continue
+		}
+		// RemoveAll deletes the link, not its target.
+		return link, func() { os.RemoveAll(alias); os.RemoveAll(work) }, nil
 	}
-	if err != nil {
-		// Native processing still works; only the external tools will refuse the path.
-		os.RemoveAll(alias)
-		return work, func() { os.RemoveAll(work) }, nil
-	}
-	// RemoveAll deletes the link, not its target.
-	return filepath.Join(alias, "work"), func() { os.RemoveAll(alias); os.RemoveAll(work) }, nil
+	// Native processing still works; only the external tools will refuse the path.
+	return work, func() { os.RemoveAll(work) }, nil
 }
 
 func stagePath(dir string) (string, error) {

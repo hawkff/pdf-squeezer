@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // Signal tests run the real entry point in a child copy of this test binary.
@@ -295,17 +296,23 @@ func TestNonUTF8DirectoriesReachPythonAndJava(t *testing.T) {
 	}
 }
 
-func TestNonUTF8DirectoryWithoutAliasKeepsNativeProcessing(t *testing.T) {
+func TestStagingAliasAvoidsNonUTF8TempDirectory(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "M\xe4rz")
 	if err := os.Mkdir(dir, 0700); err != nil {
 		t.Skip("this filesystem rejects names that are not UTF-8:", err)
 	}
-	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing")) // the alias cannot be created
-	input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
-	writeFile(t, input, testPDF(64000))
-	if err := run(t.Context(), []string{"-o", output, input}, io.Discard, io.Discard); err != nil {
+	t.Setenv("TMPDIR", dir) // an alias here would be no better than the original path
+	work, remove, err := stagingDir(filepath.Join(dir, "out.pdf"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	readContext(t, output, "")
+	if !utf8.ValidString(work) {
+		t.Fatalf("staging path %q is not valid UTF-8", work)
+	}
+	writeFile(t, filepath.Join(work, "stage.pdf"), testPDF(0))
+	remove()
 	assertNoTemps(t, dir)
+	if _, err := os.Lstat(filepath.Dir(work)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("alias remains: %v", err)
+	}
 }
