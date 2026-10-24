@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -709,18 +708,8 @@ func checkPDF(file *os.File) error {
 }
 
 func ghostscript(ctx context.Context, input string, output *os.File, opts options, stderr io.Writer) error {
-	names := []string{"gs"}
-	if runtime.GOOS == "windows" {
-		names = []string{"gswin64c", "gswin32c", "gs"}
-	}
-	var executable string
-	for _, name := range names {
-		if path, err := exec.LookPath(name); err == nil {
-			executable = path
-			break
-		}
-	}
-	if executable == "" {
+	executable, err := exec.LookPath("gs")
+	if err != nil {
 		return errors.New("Ghostscript not found in PATH; install it or use --engine pdfcpu")
 	}
 	// With the pdfcpu engine, grayscale and DPI belong to the native/Python passes.

@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -739,9 +738,6 @@ func TestGhostscriptRejectsDroppedImages(t *testing.T) {
 }
 
 func TestBrokenGhostscriptOutput(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("uses a POSIX shell stub")
-	}
 	for _, exit := range []string{"0", "1"} {
 		t.Run("exit="+exit, func(t *testing.T) {
 			dir := t.TempDir()
@@ -809,7 +805,7 @@ func TestPublishFile(t *testing.T) {
 			if same, data := os.SameFile(stagedInfo, info), readFile(t, output); same != linked || string(data) != "staged output" {
 				t.Fatalf("published %q, linked %v, want linked %v", data, same, linked)
 			}
-			if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
+			if info.Mode().Perm() != 0600 {
 				t.Fatalf("output mode %v is not private", info.Mode().Perm())
 			}
 			writeFile(t, other, []byte("replacement"))

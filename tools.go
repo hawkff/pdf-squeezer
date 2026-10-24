@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"sync"
 
@@ -310,23 +309,6 @@ func validatePDFA(ctx context.Context, flavour string, paths []string, stderr io
 		}
 	}
 	args := append([]string{"--format", "xml", "--flavour", flavour, "--maxfailuresdisplayed", "3"}, absolute...)
-	if runtime.GOOS == "windows" && strings.EqualFold(filepath.Ext(binary), ".bat") {
-		// Launch the installed CLI jar directly: cmd.exe would reinterpret paths
-		// containing shell metacharacters or environment-variable expansions.
-		resolved, err := filepath.EvalSymlinks(binary)
-		if err != nil {
-			return nil, err
-		}
-		jars, err := filepath.Glob(filepath.Join(filepath.Dir(resolved), "bin", "cli-*.jar"))
-		if err != nil || len(jars) != 1 {
-			return nil, errors.New("cannot locate veraPDF's CLI jar next to its Windows launcher")
-		}
-		binary, err = exec.LookPath("java")
-		if err != nil {
-			return nil, errors.New("veraPDF requires Java on PATH")
-		}
-		args = append([]string{"-jar", jars[0]}, args...)
-	}
 	cmd := exec.CommandContext(ctx, binary, args...)
 	var report, messages boundedBuffer
 	cmd.Stdout, cmd.Stderr = &report, &messages
