@@ -2057,6 +2057,7 @@ class PDFToolsTests(unittest.TestCase):
             input="{}",
             capture_output=True,
             text=True,
+            timeout=60,
             check=False,
         )
         self.assertEqual(result.returncode, 1)

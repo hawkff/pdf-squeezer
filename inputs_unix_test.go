@@ -4,15 +4,68 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 )
+
+// Signal tests run the real entry point in a child copy of this test binary.
+func TestMain(m *testing.M) {
+	if os.Getenv("PDF_SQUEEZER_TEST_MAIN") == "1" {
+		main()
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
+func TestHangupStopsToolsAndRemovesStaging(t *testing.T) {
+	dir, tools := t.TempDir(), t.TempDir()
+	input, pidFile := filepath.Join(dir, "input.pdf"), filepath.Join(tools, "pid")
+	writeFile(t, input, testPDF(0))
+	stub := filepath.Join(tools, "python")
+	writeFile(t, stub, []byte("#!/bin/sh\necho $$ > \"$TEST_PID\"\nexec sleep 60\n"))
+	if err := os.Chmod(stub, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "--gray", "-o", filepath.Join(dir, "output.pdf"), input)
+	cmd.Env = append(os.Environ(), "PDF_SQUEEZER_TEST_MAIN=1", "PDF_SQUEEZER_PYTHON="+stub, "TEST_PID="+pidFile)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	var pid int
+	for deadline := time.Now().Add(10 * time.Second); pid == 0; time.Sleep(20 * time.Millisecond) {
+		if data, err := os.ReadFile(pidFile); err == nil {
+			pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+		}
+		if pid == 0 && time.Now().After(deadline) {
+			cmd.Process.Kill()
+			t.Fatalf("the tool did not start: %v", <-done)
+		}
+	}
+	if err := cmd.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		cmd.Process.Kill()
+		t.Fatal("the CLI kept running after SIGHUP")
+	}
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		syscall.Kill(pid, syscall.SIGKILL)
+		t.Fatalf("the tool survived the hangup: %v", err)
+	}
+	assertNoTemps(t, dir)
+}
 
 func TestReplacedInputsDoNotBlock(t *testing.T) {
 	for _, mode := range []string{"compress", "images", "text"} {
