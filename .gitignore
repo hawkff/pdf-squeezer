@@ -9,10 +9,7 @@
 go.work
 go.work.sum
 
-# Local configuration and credentials
-AGENTS.md
-AGENTS.local.md
-.pi/
+# Credentials and logs
 .env
 .env.*
 !.env.example

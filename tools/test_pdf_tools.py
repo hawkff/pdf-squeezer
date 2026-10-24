@@ -1504,7 +1504,7 @@ class PDFToolsTests(unittest.TestCase):
                     self.assertIsNone(names[71])
                 self.assert_pdfa("4")
 
-    def test_pdfa_unknown_font_usage_refuses_conflicting_default_metrics(self):
+    def test_pdfa_unknown_font_usage_keeps_partial_widths(self):
         for default in (0, 500):
             with self.subTest(default=default):
                 pdf = pikepdf.Pdf.new()
@@ -1521,19 +1521,48 @@ class PDFToolsTests(unittest.TestCase):
                     LastChar=66,
                     Widths=[667, 667],
                 )
-                text_page(pdf, {"F1": font}, b"BT /F1 24 Tf (AB) Tj ET")
+                text_page(
+                    pdf,
+                    {"F1": font},
+                    b"BT /F1 24 Tf 10 50 Td (A) Tj 3 Tr (W) Tj 0 Tr (B) Tj ET",
+                )
                 pdf.save(self.source)
                 pdf.close()
-                with (
-                    mock.patch.object(
+                for font_files in ({}, {"Helvetica": path}):
+                    with mock.patch.object(
                         tools.pdfa, "font_usage", return_value=(None, None)
-                    ),
-                    self.assertRaisesRegex(
-                        tools.pdfa.ConversionError,
-                        "font usage could not be determined.*conflict",
-                    ),
-                ):
-                    self.convert_pdfa(font_files={"Helvetica": path})
+                    ):
+                        self.convert_pdfa(font_files=font_files)
+                    self.assert_rendering_close(self.source, self.output)
+                    with pikepdf.Pdf.open(self.output) as result:
+                        font = result.pages[0].Resources.Font.F1
+                        self.assertEqual(
+                            float(font.FontDescriptor.MissingWidth), default
+                        )
+                        for code, width in ((65, 667), (66, 667), (87, default)):
+                            self.assertEqual(
+                                float(font.Widths[code - int(font.FirstChar)]), width
+                            )
+                    self.assert_pdfa("4")
+
+    def test_pdfa_unknown_font_usage_refuses_conflicting_explicit_metrics(self):
+        pdf = pikepdf.Pdf.new()
+        path, _ = tools.pdfa.substitute_path("Helvetica", options())
+        font = simple_font(
+            pdf, "Helvetica", FirstChar=65, LastChar=66, Widths=[500, 500]
+        )
+        text_page(pdf, {"F1": font}, b"BT /F1 24 Tf (AB) Tj ET")
+        pdf.save(self.source)
+        pdf.close()
+        for font_files in ({}, {"Helvetica": path}):
+            with (
+                mock.patch.object(tools.pdfa, "font_usage", return_value=(None, None)),
+                self.assertRaisesRegex(
+                    tools.pdfa.ConversionError,
+                    "font usage could not be determined.*conflict",
+                ),
+            ):
+                self.convert_pdfa(font_files=font_files)
 
     def test_pdfa_invisible_advance_without_metrics_fails_closed(self):
         liberation = fontconfig_file("Liberation Sans")

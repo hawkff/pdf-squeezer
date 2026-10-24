@@ -119,6 +119,9 @@ func optimizeImages(ctx context.Context, pdf *model.Context, opts options, logf 
 		if j.reason == "" {
 			j.invert, j.reason = imageDecode(pdf, &sd, j.comps, j.softMask)
 		}
+		if j.reason == "" && !opts.force && len(sd.Raw) < minImageSavings {
+			j.reason = "no gain"
+		}
 		if j.reason == "" {
 			n, ok := sampleSize(*sd.IntEntry("Width"), *sd.IntEntry("Height"), j.comps, *sd.IntEntry("BitsPerComponent"))
 			if !ok {
