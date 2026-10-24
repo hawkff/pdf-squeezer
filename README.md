@@ -10,6 +10,15 @@ Download a binary for Linux, macOS, or Windows from the [releases page](https://
 go install github.com/hawkff/pdf-squeezer@latest
 ```
 
+On Linux, fetch the binary for your architecture (`amd64` or `arm64`), check it against the release checksums, and put it on your `PATH`:
+
+```sh
+curl -fsSLO https://github.com/hawkff/pdf-squeezer/releases/latest/download/pdf-squeezer_linux_amd64
+curl -fsSLO https://github.com/hawkff/pdf-squeezer/releases/latest/download/checksums.txt
+sha256sum --ignore-missing -c checksums.txt
+install -Dm755 pdf-squeezer_linux_amd64 ~/.local/bin/pdf-squeezer
+```
+
 The container image carries every optional tool (Python helpers, qpdf, Ghostscript, veraPDF with a Java runtime, fontconfig with URW and Liberation fonts), so PDF/A conversion works without any setup:
 
 ```sh
@@ -54,7 +63,7 @@ pdf-squeezer --version
 
 Flags may come before or after filenames. Use `--` before a filename that starts with a dash. Short flags are `-o` output, `-V` verbose, `-v` version, and `-h` help.
 
-The CLI leaves inputs unchanged and refuses to overwrite outputs, including symlinks. `--collision number` chooses a numbered name instead. Directory scans skip hidden files, symlinks, and generated `.squeezed.pdf` or `.squeezed.N.pdf` outputs. Batch output retains relative subdirectories beneath an existing output directory. A batch reports individual failures and returns a failing exit status if any input fails. For separate destinations, repeat `-o` once per distinct input file. Inputs keep their command-line order; directory inputs cannot use this form. Every destination is checked before processing begins.
+The CLI leaves inputs unchanged and refuses to overwrite outputs, including symlinks. `--collision number` chooses a numbered name instead. Directory scans skip hidden files, symlinks inside the tree, and generated `.squeezed.pdf` or `.squeezed.N.pdf` outputs. A directory named on the command line may itself be a symlink. Batch output retains relative subdirectories beneath an existing output directory. A batch reports individual failures and returns a failing exit status if any input fails. For separate destinations, repeat `-o` once per distinct input file. Inputs keep their command-line order; directory inputs cannot use this form. Every destination is checked before processing begins.
 
 ```sh
 pdf-squeezer first.pdf second.pdf -o out/first.pdf -o elsewhere/second.pdf
@@ -88,7 +97,7 @@ DPI is a ceiling, not a request to upscale. An image below the selected target s
 
 16-bit samples retain their precision unless `--reduce-bit-depth` permits an 8-bit conversion. Soft masks retain their precision regardless of that flag. Matte-backed images, explicit masks, indexed images, unsupported transfer functions, and unknown filters stay unchanged. The native pass handles identity and inversion `/Decode` arrays and lossless CMYK streams. Use `--extended-images` for supported JPEG 2000 and CMYK JPEG decoding through the optional tools.
 
-`--image-memory 512` sets the native image working-buffer budget in MiB. Workers share this budget and release decoded buffers after each job. It is an estimate, not a process-wide memory ceiling: the parsed document and encoded output also occupy memory. Images above the sample limit or working budget stay unchanged. `-V` reports progress and preservation reasons. Interrupting the CLI cancels processing and terminates optional tool process groups where supported.
+`--image-memory 512` sets the native image working-buffer budget in MiB. Workers share this budget and release decoded buffers after each job. It is an estimate, not a process-wide memory ceiling: the parsed document and encoded output also occupy memory. Images above the sample limit or working budget stay unchanged. `-V` reports progress and preservation reasons. Interrupting or terminating the CLI, or closing its terminal, cancels processing, stops optional tool process groups where supported, and removes staging files.
 
 Identical encoded soft masks share compression work without removing their mask references. The native encoder tries JPEG first when permitted and stops competing encodings once their payload exceeds the current winner. It preserves the same codec choice and tie order without completing losing candidates.
 
@@ -106,7 +115,13 @@ python3 -m venv .venv
 export PDF_SQUEEZER_PYTHON="$PWD/.venv/bin/python"
 ```
 
-On Windows, set `PDF_SQUEEZER_PYTHON` to the environment's `Scripts\python.exe`. Otherwise the CLI looks for `python3` on `PATH`. The processing script is embedded in the Go binary; users do not need to copy it beside the executable.
+On Windows, set `PDF_SQUEEZER_PYTHON` to the environment's `Scripts\python.exe`. Otherwise the CLI looks for `python3` on `PATH`. The processing script is embedded in the Go binary; users do not need to copy it beside the executable. The CLI starts Python in isolated mode (`-I`), which ignores `PYTHONPATH` and packages installed with `pip install --user`. Use a virtual environment or your distribution's packages.
+
+On Debian or Ubuntu, the distribution provides the other optional tools. veraPDF and jbig2enc's `jbig2` need separate installs.
+
+```sh
+sudo apt install qpdf ghostscript jbig2dec default-jre-headless fontconfig fonts-urw-base35 fonts-liberation python3-venv
+```
 
 The optional dependencies have their own licenses. In particular, Ghostscript and PyMuPDF/MuPDF use AGPL or commercial licensing, and veraPDF is GPL/MPL. They are separate installations, not bundled third-party binaries. The binary does embed the ICC sRGB profile `sRGB2014.icc`, which the International Color Consortium distributes without restriction.
 
@@ -293,9 +308,9 @@ Bitmap output replaces pages with rendered images. MRC output separates a high-r
 
 ## File safety
 
-- All output is staged and validated before exclusive destination creation. Inputs and existing outputs are never replaced or moved to Trash.
-- A crash during the final copy can leave an incomplete new destination. Remove it before retrying. A reported write failure removes partial output.
-- Temporary working files and output use private permissions where the filesystem supports them. Keep enough space for intermediates and the final copy.
+- All output is staged and validated before it gets its final name. Inputs and existing outputs are never replaced or moved to Trash.
+- The CLI publishes the staged result with a hard link, so a crash cannot leave a partial output. Filesystems without hard links, such as FAT and exFAT, get a copy instead, and a crash during that copy can leave an incomplete destination. Remove it before retrying. A reported write failure removes partial output.
+- Staging happens in a private directory next to the output, and optional tools keep their scratch files there. Temporary files and output use private permissions where the filesystem supports them. Keep free space next to the output for a few copies of the document.
 - Compression invalidates digital signatures. Ghostscript, font rewriting, flattening, rasterization, and PDF/A-4 conversion can change document features. Keep originals and inspect results.
 - Default compression and the open-source processing tools run locally. Keep PDF parsers and optional tools patched before processing untrusted documents.
 
