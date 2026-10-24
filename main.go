@@ -757,6 +757,10 @@ func ghostscript(ctx context.Context, input string, output *os.File, opts option
 // atomically and the link fails if path exists. Filesystems without hard links
 // get an exclusive copy instead.
 func publishFile(ctx context.Context, staged, path string) (int64, error) {
+	// Tools may create stages with any mode. Outputs stay private, with their data on disk before the name.
+	if err := os.Chmod(staged, 0600); err != nil {
+		return 0, err
+	}
 	source, err := os.OpenFile(staged, os.O_RDWR, 0)
 	if err != nil {
 		return 0, err
@@ -766,11 +770,10 @@ func publishFile(ctx context.Context, staged, path string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	// Tools may recreate staged files. Outputs stay private, with their data on disk before the name.
-	if err := errors.Join(source.Chmod(0600), source.Sync(), ctx.Err()); err != nil {
+	if err := errors.Join(source.Sync(), ctx.Err()); err != nil {
 		return 0, err
 	}
-	err = os.Link(staged, path)
+	err = link(staged, path)
 	if err == nil {
 		return info.Size(), nil
 	}
@@ -779,6 +782,8 @@ func publishFile(ctx context.Context, staged, path string) (int64, error) {
 	}
 	return writeNew(ctx, path, source)
 }
+
+var link = os.Link // tests replace it to reach the copy fallback
 
 // shortcut: hard-link publication falls back to this copy, which a crash can leave partial; add a no-replace rename where the platform has one.
 func writeNew(ctx context.Context, path string, source io.Reader) (written int64, err error) {

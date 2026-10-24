@@ -780,35 +780,46 @@ func TestWriteNewFailure(t *testing.T) {
 	}
 }
 
-func TestPublishFileLinksPrivateOutput(t *testing.T) {
-	dir := t.TempDir()
-	staged, output, other := filepath.Join(dir, "stage.pdf"), filepath.Join(dir, "out.pdf"), filepath.Join(dir, "other.pdf")
-	if err := os.WriteFile(staged, []byte("staged output"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if written, err := publishFile(t.Context(), staged, output); err != nil || written != 13 {
-		t.Fatalf("publish: %d bytes, %v", written, err)
-	}
-	stagedInfo, err := os.Stat(staged)
-	if err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(output)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !os.SameFile(stagedInfo, info) {
-		t.Fatal("output was copied instead of linked")
-	}
-	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
-		t.Fatalf("output mode %v is not private", info.Mode().Perm())
-	}
-	writeFile(t, other, []byte("replacement"))
-	if _, err := publishFile(t.Context(), other, output); !errors.Is(err, os.ErrExist) {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(readFile(t, output)) != "staged output" {
-		t.Fatal("existing output changed")
+func TestPublishFile(t *testing.T) {
+	for _, linked := range []bool{true, false} {
+		t.Run(fmt.Sprintf("linked=%v", linked), func(t *testing.T) {
+			dir := t.TempDir()
+			staged, output, other := filepath.Join(dir, "stage.pdf"), filepath.Join(dir, "out.pdf"), filepath.Join(dir, "other.pdf")
+			// Tools can leave a stage without owner write permission.
+			if err := os.WriteFile(staged, []byte("staged output"), 0400); err != nil {
+				t.Fatal(err)
+			}
+			if !linked {
+				link = func(string, string) error { return errors.ErrUnsupported }
+				t.Cleanup(func() { link = os.Link })
+			} else if err := os.Link(staged, filepath.Join(dir, "probe")); err != nil {
+				t.Skip("no hard links on this filesystem:", err)
+			}
+			if written, err := publishFile(t.Context(), staged, output); err != nil || written != 13 {
+				t.Fatalf("publish: %d bytes, %v", written, err)
+			}
+			stagedInfo, err := os.Stat(staged)
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if same, data := os.SameFile(stagedInfo, info), readFile(t, output); same != linked || string(data) != "staged output" {
+				t.Fatalf("published %q, linked %v, want linked %v", data, same, linked)
+			}
+			if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
+				t.Fatalf("output mode %v is not private", info.Mode().Perm())
+			}
+			writeFile(t, other, []byte("replacement"))
+			if _, err := publishFile(t.Context(), other, output); !errors.Is(err, os.ErrExist) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if string(readFile(t, output)) != "staged output" {
+				t.Fatal("existing output changed")
+			}
+		})
 	}
 }
 

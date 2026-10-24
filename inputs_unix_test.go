@@ -243,36 +243,25 @@ func TestExpandInputsSkipsSpecialFiles(t *testing.T) {
 
 func TestFinishedStagesAreRemovedEarly(t *testing.T) {
 	requireTool(t, "qpdf")
-	requireTool(t, "gs")
-	real, err := exec.LookPath("gs")
-	if err != nil {
-		t.Fatal(err)
-	}
 	dir, tools := t.TempDir(), t.TempDir()
-	plain, input, output := filepath.Join(dir, "plain.pdf"), filepath.Join(dir, "input.pdf"), filepath.Join(dir, "output.pdf")
-	owner, record := filepath.Join(tools, "owner.txt"), filepath.Join(tools, "record")
-	writeFile(t, plain, testPDF(64000))
-	writeFile(t, owner, []byte("example-owner\n"))
-	if err := run(t.Context(), []string{"--encrypt-owner-file", owner, "-o", input, plain}, io.Discard, io.Discard); err != nil {
-		t.Fatal(err)
-	}
-	stub := filepath.Join(tools, "gs")
-	writeFile(t, stub, []byte("#!/bin/sh\nls \"$TEST_DIR\"/.pdf-squeezer-*/ | grep -c '^stage-' > \"$TEST_RECORD\"\nexec \"$TEST_TOOL\" \"$@\"\n"))
+	input, output, record := filepath.Join(dir, "input.pdf"), filepath.Join(dir, "output.pdf"), filepath.Join(tools, "record")
+	writeFile(t, input, testPDF(64000))
+	// A Python stand-in that copies its input and counts stages; arguments are -I script operation input output.
+	stub := filepath.Join(tools, "python")
+	writeFile(t, stub, []byte("#!/bin/sh\nprintf '%s %s\\n' \"$3\" \"$(ls \"$(dirname \"$5\")\" | grep -c '^stage-')\" >> \"$TEST_RECORD\"\ncp \"$4\" \"$5\"\n"))
 	if err := os.Chmod(stub, 0700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("TEST_DIR", dir)
 	t.Setenv("TEST_RECORD", record)
-	t.Setenv("TEST_TOOL", real)
-	t.Setenv("PATH", tools+string(os.PathListSeparator)+os.Getenv("PATH"))
-	// Decryption and inline-image externalization both finish before Ghostscript starts.
-	args := []string{"--password-file", owner, "--inline-images", "--convert-fonts-cff", "-o", output, input}
-	if err := run(t.Context(), args, io.Discard, io.Discard); err != nil {
+	t.Setenv("PDF_SQUEEZER_PYTHON", stub)
+	// Inline-image externalization and the transform pass finish before pdfcpu writes;
+	// the monochrome pass follows that write.
+	if err := run(t.Context(), []string{"--inline-images", "--mono-codecs", "ccitt", "-o", output, input}, io.Discard, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	// The input snapshot, the externalized stage, and Ghostscript's empty output.
-	if count := strings.TrimSpace(string(readFile(t, record))); count != "3" {
-		t.Fatalf("%s stage files existed while Ghostscript ran, want 3", count)
+	// Each pass sees the input snapshot, its own input, and its empty output.
+	if got := string(readFile(t, record)); got != "transform 3\nmonochrome 3\n" {
+		t.Fatalf("stage files while tools ran:\n%s", got)
 	}
 	assertNoTemps(t, dir)
 }
