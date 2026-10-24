@@ -24,7 +24,8 @@ import (
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// A closed terminal cancels too, so tool process groups and staging files are cleaned up.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	err := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
 	stop()
 	if err != nil && !errors.Is(err, flag.ErrHelp) {
@@ -473,16 +474,11 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 	}
 	if opts.engine == "ghostscript" || opts.cffFonts {
 		err = apply("rewriting with Ghostscript", func(src, dst string) error {
-			input, err := os.Open(src)
-			if err != nil {
-				return err
-			}
-			defer input.Close()
 			output, err := os.OpenFile(dst, os.O_WRONLY|os.O_TRUNC, 0600)
 			if err != nil {
 				return err
 			}
-			err = ghostscript(ctx, input, output, opts, stderr)
+			err = ghostscript(ctx, src, output, opts, stderr)
 			return errors.Join(err, output.Close())
 		})
 		if err != nil {
@@ -681,7 +677,7 @@ func checkPDF(file *os.File) error {
 	return nil
 }
 
-func ghostscript(ctx context.Context, input, output *os.File, opts options, stderr io.Writer) error {
+func ghostscript(ctx context.Context, input string, output *os.File, opts options, stderr io.Writer) error {
 	names := []string{"gs"}
 	if runtime.GOOS == "windows" {
 		names = []string{"gswin64c", "gswin32c", "gs"}
@@ -730,16 +726,17 @@ func ghostscript(ctx context.Context, input, output *os.File, opts options, stde
 	if opts.cffFonts {
 		args = append(args, "-c", "<< /NeverEmbed [] >> setdistillerparams")
 	}
-	args = append(args, "-f", "-")
+	// Ghostscript spools piped PDF input to a temporary copy; a staged path is read in place.
+	args = append(args, "-f", input)
 	cmd := exec.CommandContext(ctx, executable, args...)
-	cmd.Stdin, cmd.Stdout = contextReader{ctx, input}, output
+	cmd.Stdout = output
 	var messages boundedBuffer
 	cmd.Stderr = &messages
 	if opts.verbose {
 		cmd.Stderr = io.MultiWriter(stderr, &messages)
 		fmt.Fprintln(stderr, "running Ghostscript")
 	}
-	cmd.Env = append(os.Environ(), "GS_OPTIONS=")
+	cmd.Env = append(privateTemp(filepath.Dir(input)), "GS_OPTIONS=")
 	configureCommand(cmd)
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {

@@ -89,6 +89,12 @@ func toolError(ctx context.Context, name string, err error, output *boundedBuffe
 	return nil
 }
 
+// privateTemp points a tool's scratch files at the private staging directory,
+// which is removed even when a canceled tool is killed before its own cleanup.
+func privateTemp(dir string) []string {
+	return append(os.Environ(), "TMPDIR="+dir, "TEMP="+dir)
+}
+
 func qpdf(ctx context.Context, args []string, password string, stderr io.Writer) error {
 	path, err := exec.LookPath("qpdf")
 	if err != nil {
@@ -171,7 +177,7 @@ func pythonPDF(ctx context.Context, operation, input, output string, opts option
 		return err
 	}
 	cmd := exec.CommandContext(ctx, path, "-I", filepath.Join(dir, "pdf_tools.py"), operation, input, output)
-	cmd.Stdin = bytes.NewReader(data)
+	cmd.Stdin, cmd.Env = bytes.NewReader(data), privateTemp(dir)
 	var messages boundedBuffer
 	cmd.Stdout, cmd.Stderr = &messages, &messages
 	configureCommand(cmd)
