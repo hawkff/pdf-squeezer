@@ -768,9 +768,6 @@ func requirePythonTools(t *testing.T) {
 }
 
 func TestPDFAValidationFailsClosed(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX tool stub")
-	}
 	dir := t.TempDir()
 	document := filepath.Join(dir, "declared.pdf")
 	writeFile(t, document, pdfaPDF("4", ""))
@@ -902,9 +899,6 @@ func TestPreparedInputSnapshot(t *testing.T) {
 }
 
 func TestVerifierRetrySeparatesToolFailuresAndVerdicts(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX tool stub")
-	}
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "verapdf")
 	writeFile(t, stub, []byte(`#!/bin/sh
