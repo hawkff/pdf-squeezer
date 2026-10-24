@@ -7,6 +7,7 @@ import os
 import random
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import zlib
@@ -2040,6 +2041,28 @@ class PDFToolsTests(unittest.TestCase):
                         )
                     else:
                         self.assertEqual(len(images), 1)
+
+    def test_missing_optional_module_is_reported_without_traceback(self):
+        scripts = Path(self.directory.name) / "scripts"
+        scripts.mkdir()
+        for name in ("pdf_tools.py", "pdfa.py"):
+            shutil.copy(Path(__file__).with_name(name), scripts / name)
+        # The script directory comes first on sys.path, so this shadows pikepdf.
+        (scripts / "pikepdf.py").write_text(
+            "raise ModuleNotFoundError(\"No module named 'pikepdf'\", name='pikepdf')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-I", str(scripts / "pdf_tools.py"), "transform"]
+            + [self.source, self.output],
+            input="{}",
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Missing optional module pikepdf", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":

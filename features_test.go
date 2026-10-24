@@ -458,6 +458,37 @@ func TestExpandInputsSkipsHiddenDirectories(t *testing.T) {
 	}
 }
 
+func TestExpandInputsFollowsNamedSymlinkDirectory(t *testing.T) {
+	dir := t.TempDir()
+	real, link := filepath.Join(dir, "real"), filepath.Join(dir, "link")
+	for _, name := range []string{"a.pdf", "child/b.pdf"} {
+		path := filepath.Join(real, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, path, nil)
+	}
+	if err := os.Symlink(real, link); err != nil {
+		t.Skip(err)
+	}
+	for recursive, want := range map[bool]string{false: "a.pdf", true: "a.pdf child/b.pdf"} {
+		files, err := expandInputs(t.Context(), []string{link}, recursive)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, file := range files {
+			if file.path != filepath.Join(link, file.relative) {
+				t.Errorf("%s is not reported under the named directory", file.path)
+			}
+			got = append(got, filepath.ToSlash(file.relative))
+		}
+		if strings.Join(got, " ") != want {
+			t.Fatalf("recursive=%v: got %v, want %s", recursive, got, want)
+		}
+	}
+}
+
 func TestProfilesBatchAndTimestamps(t *testing.T) {
 	dir, output := t.TempDir(), t.TempDir()
 	profilePath := filepath.Join(t.TempDir(), "profile.json")
