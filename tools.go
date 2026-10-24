@@ -408,11 +408,11 @@ func extract(ctx context.Context, input, output string, opts options, stderr io.
 	if err := checkPDF(f); err != nil {
 		return err
 	}
-	work, err := os.MkdirTemp(filepath.Dir(output), ".pdf-squeezer-*")
+	work, removeWork, err := stagingDir(output)
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(work)
+	defer removeWork()
 	if opts.extract == "text" || opts.inline {
 		if input, err = stagePath(work); err != nil {
 			return err
