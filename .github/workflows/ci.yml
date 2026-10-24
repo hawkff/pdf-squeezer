@@ -15,29 +15,29 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TARGETS: linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
+  TARGETS: linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 jobs:
   check:
     runs-on: namespace-profile-default
-    # Ubuntu 24.04 ships Ghostscript 10, whose PDF interpreter the image-skipping test targets.
-    container: ubuntu:24.04
+    # Debian 13 ships Ghostscript 10, whose PDF interpreter the image-skipping test targets.
+    container: debian:trixie
     timeout-minutes: 15
     steps:
       - name: Install PDF tools and test dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
         run: apt-get update && apt-get install -y --no-install-recommends ghostscript qpdf poppler-utils gcc g++ make libc6-dev ca-certificates git cmake pkg-config libleptonica-dev jbig2dec python3 python3-venv fonts-dejavu-core fontconfig fonts-urw-base35 fonts-liberation default-jre-headless curl unzip
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          # go.mod names the oldest supported release; builds take its newest security patch.
-          go-version: "1.26"
+          # go.mod names the oldest supported release; builds take the newest one.
+          go-version: stable
           check-latest: true
       - name: Install optional Python tools
         run: |
           python3 -m venv "$RUNNER_TEMP/pdf-tools"
-          "$RUNNER_TEMP/pdf-tools/bin/pip" install -r tools/requirements.txt ruff==0.16.10
+          "$RUNNER_TEMP/pdf-tools/bin/pip" install -r tools/requirements.txt ruff==0.17.2
           echo "$RUNNER_TEMP/pdf-tools/bin" >> "$GITHUB_PATH"
       - name: Install lossless JBIG2 encoder
         run: |
@@ -49,31 +49,9 @@ jobs:
           cmake --build "$RUNNER_TEMP/jbig2enc/build" -j4
           cmake --install "$RUNNER_TEMP/jbig2enc/build"
       - name: Install veraPDF
-        # Pinned release with its checksum. The IzPack installer needs an answer
-        # file; the GUI pack carries the CLI scripts.
         run: |
-          cd "$RUNNER_TEMP"
-          curl -fsSL -o verapdf-installer.zip https://software.verapdf.org/releases/1.30/verapdf-greenfield-1.30.2-installer.zip
-          echo "6cc6341cb1af644044054b81f00a6590a7918abb18f762243de115258bcad838  verapdf-installer.zip" | sha256sum -c -
-          unzip -q verapdf-installer.zip
-          cat > verapdf-auto.xml <<EOF
-          <AutomatedInstallation langpack="eng">
-            <com.izforge.izpack.panels.htmlhello.HTMLHelloPanel id="welcome"/>
-            <com.izforge.izpack.panels.target.TargetPanel id="install_dir"><installpath>$RUNNER_TEMP/verapdf</installpath></com.izforge.izpack.panels.target.TargetPanel>
-            <com.izforge.izpack.panels.packs.PacksPanel id="sdk_pack_select">
-              <pack index="0" name="veraPDF GUI" selected="true"/>
-              <pack index="1" name="veraPDF Mac and *nix Scripts" selected="true"/>
-              <pack index="2" name="veraPDF Validation model" selected="false"/>
-              <pack index="3" name="veraPDF Documentation" selected="false"/>
-              <pack index="4" name="veraPDF Sample Plugins" selected="false"/>
-            </com.izforge.izpack.panels.packs.PacksPanel>
-            <com.izforge.izpack.panels.install.InstallPanel id="install"/>
-            <com.izforge.izpack.panels.finish.FinishPanel id="finish"/>
-          </AutomatedInstallation>
-          EOF
-          verapdf-*/verapdf-install "$RUNNER_TEMP/verapdf-auto.xml"
+          sh tools/install-verapdf.sh "$RUNNER_TEMP/verapdf"
           echo "$RUNNER_TEMP/verapdf" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/verapdf/verapdf" --version
       - name: Check formatting and Python lint
         run: |
           test -z "$(gofmt -l .)"
@@ -96,6 +74,49 @@ jobs:
             CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -trimpath -buildvcs=false -o /tmp/pdf-squeezer .
           done
 
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          check-latest: true
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Install PDF tools and test dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install qpdf ghostscript poppler jbig2dec jbig2enc fontconfig
+          brew install --cask font-liberation
+      - name: Install optional Python tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pdf-tools"
+          "$RUNNER_TEMP/pdf-tools/bin/pip" install -r tools/requirements.txt
+          echo "$RUNNER_TEMP/pdf-tools/bin" >> "$GITHUB_PATH"
+      - name: Install veraPDF
+        run: |
+          sh tools/install-verapdf.sh "$RUNNER_TEMP/verapdf"
+          echo "$RUNNER_TEMP/verapdf" >> "$GITHUB_PATH"
+      - name: Test both engines
+        env:
+          PDF_SQUEEZER_INTEGRATION: "1"
+        run: go test -race ./...
+      - name: Compare PDF rendering and optional operations
+        env:
+          PDF_SQUEEZER_INTEGRATION: "1"
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+
   image:
     needs: check
     runs-on: namespace-profile-default
@@ -104,20 +125,20 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false # the build context must not carry the token
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Log in to GHCR
         if: github.ref_type == 'tag'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build the image with every optional tool; push on tags
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: ${{ github.ref_type == 'tag' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
@@ -128,19 +149,19 @@ jobs:
 
   release:
     if: github.ref_type == 'tag'
-    needs: [check, image]
+    needs: [check, macos, image]
     runs-on: namespace-profile-default
     timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # Go stamps the version from the tag on HEAD.
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          # go.mod names the oldest supported release; builds take its newest security patch.
-          go-version: "1.26"
+          # go.mod names the oldest supported release; builds take the newest one.
+          go-version: stable
           check-latest: true
       - name: Build release binaries
         # Build outside the checkout: files in the tree would mark Go's version stamp +dirty.
@@ -148,7 +169,6 @@ jobs:
           mkdir "$RUNNER_TEMP/dist"
           for target in $TARGETS; do
             name="pdf-squeezer_${target%/*}_${target#*/}"
-            [ "${target%/*}" = windows ] && name="$name.exe"
             CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build -trimpath -ldflags="-s -w" -o "$RUNNER_TEMP/dist/$name" .
           done
           cp tools/requirements.txt "$RUNNER_TEMP/dist/pdf-tools-requirements.txt"

@@ -30,7 +30,6 @@ esac
 """
 
 
-@unittest.skipIf(sys.platform == "win32", "POSIX shell stub")
 class CorpusTests(unittest.TestCase):
     def run_corpus(self, *names):
         directory = tempfile.TemporaryDirectory()
