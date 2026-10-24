@@ -301,7 +301,7 @@ Bitmap output replaces pages with rendered images. MRC output separates a high-r
 
 ## Development
 
-CI runs on Namespace. It runs Go tests with the race detector, `go vet`, formatting checks, Python lint checks, and synthetic render-comparison tests. It cross-compiles standalone binaries for the supported targets.
+CI runs Go tests with the race detector, `go vet`, formatting checks, Python lint checks, and synthetic render-comparison tests. It cross-compiles standalone binaries for the supported targets.
 
 The tests cover shared-image cropping and DPI, masks and scan codecs, CMYK/JPEG 2000, font merging/subsetting, flattening and raster output, and PDF/A conversion of fonts, color, attachments, annotations, and forbidden features at every level, each verified with veraPDF. CI also builds the container image and pushes it on release tags. A missing optional dependency or a noncompliant validator report must fail without publishing an output.
 
