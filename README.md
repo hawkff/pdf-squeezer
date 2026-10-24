@@ -1,210 +1,247 @@
 # pdf-squeezer
 
-A PDF compressor and PDF/A-4 converter written in Go. Default compression needs no external software. Optional local tools add image cropping, scan codecs, font optimization, and archival conversion.
+pdf-squeezer compresses PDF files and converts them to PDF/A. It is a single Go binary for Linux and macOS, and its default compression needs no other software. Optional tools add downsampling, cropping, scan codecs, font work, and PDF/A conversion.
+
+## Contents
+
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Optional tools](#optional-tools)
+- [Compression levels](#compression-levels)
+- [Images](#images)
+- [Output files and batches](#output-files-and-batches)
+- [Document changes](#document-changes)
+- [Profiles](#profiles)
+- [Passwords and encryption](#passwords-and-encryption)
+- [PDF/A](#pdfa)
+- [Extraction and raster output](#extraction-and-raster-output)
+- [Troubleshooting](#troubleshooting)
+- [Safety notes](#safety-notes)
+- [Development](#development)
+- [License](#license)
 
 ## Install
 
-Download a binary for Linux or macOS from the [releases page](https://github.com/hawkff/pdf-squeezer/releases), or install with Go 1.26 or newer:
+Download a binary from the [releases page](https://github.com/hawkff/pdf-squeezer/releases). Builds exist for `linux_amd64`, `linux_arm64`, `darwin_arm64` for Apple silicon, and `darwin_amd64` for Intel Macs. Check the file against `checksums.txt` and put it on your `PATH`:
 
 ```sh
-go install github.com/hawkff/pdf-squeezer@latest
-```
-
-On Linux, fetch the binary for your architecture (`amd64` or `arm64`), check it against the release checksums, and put it on your `PATH`:
-
-```sh
-curl -fsSLO https://github.com/hawkff/pdf-squeezer/releases/latest/download/pdf-squeezer_linux_amd64
+asset=pdf-squeezer_linux_amd64
+curl -fsSLO "https://github.com/hawkff/pdf-squeezer/releases/latest/download/$asset"
 curl -fsSLO https://github.com/hawkff/pdf-squeezer/releases/latest/download/checksums.txt
-sha256sum --ignore-missing -c checksums.txt
-install -Dm755 pdf-squeezer_linux_amd64 ~/.local/bin/pdf-squeezer
+sha256sum --ignore-missing -c checksums.txt   # on macOS: shasum -a 256 --ignore-missing -c checksums.txt
+mkdir -p ~/.local/bin && install -m 755 "$asset" ~/.local/bin/pdf-squeezer
 ```
 
-The container image carries every optional tool (Python helpers, qpdf, Ghostscript, veraPDF with a Java runtime, fontconfig with URW and Liberation fonts), so PDF/A conversion works without any setup:
+On macOS, a binary downloaded with a browser runs only after `xattr -d com.apple.quarantine FILE`.
+
+With Go 1.26 or newer, `go install github.com/hawkff/pdf-squeezer@latest` builds and installs it.
+
+The container image includes every optional tool. `--user` lets it write to the current directory as you:
 
 ```sh
 docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/data" ghcr.io/hawkff/pdf-squeezer:latest --pdfa 4 report.pdf
 ```
 
-The image runs as an unprivileged user; `--user` makes the output files yours.
-
-## Use
+## Quick start
 
 ```sh
-# Structural optimization; writes document.squeezed.pdf next to the input
-pdf-squeezer document.pdf
-
-# Choose an output file or existing directory
-pdf-squeezer document.pdf -o smaller.pdf
-pdf-squeezer document.pdf -o out/
-
-# Choose a compression tier without flattening the document
-pdf-squeezer --compression medium scan.pdf
-pdf-squeezer --compression heavy scan.pdf
-
-# Set image encoding options directly
-pdf-squeezer --images --image-quality 75 scan.pdf
-
-# Re-encode without discarding sample precision or recompressing JPEG
-pdf-squeezer --lossless document.pdf
-
-# Multiple files, or PDFs in a directory tree
-pdf-squeezer first.pdf second.pdf -o out/
-pdf-squeezer --recursive documents/ -o out/
-
-# Strip identifying document metadata
-pdf-squeezer --privacy document.pdf
-
-# Convert to PDF/A-4, verified by veraPDF
-pdf-squeezer --pdfa 4 report.pdf
-
-pdf-squeezer --help
-pdf-squeezer --version
+pdf-squeezer document.pdf                     # writes document.squeezed.pdf next to the input
+pdf-squeezer document.pdf -o smaller.pdf      # picks the output file
+pdf-squeezer --compression balanced scan.pdf  # recompresses images with the built-in encoder
+pdf-squeezer --compression medium scan.pdf    # also downsamples and crops images; needs the optional tools
+pdf-squeezer --recursive documents/ -o out/   # every PDF in a directory tree
+pdf-squeezer --privacy document.pdf           # removes identifying metadata
+pdf-squeezer --pdfa 4 report.pdf              # converts to PDF/A-4, checked by veraPDF
 ```
 
-Flags may come before or after filenames. Use `--` before a filename that starts with a dash. Short flags are `-o` output, `-V` verbose, `-v` version, and `-h` help.
-
-The CLI leaves inputs unchanged and refuses to overwrite outputs, including symlinks. `--collision number` chooses a numbered name instead. Directory scans skip hidden files, symlinks inside the tree, and generated `.squeezed.pdf` or `.squeezed.N.pdf` outputs. A directory named on the command line may itself be a symlink. Batch output retains relative subdirectories beneath an existing output directory. A batch reports individual failures and returns a failing exit status if any input fails. For separate destinations, repeat `-o` once per distinct input file. Inputs keep their command-line order; directory inputs cannot use this form. Every destination is checked before processing begins.
-
-`--jobs N` prepares up to N files of a batch at once. Reports and published outputs keep input order. Each file has its own `--image-memory` budget, so N jobs can use N times that memory for images.
-
-```sh
-pdf-squeezer first.pdf second.pdf -o out/first.pdf -o elsewhere/second.pdf
-```
-
-Compression keeps the original bytes when the result would be no smaller. Explicit document changes, including privacy, metadata edits, grayscale, encryption, removals, flattening, raster conversion, and PDF/A-4 conversion, keep their result even when it is larger. `--force-recompression` also disables the size fallback. Unsupported or unsafe images remain untouched even with that flag.
-
-## Compression tiers
-
-`--compression light|balanced|medium|strong|heavy` sets image-compression defaults. Without this flag, default structural optimization stays unchanged.
-
-| Tier | JPEG quality | Allow 16-bit to 8-bit images | Target color/gray DPI | Other work |
-| --- | ---: | --- | ---: | --- |
-| `light` | 90 | No | Unchanged | Compare JPEG and lossless Flate |
-| `balanced` | 85 | Yes | Unchanged | Same codec comparison |
-| `medium` | 65 | Yes | 150 | Crop unused margins; include inline images |
-| `strong` | 45 | Yes | 120 | Same placement-aware work |
-| `heavy` | 30 | Yes | 96 | Also merge compatible fonts; try maximum-effort Flate with and without PNG predictors |
-
-Light and balanced need no external tools. Medium and strong need the Python tools and qpdf. Heavy also uses the fontTools package included in the Python requirements. Missing tools cause an error, not a fallback to another engine.
-
-Tiers never enable rasterization, flattening, grayscale conversion, metadata stripping, or removal of fonts, tags, links, forms, or attachments. They retain soft-mask precision. Higher tiers permit more image loss; heavy can introduce visible JPEG artifacts around small text and colored edges. They do not guarantee a reduction percentage or a smaller result on every document. The no-size-gain fallback still applies.
-
-DPI is a ceiling, not a request to upscale. An image below the selected target stays at its existing resolution. Tier settings are defaults: profile values override them, and explicit flags override both. For example, `--compression strong --image-quality 70 --dpi 0` retains resolution and uses JPEG quality 70. `--lossless` rejects tier settings that would discard precision or resolution; use it without a tier for preservation.
-
-## Image compression
-
-`--images` handles supported 1-, 8-, and 16-bit image samples. It compares Flate compression with PNG predictors against JPEG, with configurable `--image-quality 1..100` and `--image-codecs flate,jpeg`. A native re-encode normally needs to save at least 2% and 1 KiB.
-
-`--color-reduction exact`, the default, lets the lossy path reduce exactly gray DeviceRGB samples to DeviceGray and exact black-and-white gray samples to 1-bit. `--color-reduction preserve` disables both classifications while still allowing JPEG. It does not disable separately requested `--reduce-bit-depth` or `--gray` conversion. It preserves ICC color spaces and avoids grayscale reclassification when the document overrides default color spaces. `--lossless` forbids JPEG re-encoding, color-space changes, downsampling, and bit-depth reduction. Existing JPEG data stays encoded in that mode.
-
-16-bit samples retain their precision unless `--reduce-bit-depth` permits an 8-bit conversion. Soft masks retain their precision regardless of that flag. Matte-backed images, explicit masks, indexed images, unsupported transfer functions, and unknown filters stay unchanged. The native pass handles identity and inversion `/Decode` arrays and lossless CMYK streams. Use `--extended-images` for supported JPEG 2000 and CMYK JPEG decoding through the optional tools.
-
-`--image-memory 512` sets the native image working-buffer budget in MiB. Workers share this budget and release decoded buffers after each job. It is an estimate, not a process-wide memory ceiling: the parsed document and encoded output also occupy memory. Images above the sample limit or working budget stay unchanged. `-V` reports progress and preservation reasons. Interrupting or terminating the CLI, or closing its terminal, cancels processing, stops optional tool process groups where supported, and removes staging files.
-
-Identical encoded soft masks share compression work without removing their mask references. The native encoder tries JPEG first when permitted and stops competing encodings once their payload exceeds the current winner. It preserves the same codec choice and tie order without completing losing candidates.
-
-After image transformations, the CLI deduplicates equivalent streams. Exact encoded duplicates bypass decoding; other generalized lossless filters are compared by decoded bytes. Specialized image codecs retain their encoding parameters, and the smallest equivalent encoding wins. The CLI also enables pdfcpu's duplicate-content-stream optimization.
+Each run prints the old and new size. If a file does not shrink, the output is a copy of the original, and the CLI suggests an option to try. Flags can go before or after file names. `-V` reports progress, and `pdf-squeezer --help` lists every flag.
 
 ## Optional tools
 
-Nothing is installed automatically. A requested tool that is missing or fails stops that operation; the CLI does not silently select another engine.
+The CLI installs nothing itself. If an option needs a missing tool, that file fails with an error. The CLI never switches to another method on its own.
 
-For the Python operations, create an environment and install `tools/requirements.txt` from this repository, or the release's `pdf-tools-requirements.txt`:
+| Tool | Needed for |
+| --- | --- |
+| Python packages from `tools/requirements.txt` | `--compression medium` and higher, `--clip-images`, `--extended-images`, `--mono-codecs`, `--flatten`, `--subset-fonts`, `--merge-fonts`, `--bitmap`, `--mrc`, `--extract text`, five `--strip` categories, `--pdfa`, and, with the default engine, DPI limits and `--gray` |
+| qpdf | Encrypted input, `--inline-images`, `--strip images`, `--compression medium` and higher, and `--pdfa` |
+| `jbig2` from [jbig2enc](https://github.com/agl/jbig2enc) | `--mono-codecs jbig2` |
+| jbig2dec | Reading JBIG2 images already in a PDF |
+| Ghostscript | `--engine ghostscript` and `--convert-fonts-cff` |
+| veraPDF 1.30.3 or newer, with Java | `--pdfa`, and checking files that declare PDF/A |
+| fontconfig with URW base 35 or Liberation fonts | `--pdfa` on files whose standard fonts are not embedded |
+| Python 3 | Importing `.pdfscp` profiles |
+
+The rest needs nothing extra. That includes `--images`, `--compression light` and `balanced`, metadata and privacy options, output encryption, and image extraction.
+
+### Python packages
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -r tools/requirements.txt
+.venv/bin/python -m pip install -r tools/requirements.txt   # or the release asset pdf-tools-requirements.txt
 export PDF_SQUEEZER_PYTHON="$PWD/.venv/bin/python"
 ```
 
-Without `PDF_SQUEEZER_PYTHON`, the CLI looks for `python3` on `PATH`. The processing script is embedded in the Go binary; users do not need to copy it beside the executable. The CLI starts Python in isolated mode (`-I`), which ignores `PYTHONPATH` and packages installed with `pip install --user`. Use a virtual environment or your distribution's packages.
+The binary carries its own Python scripts, so you install only the packages. Without `PDF_SQUEEZER_PYTHON`, the CLI uses `python3` from your `PATH`. It runs Python in isolated mode, which ignores `PYTHONPATH` and packages from `pip install --user`.
 
-On Debian or Ubuntu, the distribution provides the other optional tools. veraPDF and jbig2enc's `jbig2` need separate installs.
+### Other tools
+
+Debian and Ubuntu package everything except veraPDF and jbig2enc's `jbig2`:
 
 ```sh
 sudo apt install qpdf ghostscript jbig2dec default-jre-headless fontconfig fonts-urw-base35 fonts-liberation python3-venv
 ```
 
-On macOS, Homebrew provides the same tools. veraPDF also needs a Java runtime, and Intel Macs build pikepdf and PyMuPDF from source during the `pip install`, which needs the Xcode command line tools.
+On macOS, these Homebrew commands install everything except veraPDF and the Java runtime it needs. On Intel Macs, pip builds pikepdf and PyMuPDF from source, which needs the Xcode command line tools.
 
 ```sh
 brew install qpdf ghostscript jbig2dec jbig2enc fontconfig
 brew install --cask font-urw-base35 font-liberation
 ```
 
-The optional dependencies have their own licenses. In particular, Ghostscript and PyMuPDF/MuPDF use AGPL or commercial licensing, and veraPDF is GPL/MPL. They are separate installations, not bundled third-party binaries. The binary does embed the ICC sRGB profile `sRGB2014.icc`, which the International Color Consortium distributes without restriction.
+Use [veraPDF](https://verapdf.org/) 1.30.3 or newer, because older releases leave a log file in `/tmp` on every run. From a clone of this repository, `sh tools/install-verapdf.sh "$HOME/.local/verapdf"` installs a checksummed 1.30.3. Add that directory to your `PATH` afterwards. The script needs Java, `curl`, and `unzip`.
 
-### Placement-aware images and scan codecs
+Ghostscript and PyMuPDF/MuPDF use AGPL or commercial licenses, and veraPDF uses GPL and MPL. The release binaries include none of them. The binary embeds the freely distributable ICC sRGB profile `sRGB2014.icc`.
 
-```sh
-# Downsample according to displayed size, without Ghostscript
-pdf-squeezer --dpi 120 --gray-dpi 150 scan.pdf
+## Compression levels
 
-# Crop unused margins and include inline images
-pdf-squeezer --images --clip-images --inline-images document.pdf
+`--compression` picks a set of image settings. Without it, the CLI optimizes the PDF structure and leaves images alone.
 
-# Compare lossless monochrome codecs
-pdf-squeezer --images --mono-codecs flate,ccitt,jbig2 scan.pdf
+| Level | JPEG quality | 16-bit images to 8-bit | Color and gray DPI limit | Extra work |
+| --- | ---: | --- | ---: | --- |
+| `light` | 90 | No | None | |
+| `balanced` | 85 | Yes | None | |
+| `medium` | 65 | Yes | 150 | Crops unused image margins and includes inline images |
+| `strong` | 45 | Yes | 120 | Same as `medium` |
+| `heavy` | 30 | Yes | 96 | Same as `medium`, plus font merging and maximum-effort Flate |
 
-# Optional monochrome downsampling
-pdf-squeezer --mono-dpi 300 --mono-codecs flate,ccitt,jbig2 scan.pdf
-```
+Every level compares JPEG with lossless Flate for each image and keeps the smaller one. `medium` and higher need the Python packages and qpdf. Levels never rasterize, flatten, convert to grayscale, or remove content. `heavy` can leave JPEG artifacts around small text and colored edges, so check fine print before you share the result.
 
-These operations use pikepdf and Pillow. Inline-image externalization uses `qpdf`. CCITT Group 4 requires Pillow's libtiff support. JBIG2 requires [jbig2enc](https://github.com/agl/jbig2enc)'s `jbig2` executable. Its generic-region encoding is lossless; the CLI never enables lossy symbol substitution. Install `jbig2dec` as well to decode existing JBIG2 images through pikepdf.
+The DPI limit is a ceiling, and images below it keep their resolution. Flags override profile values, and profile values override the level. `--compression strong --dpi 0` therefore keeps every image's resolution. `--lossless` rejects levels that lower precision or resolution.
 
-`--dpi` targets color and gray images; `--gray-dpi` overrides gray resolution. Monochrome resolution stays unchanged unless `--mono-dpi` is supplied. Images must exceed the target times `--dpi-threshold`, which defaults to 1.5, before downsampling. Each image axis is judged on its own, so an image squeezed in one direction loses pixels only along that direction. A shared image uses the most demanding placement across pages and nested forms, including `/UserUnit` and affine transforms.
-
-Cropping unions visible bounds across shared uses and adjusts drawing transforms. It retains a border for interpolation and only crops axis-aligned placements. Lossless mode additionally preserves images on fractional or downsampled display grids to avoid changing a viewer's sampling. It preserves images used in masks, annotation appearances, patterns, or unanalysed forms rather than guessing their placement. Complex clipping paths use conservative bounding boxes. Downsampling remains lossy; inspect fine text before sharing scans.
-
-For monochrome images, the codec comparison may retain full resolution when a smaller lossless encoding costs no more than 3.5 times the downsampled candidate. This favors small-text legibility over minimum byte count.
-
-### Ghostscript
-
-Install a current, security-patched Ghostscript and put `gs` on `PATH`.
+### Ghostscript engine
 
 ```sh
 pdf-squeezer --engine ghostscript --quality ebook scan.pdf
 pdf-squeezer --engine ghostscript --dpi 100 --gray scan.pdf
 ```
 
-Presets are `screen`, `ebook`, `printer`, and `prepress`. The default is `ebook`. They change more than image resolution. Colors retain their original color spaces unless `--gray` requests conversion. With the pdfcpu engine, `--gray` uses the optional Python tools and also converts text and vectors.
+`--engine ghostscript` rewrites the whole file with Ghostscript instead of the default `pdfcpu` engine. The `--quality` presets are `screen`, `ebook`, `printer`, and `prepress`, and `ebook` is the default. They change more than image resolution. If Ghostscript skips an image it cannot decode, the CLI rejects the output, because that page would come out blank.
 
-If Ghostscript reports an image-decoding failure that would leave a blank page, the CLI rejects its output. Try the pdfcpu engine for that file.
+## Images
+
+`--images` recompresses images with the built-in encoder. For each image, it compares lossless Flate with JPEG and keeps the smaller encoding if it saves at least 2% and 1 KiB.
+
+```sh
+pdf-squeezer --images --image-quality 75 scan.pdf     # JPEG quality from 1 to 100; 75 is the default
+pdf-squeezer --images --image-codecs flate scan.pdf   # never uses JPEG
+pdf-squeezer --lossless document.pdf                  # recompresses images without loss
+```
+
+- `--lossless` turns on `--images` and forbids JPEG, color-space changes, downsampling, and bit-depth reduction.
+- RGB images whose pixels are all gray become grayscale, and grayscale images with only black and white become 1-bit. `--color-reduction preserve` turns this off.
+- 16-bit images stay 16-bit unless you add `--reduce-bit-depth`. Soft masks always keep their precision.
+- `--gray` converts all page colors to grayscale.
+- `--force-recompression` keeps the new encoding even when it saves nothing.
+- `--extended-images` adds JPEG 2000 and CMYK JPEG images.
+- Images with a matte, explicit masks, indexed colors, unsupported transfer functions, or unknown filters stay unchanged.
+- `--image-memory` sets the memory budget for image buffers in MiB, 512 by default. Images that need more stay unchanged. `-V` prints each image the CLI kept and why.
+
+### Downsampling and scan codecs
+
+These options need the Python packages.
+
+```sh
+pdf-squeezer --dpi 120 --gray-dpi 150 scan.pdf                    # downsamples to the displayed size
+pdf-squeezer --images --clip-images --inline-images document.pdf  # crops unused margins, includes inline images
+pdf-squeezer --images --mono-codecs flate,ccitt,jbig2 scan.pdf    # picks the best lossless black-and-white codec
+```
+
+- `--dpi` limits color and gray images, and `--gray-dpi` overrides it for gray ones. `--mono-dpi` sets a limit for black-and-white images, which otherwise keep their resolution.
+- The CLI measures each image at the size the page draws it. It downsamples an image only when it exceeds the limit times `--dpi-threshold`, which defaults to 1.5. A shared image keeps enough pixels for its largest use.
+- Cropping applies only to axis-aligned images. Images in masks, patterns, annotation appearances, or forms the CLI cannot analyze stay whole.
+- CCITT Group 4 and JBIG2 encoding is lossless. The CLI never enables the lossy symbol matching in JBIG2.
+
+Downsampling loses detail, so check fine text before you share a scan.
+
+## Output files and batches
+
+- Without `-o`, each output goes next to its input as `NAME.squeezed.pdf`.
+- `-o` takes a file name for one input, or an existing directory for any number. Outputs inside that directory keep the subdirectories of their inputs.
+- To give each input its own destination, repeat `-o` once per input file, in order: `pdf-squeezer a.pdf b.pdf -o out/a.pdf -o elsewhere/b.pdf`. This form does not accept directory inputs.
+- The CLI checks every destination before it starts and never overwrites an existing file or symlink. `--collision number` writes `NAME.squeezed.1.pdf` and so on instead of stopping.
+- A directory input covers its top-level `.pdf` files, and `--recursive` adds subdirectories. Scans skip hidden files and directories, symlinks inside the tree, and earlier `.squeezed.pdf` outputs.
+- `--jobs N` processes up to N files at once, from 1 to 64, and keeps reports and outputs in input order. Each job has its own `--image-memory` budget.
+- A batch reports each failed file, continues with the rest, and exits with a nonzero status if any file failed.
+
+If compression does not make a file smaller, the output is a copy of the original. Options that change the document on purpose, such as `--privacy`, `--strip`, `--flatten`, `--gray`, or `--pdfa`, keep their result even when it grows. So does `--force-recompression`.
+
+## Document changes
+
+```sh
+pdf-squeezer --privacy document.pdf
+pdf-squeezer --metadata 'Title=Public report' --metadata 'Author=' document.pdf
+pdf-squeezer --timestamps modified document.pdf
+pdf-squeezer --strip thumbnails,piece-info document.pdf
+pdf-squeezer --subset-fonts --merge-fonts document.pdf
+pdf-squeezer --flatten forms,annotations document.pdf
+```
+
+`--privacy` empties the document information, removes XMP metadata, application data, and web-capture data, and gives the file a new identifier. Page content, comments, form values, and attachments can still hold personal data, so check them yourself.
+
+`--metadata KEY=VALUE` sets `Title`, `Author`, `Subject`, `Keywords`, `Creator`, `Producer`, `CreationDate`, or `ModDate`. Dates use the form `D:YYYYMMDDhhmmssZ`. Repeat the flag for more keys, and leave the value empty to remove one. It also removes XMP metadata, which could contradict the new values. It cannot be combined with `--privacy`.
+
+`--timestamps preserve`, the default, keeps the document dates and the input file's modification time. `modified` sets the document's modification date to now, and `now` sets both document dates. Both also remove XMP metadata.
+
+### Removing content
+
+`--strip` removes the categories you list, separated by commas. Removing tags or output intents to save a few bytes costs accessibility and color accuracy.
+
+<details>
+<summary>All <code>--strip</code> categories</summary>
+
+| Category | Removes |
+| --- | --- |
+| `thumbnails`, `alternates`, `threads` | Page thumbnails, alternate images, and article threads |
+| `piece-info`, `web-capture` | Application data and web-capture data |
+| `metadata` | XMP metadata. Add `--privacy` to clear the document information too |
+| `tags` | Accessibility structure and reading order |
+| `output-intents` | Color output intents |
+| `links`, `annotations`, `forms` | Those objects, without drawing them into the page |
+| `images` | All images, inline images included. Needs qpdf |
+| `actions`\* | Actions that PDF/A forbids, form-field actions, and page and document event actions. GoTo, URI, SubmitForm, and JavaScript actions stay |
+| `multimedia`\* | Sound, Screen, Movie, 3D, and RichMedia annotations |
+| `hidden`\* | Hidden and no-view annotations |
+| `xfa`\* | XFA form data. The regular form fields stay |
+| `attachments`\* | Embedded files and file-attachment annotations |
+
+\* Needs the Python packages.
+
+</details>
 
 ### Fonts and flattening
 
-```sh
-pdf-squeezer --subset-fonts --merge-fonts document.pdf
-pdf-squeezer --flatten forms,annotations document.pdf
-pdf-squeezer --flatten links document.pdf
-pdf-squeezer --convert-fonts-cff document.pdf
-```
+- `--subset-fonts` removes unused glyphs from embedded fonts with MuPDF.
+- `--merge-fonts` combines compatible subsets of the same TrueType font with fontTools and leaves the text as it is.
+- `--convert-fonts-cff` rewrites the file with Ghostscript to store fonts in the compact CFF format.
+- `--remove-standard-fonts` drops embedded copies of the 14 standard PDF fonts, so viewers use their own.
+- `--flatten` draws `forms`, `annotations`, `links`, or `all` into the page. Comments, attached data, and editing can be lost.
 
-Font subsetting uses MuPDF. Font merging uses fontTools and combines compatible retained-glyph-ID TrueType subsets without rewriting text. It preserves each font's character mapping and excludes incompatible programs and unsupported consumers. It is not a general merger for every font format.
+Flattening is not redaction. The content underneath stays in the file.
 
-`--convert-fonts-cff` rewrites through Ghostscript's PDF writer with compact font programs. This is a document rewrite, not a byte-preserving font patch. `--remove-standard-fonts` is a separate opt-in option for eligible embedded copies of the standard PDF fonts; it makes rendering depend on viewer-provided substitutes.
-
-Flattening freezes selected form fields, annotations, or links into page content. `--flatten all` selects every category. A visible link border without a usable appearance stream causes an error rather than disappearing. Comments, attached annotation data, and editability may be lost. Flattening is not redaction and does not securely remove underlying page content.
-
-## Profiles and document controls
+## Profiles
 
 ```sh
 pdf-squeezer --images --image-quality 70 --save-profile web.profile.json
 pdf-squeezer --profile web.profile.json document.pdf
-
-# Explicit flags override profile values
-pdf-squeezer --profile web.profile.json --image-quality 85 document.pdf
-
-pdf-squeezer --metadata 'Title=Public report' --metadata 'Author=' document.pdf
-pdf-squeezer --strip thumbnails,alternates,piece-info document.pdf
-pdf-squeezer --strip web-capture document.pdf
-pdf-squeezer --timestamps modified document.pdf
-pdf-squeezer --timestamps now document.pdf
+pdf-squeezer --profile web.profile.json --image-quality 85 document.pdf   # flags override the profile
 ```
 
-Native profiles use versioned JSON and contain settings and optional metadata, never input/output paths, password files, or password values. Existing version-1 files still work. Version-2 bundles contain an ordered `profiles` array of version-1 entries, each with an optional `name`.
+A profile is a JSON file with settings and optional metadata. It never holds file paths, passwords, or single-run options such as `-o`, `--recursive`, and `--jobs`. Read a profile from someone else before you use it, because it can turn on destructive options.
 
-`--profile-entry NAME|N` selects an entry by name or 1-based index. A matching name takes precedence over an index; ambiguous names require an index. Without it, the first entry is used. Repeat `--profile` to combine files in argument order. `--save-profile` saves the selected entry's resolved settings and retains the other entries when saving a bundle. Export uses native JSON only.
+<details>
+<summary>Bundles and <code>.pdfscp</code> import</summary>
+
+Repeat `--profile` to load several profiles as one list, and pick one with `--profile-entry` and a name or a 1-based number. Without it, the first entry applies. Saving with several profiles loaded writes a bundle that keeps the others. A profile saved with `--compression` takes that level as its name:
 
 ```sh
 pdf-squeezer --compression light --save-profile light.profile.json
@@ -212,34 +249,11 @@ pdf-squeezer --compression strong --save-profile strong.profile.json
 pdf-squeezer --profile light.profile.json --profile strong.profile.json \
   --profile-entry strong --save-profile presets.profile.json
 pdf-squeezer --profile presets.profile.json --profile-entry 2 document.pdf
-pdf-squeezer --profile exported.pdfscp --profile-entry 1 document.pdf
 ```
 
-`.pdfscp` import accepts XML or binary property lists containing an array of settings dictionaries. It requires Python 3's standard-library `plistlib`, not the optional PDF packages. It maps supported image, font, removal, metadata and date fields to CLI settings. Normalized `imageQuality` values become JPEG quality 1..100. Fields absent from the file use CLI defaults; the importer does not reproduce another engine's internal compression rules.
+`--profile` also imports `.pdfscp` property lists, which need only Python 3. The importer maps image, font, removal, metadata, and date settings. It stops on settings it cannot map exactly, such as unknown fields, unverified color conversion, or automatic Producer replacement. The error suggests a native option where one exists.
 
-Unknown fields, unverified nonzero `colorConversion` values, disabled structural optimization, and automatic Producer replacement cause an error rather than a guessed conversion. Use native `--gray` for grayscale or `--metadata Producer=VALUE` for a custom Producer, and save those settings in a native profile if needed. The CLI has no option to disable structural optimization. Timestamp import preserves the CLI's portable filesystem behavior, not macOS birth-time changes. A profile can request destructive transformations independently of a compression tier, so inspect imported profiles before using them.
-
-`--metadata KEY=VALUE` is repeatable. Supported keys are `Title`, `Author`, `Subject`, `Keywords`, `Creator`, `Producer`, `CreationDate`, and `ModDate`. An empty value removes that key. Dates use `D:YYYYMMDDhhmmssZ`. Editing these fields removes XMP copies that could retain contradictory values.
-
-`--timestamps preserve` retains existing document dates and the input's filesystem modification time. It is the default. `--timestamps modified` updates only the document modification date, preserving its creation date. `--timestamps now` updates both document dates. Both update modes leave the output with its new filesystem timestamp and remove stale XMP copies. The CLI does not promise portable filesystem birth-time preservation.
-
-`--privacy` empties the document information dictionary, removes XMP metadata, application piece information, and web-capture information, and creates a fresh document identifier. Page content, comments, form values, and attachments can still contain personal information. Check those separately.
-
-`--strip` accepts a comma-separated list:
-
-- `thumbnails`, `alternates`, `threads`, `piece-info`, or `metadata`. Here `metadata` means XMP; use `--privacy` to clear document information too.
-- `web-capture` removes the catalog's SpiderInfo web-capture data without clearing document information or XMP.
-- `tags` removes accessibility structure and reading-order information.
-- `output-intents` removes document color/output-intent information.
-- `links`, `annotations`, or `forms` removes those objects rather than flattening their appearances.
-- `images` removes image drawing objects, including externalized inline images.
-- `actions` removes actions that PDF/A forbids (Launch, Sound, Movie, ResetForm, ImportData, Hide, Rendition, Trans, SetOCGState, GoTo3DView, non-navigation named actions), actions on form fields, and page or document event actions. GoTo, URI, SubmitForm, and JavaScript actions stay.
-- `multimedia` removes Sound, Screen, Movie, 3D, and RichMedia annotations.
-- `hidden` removes hidden and no-view annotations.
-- `xfa` removes XFA form data; the AcroForm fields stay.
-- `attachments` removes embedded files and file attachment annotations.
-
-The last five categories use the optional Python tools. None of these removals is enabled by default. Do not remove accessibility tags or color information merely to save a few bytes.
+</details>
 
 ## Passwords and encryption
 
@@ -250,9 +264,10 @@ pdf-squeezer --encrypt-user-file reader-password.txt \
   --encrypt-owner-file owner-password.txt --permissions print document.pdf
 ```
 
-Password files contain one line. Password values never enter command arguments or saved profiles. New encryption uses AES-256 and requires a nonempty owner password different from the user password. Permissions are `all`, `print`, or `none`; PDF viewers determine how they enforce restrictions.
-
-Encrypted inputs require qpdf. The CLI uses private decrypted working copies, then preserves the input's encryption unless `--decrypt` or new output encryption was requested. For a fresh identifier, `--privacy` on encrypted input requires explicit decryption or new encryption. Protect the working filesystem as well as the final document.
+- Passwords come from one-line files, so they never appear in the process list or in profiles.
+- New encryption uses AES-256 and needs an owner password that differs from the user password. `--permissions` takes `all`, `print`, or `none`, and each viewer decides how to enforce them.
+- Encrypted input needs qpdf. The output keeps the input's encryption unless you add `--decrypt` or new encryption. On encrypted input, `--privacy` needs one of the two, because the file gets a new identifier.
+- The CLI decrypts into a private directory next to the output, so protect that filesystem too.
 
 ## PDF/A
 
@@ -262,73 +277,86 @@ pdf-squeezer --pdfa 3b invoice.pdf
 pdf-squeezer --pdfa 4 --output-intent ISOcoated_v2.icc brochure.pdf
 pdf-squeezer --pdfa 4 --font-file 'Verdana=/path/to/verdana.ttf' slides.pdf
 pdf-squeezer --pdfa 2b --strip actions,hidden form.pdf
-pdf-squeezer --pdfa 4 --images --dpi 150 --image-quality 80 scan.pdf
 ```
 
-`--pdfa LEVEL` converts the compressed document to PDF/A-2b, PDF/A-3b, or PDF/A-4 (ISO 19005) and publishes it only after [veraPDF](https://verapdf.org/) confirms compliance. PDF/A-4 documents with embedded files become PDF/A-4f; PDF/A-3b associates every embedded file with the document; PDF/A-2b refuses attachments, since it only permits ones that are PDF/A themselves. PDF/A-2 and 3 also forbid JavaScript and event actions, and keep only predefined XMP schemas, so custom XMP properties without an extension schema are dropped. Ghostscript cannot produce PDF/A-4, so the conversion is this project's own code on top of pikepdf, fontTools, and MuPDF.
+`--pdfa` converts the compressed document to PDF/A and writes it only after [veraPDF](https://verapdf.org/) confirms that it complies. It needs the Python packages, qpdf, veraPDF, and fontconfig, which the container image already has. In a batch, one veraPDF run checks up to 32 files.
 
-A batch runs veraPDF once per group of files rather than once per file.
+| Level | PDF version | Attachments |
+| --- | --- | --- |
+| `2b` | 1.7 | Refused, because PDF/A-2 accepts only attachments that are PDF/A files |
+| `3b` | 1.7 | Kept and associated with the document |
+| `4` | 2.0 | Kept, and the file becomes PDF/A-4f |
 
-It requires the Python tools, qpdf, veraPDF with a Java runtime on `PATH` (use 1.30.3 or newer; older releases leave a log file in `/tmp` on each run), and fontconfig with metric-compatible fonts for the standard 14 fonts: the URW Base35 family (`fonts-urw-base35`) or Liberation (`fonts-liberation`).
+PDF/A-2b and 3b forbid JavaScript and event actions. For those levels, the converter drops custom XMP properties that lack an extension schema.
 
-The converter repairs what it can without changing page content:
+The converter repairs what it can without changing how pages look. When it cannot, it stops and names the object and the option that fixes it, such as `--strip actions`, `--font-file`, or `--output-intent`. It never flattens, rasterizes, or deletes content to pass validation. If veraPDF still rejects the file, the error lists each failed rule, the objects involved, and an option to try. `-V` prints every repair.
 
-- PDF 2.0 header, file identifier, XMP identification, document information moved into XMP, and PDF 2.0 deprecations such as LZW streams, transfer functions, halftone settings, image alternates, OPI, reference XObjects, and interpolation flags.
-- Resources inherited by form XObjects, annotation appearances, patterns, and Type 3 glyphs become explicit.
-- Missing appearance streams for annotations and form fields are generated with MuPDF.
-- Soft masks follow their images when `--dpi` or `--clip-images` downsample or crop them, as long as the mask has the image's size and no matte.
-- Non-embedded Helvetica, Times, Courier, Symbol, ZapfDingbats, and their Arial, Times New Roman, and Courier New aliases are embedded from a metric-compatible font. The document's glyph widths must match; otherwise supply a font with `--font-file NAME=PATH`. A supplied font keeps the document's widths: its glyph advances are set to them, so text does not move. Composite (Type 0) fonts need the original TrueType file through `--font-file`, because their glyph identifiers only match that file.
-- Embedded fonts get consistent widths (font programs are patched, so layout does not change), TrueType cmap subtables, symbolic encoding rules, CIDToGIDMap entries, and valid ToUnicode mappings. Fonts and glyphs count as used only when drawn, including through forms, patterns, Type 3 glyphs, and appearance streams; text in rendering mode 3 does not require embedding.
-- An output intent is added. The bundled sRGB profile covers DeviceGray and DeviceRGB content. DeviceCMYK content needs a CMYK ICC profile through `--output-intent`; the converter then adds a DefaultRGB color space for any RGB content.
-- Optional content configurations, permissions, and embedded file specifications (MIME type, names, `AFRelationship`) are normalized.
+<details>
+<summary>What the converter repairs</summary>
 
-It refuses to guess. Forbidden features stop the conversion with the object number and the `--strip` category that removes them: forbidden actions, multimedia annotations, hidden annotations, XFA data, or attachments for a plain PDF/A-4. Unavailable fonts, mismatched widths, and ambiguous color conversions produce errors that name the font or the profile to supply. When veraPDF still rejects the result, the diagnostics list each failed rule with its clause, the affected objects, and the option that resolves it. Nothing is flattened, rasterized, or discarded to pass validation; `-V` reports every repair.
+- It sets the PDF header, the file identifier, and the XMP identification, and it moves the document information into XMP.
+- It removes features that PDF 2.0 deprecates or PDF/A forbids, such as LZW streams, transfer functions, halftones, image alternates, OPI, reference XObjects, and interpolation flags.
+- It makes inherited resources explicit, and MuPDF draws missing appearance streams for annotations and form fields.
+- Soft masks follow their images through `--dpi` and `--clip-images` when a mask has the size of its image and no matte.
+- When the document does not embed Helvetica, Times, Courier, Symbol, ZapfDingbats, or their Arial, Times New Roman, and Courier New aliases, the converter embeds a metric-compatible font. The document's glyph widths must match that font. Otherwise, pass the original with `--font-file NAME=PATH`. The converter sets its glyph advances to the document's widths, so text does not move. A composite font that is not embedded always needs its original TrueType file through `--font-file`.
+- It makes embedded fonts consistent in their widths, TrueType cmap subtables, symbolic encoding rules, CIDToGIDMap entries, and ToUnicode maps. Invisible text needs no embedded outline.
+- It adds an output intent. The bundled sRGB profile covers gray and RGB content. CMYK content needs a CMYK ICC profile through `--output-intent`, and the converter then adds a DefaultRGB color space for any RGB content.
+- It makes optional-content configurations, permissions, and embedded-file specifications consistent.
 
-PDF/A forbids encryption and requires metadata, color information, and embedded fonts, so `--pdfa` rejects output encryption, `--privacy`, `--strip metadata`, `--strip output-intents`, and `--remove-standard-fonts`. Encrypted input needs `--decrypt`.
+</details>
 
-### Inputs that already are PDF/A
+PDF/A forbids encryption and requires metadata, color information, and embedded fonts. `--pdfa` therefore rejects output encryption, `--privacy`, `--strip metadata`, `--strip output-intents`, and `--remove-standard-fonts`. Encrypted input needs `--decrypt`.
 
-Without `--pdfa`, an input that declares PDF/A keeps its level: a PDF/A-1 document is written with a classic cross-reference table and no object streams, and when veraPDF is on `PATH` the output is verified against the declared level before it is published. If compression broke conformance the file is not published; if the input did not conform in the first place, a warning says so and the output is published unverified. Options that remove what PDF/A requires (`--privacy`, `--metadata`, `--timestamps now`, `--strip metadata|output-intents`, raster output, a Ghostscript rewrite) print a warning and skip verification.
+The converter does not repair non-Identity CMaps, CFF-based CIDFonts without embedded programs, glyphs missing from embedded fonts, or JPEG 2000 streams that break PDF/A rules. It reports them instead.
 
-### Checking a corpus
+### Files that already declare PDF/A
 
-`tools/corpus.py` converts every PDF under a directory and tabulates the outcomes: converted, refused (grouped by the option the converter asks for), rejected by veraPDF (grouped by rule), crashed, or timed out.
-
-```sh
-python3 tools/corpus.py --pdfa 4 --binary ./pdf-squeezer documents/ results/
-```
-
-Known limits: non-Identity CMaps and CFF-based CIDFonts without embedded programs, glyphs missing from embedded fonts, and JPEG 2000 streams that violate PDF/A constraints are reported, not repaired.
+Without `--pdfa`, a file that declares PDF/A keeps its level. If veraPDF is installed, the CLI checks the output against that level and refuses to write it when compression broke conformance. If the input did not conform to begin with, or veraPDF is missing, the CLI warns and writes the output unchecked. Options that remove something PDF/A needs, such as `--privacy`, `--metadata`, raster output, or a Ghostscript rewrite, print a warning and skip the check.
 
 ## Extraction and raster output
 
 ```sh
 pdf-squeezer --extract images -o extracted-images document.pdf
-pdf-squeezer --extract images --inline-images -o extracted-images document.pdf
 pdf-squeezer --extract text -o document.txt document.pdf
-
 pdf-squeezer --bitmap --render-dpi 200 document.pdf
 pdf-squeezer --mrc --render-dpi 300 --background-dpi 72 scan.pdf
 ```
 
-Image extraction creates a new directory with object-number-based filenames. For a single input, its `-o` directory must not exist. Native extraction handles supported image XObjects; `--inline-images` includes inline images through qpdf. Text extraction uses MuPDF and creates UTF-8 text with page separators.
+- `--extract images` saves the images of each input in a new `NAME.images` directory. With a single input, `-o` names that directory, which must not exist yet. `--inline-images` adds inline images and needs qpdf.
+- `--extract text` writes UTF-8 text with a form feed between pages. Neither mode can be combined with options that change the document.
+- `--bitmap` replaces every page with a rendered image. `--mrc` splits a scan into a sharp black-and-white text layer and a low-resolution JPEG background. It suits document scans, not photos.
+- Both raster modes discard searchable text, vector graphics, form fields, links, tags, and attachments. They do not redact anything.
 
-Bitmap output replaces pages with rendered images. MRC output separates a high-resolution dark-text mask from a lower-resolution JPEG background. Its luminance threshold suits document scans, not photographs or complex artwork. Both modes discard searchable text, vector objects, interactive fields, links, tags, and attachments. They are opt-in and are not redaction tools.
+## Troubleshooting
 
-## File safety
+| Message | What to do |
+| --- | --- |
+| `no reduction; copied the original` | Follow the hint in the message, or try a stronger `--compression` level. |
+| `output already exists` | Choose another `-o`, delete the old output, or add `--collision number`. |
+| `Python 3 is required` or `Missing optional module` | Install the [Python packages](#python-packages) and set `PDF_SQUEEZER_PYTHON`. |
+| `qpdf is required` or `Ghostscript not found` | Install the tool. See [Optional tools](#optional-tools). |
+| `veraPDF did not confirm PDF/A-4 compliance` | Each failed rule listed below the message names an option to try. |
 
-- All output is staged and validated before it gets its final name. Inputs and existing outputs are never replaced or moved to Trash.
-- The CLI publishes the staged result with a hard link, so a crash cannot leave a partial output. Filesystems without hard links, such as FAT and exFAT, get a copy instead, and a crash during that copy can leave an incomplete destination. Remove it before retrying. A reported write failure removes partial output.
-- Staging happens in a private directory next to the output, and optional tools keep their scratch files there. Temporary files and output use private permissions where the filesystem supports them. Keep free space next to the output for a few copies of the document. Python and Java tools cannot open paths that are not valid UTF-8, so for such a directory they work through a symlink in the temporary directory.
-- Compression invalidates digital signatures. Ghostscript, font rewriting, flattening, rasterization, and PDF/A-4 conversion can change document features. Keep originals and inspect results.
-- Default compression and the open-source processing tools run locally. Keep PDF parsers and optional tools patched before processing untrusted documents.
+## Safety notes
+
+- The CLI never changes, moves, or replaces an existing file.
+- It builds each output in a private directory next to the destination and hard-links it into place, so a crash cannot leave a half-written file. Filesystems without hard links, such as FAT and exFAT, get a copy instead. If a crash interrupts that copy, delete the partial file.
+- The private directory needs free space for a few copies of the document. Where the filesystem allows it, only you can read the outputs and working files.
+- If the output directory's path is not valid UTF-8, the Python and Java tools reach the private directory through a symlink in the system temporary directory.
+- Ctrl-C, `kill`, or closing the terminal stops the run and its tools, and the CLI deletes its working files.
+- Any rewrite invalidates digital signatures, and the CLI warns about signed files. Keep your originals.
+- Everything runs locally. Keep the PDF tools patched before you process untrusted files.
 
 ## Development
 
-CI runs the Go tests with the race detector and the synthetic render-comparison tests, with every optional tool installed, on Debian 13 and macOS. It also runs `go vet`, formatting checks, and Python lint checks, and cross-compiles standalone binaries for Linux and macOS.
+CI runs the Go tests with the race detector and the rendering-comparison tests on Debian 13 and macOS, with every optional tool installed. It also runs `gofmt`, Ruff, and `go vet` and cross-compiles the release binaries. It builds the container image on every run and publishes it for release tags.
 
-The tests cover shared-image cropping and DPI, masks and scan codecs, CMYK/JPEG 2000, font merging/subsetting, flattening and raster output, and PDF/A conversion of fonts, color, attachments, annotations, and forbidden features at every level, each verified with veraPDF. CI also builds the container image and pushes it on release tags. A missing optional dependency or a noncompliant validator report must fail without publishing an output.
+`tools/corpus.py` converts every PDF in a directory and counts how many converted, were refused, failed veraPDF, crashed, or timed out:
+
+```sh
+python3 tools/corpus.py --pdfa 4 --binary ./pdf-squeezer documents/ results/
+```
 
 ## License
 
-[MIT](LICENSE) for this repository's code. Separately installed tools retain their own licenses.
+[MIT](LICENSE) for this repository's code. The optional tools keep their own licenses.
