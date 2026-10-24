@@ -368,10 +368,10 @@ func configuration(password string) *model.Configuration {
 // prepare compresses and transforms input into a staged file that pdfcpu has
 // validated. The caller confirms PDF/A with veraPDF when needed and publishes.
 func prepare(ctx context.Context, input, output string, opts options, stderr io.Writer) (result *staged, err error) {
-	stderr = &lockedWriter{writer: stderr}
+	// Under --jobs, files share stderr, so every line names its file.
 	logf := func(format string, args ...any) {
 		if opts.verbose {
-			fmt.Fprintf(stderr, format+"\n", args...)
+			fmt.Fprintf(stderr, "%s: "+format+"\n", append([]any{input}, args...)...)
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -399,7 +399,7 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 			removeWork()
 		}
 	}()
-	logf("input: %s (%d bytes)", input, info.Size())
+	logf("input: %d bytes", info.Size())
 	logf("staging in %s", work)
 	conf := configuration(opts.password)
 	pdf, err := api.ReadAndValidate(ctx, in, conf)
@@ -416,7 +416,7 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 	}
 	declared, err := pdfaIdentification(pdf)
 	if err != nil {
-		fmt.Fprintf(stderr, "warning: %v; declared conformance is not preserved\n", err)
+		fmt.Fprintf(stderr, "warning: %s: %v; declared conformance is not preserved\n", input, err)
 	}
 	if declared != "" && opts.pdfa == "" {
 		label := "PDF/A-" + strings.ToUpper(declared)
@@ -425,7 +425,7 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 			breaking = "--strip tags"
 		}
 		if breaking != "" {
-			fmt.Fprintf(stderr, "warning: the input declares %s and %s removes what it requires; the output will not conform\n", label, breaking)
+			fmt.Fprintf(stderr, "warning: %s declares %s and %s removes what it requires; the output will not conform\n", input, label, breaking)
 			declared = ""
 		} else {
 			logf("input declares %s; preserving its structure and verifying the output", label)
@@ -437,7 +437,7 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 		return nil, errors.New("--privacy on encrypted input requires --decrypt or new output encryption to replace its identifier")
 	}
 	if len(pdf.Signatures) > 0 {
-		fmt.Fprintln(stderr, "warning: rewriting this signed PDF invalidates its digital signatures")
+		fmt.Fprintf(stderr, "warning: rewriting %s invalidates its digital signatures\n", input)
 	}
 	start := time.Now()
 	// Every tool works on a private snapshot of the opened input, never its path.

@@ -968,7 +968,7 @@ func TestDeclaredPDFA1KeepsClassicCrossReference(t *testing.T) {
 	if bytes.Contains(data, []byte("/XRef")) || bytes.Contains(data, []byte("/ObjStm")) {
 		t.Fatal("PDF/A-1 input was written with cross-reference or object streams")
 	}
-	if !strings.Contains(messages.String(), "declares PDF/A-1B") || !strings.Contains(messages.String(), "not verified") {
+	if !strings.Contains(messages.String(), input+": input declares PDF/A-1B") || !strings.Contains(messages.String(), "not verified") {
 		t.Fatalf("missing preservation messages:\n%s", &messages)
 	}
 	broken := filepath.Join(dir, "broken.pdf")
@@ -976,7 +976,7 @@ func TestDeclaredPDFA1KeepsClassicCrossReference(t *testing.T) {
 	if err := run(t.Context(), []string{"--privacy", "-o", broken, input}, io.Discard, &messages); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(messages.String(), "--privacy removes what it requires") {
+	if !strings.Contains(messages.String(), "warning: "+input+" declares PDF/A-1B and --privacy removes what it requires") {
 		t.Fatalf("missing conflict warning:\n%s", &messages)
 	}
 }
