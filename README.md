@@ -32,7 +32,7 @@ sha256sum --ignore-missing -c checksums.txt   # on macOS: shasum -a 256 --ignore
 mkdir -p ~/.local/bin && install -m 755 "$asset" ~/.local/bin/pdf-squeezer
 ```
 
-On macOS, a binary downloaded with a browser runs only after `xattr -d com.apple.quarantine FILE`.
+On macOS, Gatekeeper blocks this binary if you download it with a browser, because it is not notarized. After you install it, run `xattr -d com.apple.quarantine ~/.local/bin/pdf-squeezer`.
 
 With Go 1.26 or newer, `go install github.com/hawkff/pdf-squeezer@latest` builds and installs it.
 
