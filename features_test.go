@@ -799,6 +799,34 @@ func TestDeclaredPDFAMissingValidator(t *testing.T) {
 	}
 }
 
+func TestPreparedInputSnapshot(t *testing.T) {
+	for _, declared := range []bool{false, true} {
+		dir := t.TempDir()
+		input, output := filepath.Join(dir, "input.pdf"), filepath.Join(dir, "output.pdf")
+		original := testPDF(0)
+		if declared {
+			original = pdfaPDF("2", "B")
+		}
+		writeFile(t, input, original)
+		opts, _, _, err := parseOptions(t.Context(), []string{input}, io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := prepare(t.Context(), input, output, opts, io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.cleanup()
+		writeFile(t, input, []byte("replacement"))
+		if s.original == input || !bytes.Equal(readFile(t, s.original), original) {
+			t.Fatal("input snapshot was lost or changed")
+		}
+		if !declared && s.path != s.original {
+			t.Fatal("no-gain fallback did not reuse the input snapshot")
+		}
+	}
+}
+
 func TestVerifierRetrySeparatesToolFailuresAndVerdicts(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX tool stub")
@@ -836,7 +864,7 @@ printf '<report><jobs><job><item><name>%s</name></item><validationReport profile
 		{"converted rejection", "rejected", "invalid", true, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := &staged{path: filepath.Join(dir, tc.output+".pdf"), input: filepath.Join(dir, tc.input+".pdf"), flavour: "4", converted: tc.converted}
+			s := &staged{path: filepath.Join(dir, tc.output+".pdf"), input: filepath.Join(dir, "replaced.pdf"), original: filepath.Join(dir, tc.input+".pdf"), flavour: "4", converted: tc.converted}
 			other := &staged{path: filepath.Join(dir, "other.pdf"), flavour: "4"}
 			var messages bytes.Buffer
 			v := verifier{stderr: &messages}
