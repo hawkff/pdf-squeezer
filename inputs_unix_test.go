@@ -263,3 +263,28 @@ func TestFinishedStagesAreRemovedEarly(t *testing.T) {
 	}
 	assertNoTemps(t, dir)
 }
+
+func TestCanceledJobsRemoveStagingFiles(t *testing.T) {
+	dir, output, tools := t.TempDir(), t.TempDir(), t.TempDir()
+	for i := range 3 {
+		writeFile(t, filepath.Join(dir, strconv.Itoa(i)+".pdf"), testPDF(0))
+	}
+	stub := filepath.Join(tools, "python")
+	writeFile(t, stub, []byte("#!/bin/sh\nexec sleep 60\n"))
+	if err := os.Chmod(stub, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PDF_SQUEEZER_PYTHON", stub)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	time.AfterFunc(500*time.Millisecond, cancel)
+	start := time.Now()
+	err := run(ctx, []string{"--jobs", "2", "--gray", "-o", output, dir}, io.Discard, io.Discard)
+	if !errors.Is(err, context.Canceled) || strings.Count(err.Error(), "context canceled") != 1 {
+		t.Fatalf("want one cancellation error, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("cancellation waited %v for the tools", elapsed)
+	}
+	assertNoTemps(t, output)
+}

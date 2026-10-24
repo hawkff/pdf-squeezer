@@ -161,40 +161,38 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		s, err := prepare(ctx, files[i].path, outputs[i], opts, stderr)
 		return result{s, err}
 	}
-	// Up to --jobs files are prepared at once; results are published in input order.
+	// Up to --jobs files are prepared at once; results are handled in input order.
+	// A slot frees only once its result is handled, so work never runs further ahead.
 	results := make([]chan result, len(files))
 	for i := range results {
 		results[i] = make(chan result, 1)
 	}
+	slots := make(chan struct{}, opts.jobs)
 	go func() {
-		slots := make(chan struct{}, opts.jobs)
 		for i := range files {
 			slots <- struct{}{}
-			go func() {
-				results[i] <- process(i)
-				<-slots
-			}()
+			go func() { results[i] <- process(i) }()
 		}
 	}()
 	for i, file := range files {
 		r := <-results[i]
 		switch {
-		case ctx.Err() != nil:
-			if r.s != nil {
-				r.s.cleanup()
-			}
 		case r.err != nil:
-			failures = append(failures, fmt.Errorf("%s: %w", file.path, r.err))
+			if ctx.Err() == nil || !errors.Is(r.err, ctx.Err()) {
+				failures = append(failures, fmt.Errorf("%s: %w", file.path, r.err))
+			}
 		case r.s == nil:
 			fmt.Fprintln(stdout, outputs[i])
 		default:
 			// veraPDF starts a JVM per invocation, so files that need it wait for a batch.
+			// After cancellation, flush removes staged files instead of publishing them.
 			pending = append(pending, r.s)
 			if r.s.flavour == "" || len(pending) >= validationBatch {
 				verifier.validate(ctx, pending)
 				flush()
 			}
 		}
+		<-slots
 	}
 	verifier.validate(ctx, pending)
 	flush()

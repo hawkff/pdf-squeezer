@@ -494,8 +494,13 @@ func TestParallelJobsKeepInputOrder(t *testing.T) {
 	var want []string
 	for i := range 6 {
 		name := fmt.Sprintf("%02d.pdf", i)
-		// The replacement keeps the content stream length.
-		data := bytes.Replace(testPDF(64000), []byte("Squeeze this PDF."), []byte(fmt.Sprintf("Document %02d text", i)), 1)
+		// The replacement keeps the content stream length. The first file is the
+		// largest, so it finishes last and a completion-order report would show it.
+		padding := 64000
+		if i == 0 {
+			padding = 16 << 20
+		}
+		data := bytes.Replace(testPDF(padding), []byte("Squeeze this PDF."), []byte(fmt.Sprintf("Document %02d text.", i)), 1)
 		if i == 3 {
 			data = []byte("%PDF-1.7\nbroken")
 		} else {
@@ -503,8 +508,8 @@ func TestParallelJobsKeepInputOrder(t *testing.T) {
 		}
 		writeFile(t, filepath.Join(dir, name), data)
 	}
-	var stdout bytes.Buffer
-	err := run(t.Context(), []string{"--jobs", "4", "-V", "-o", output, dir}, &stdout, io.Discard)
+	var stdout, stderr bytes.Buffer
+	err := run(t.Context(), []string{"--jobs", "4", "-V", "-o", output, dir}, &stdout, &stderr)
 	if err == nil || !strings.Contains(err.Error(), "03.pdf") || strings.Count(err.Error(), ".pdf:") != 1 {
 		t.Fatalf("expected one failure for 03.pdf: %v", err)
 	}
@@ -516,7 +521,7 @@ func TestParallelJobsKeepInputOrder(t *testing.T) {
 		t.Fatalf("reports out of order:\n%s", &stdout)
 	}
 	for _, path := range want {
-		text := fmt.Sprintf("Document %s text", filepath.Base(path)[:2])
+		text := fmt.Sprintf("Document %s text.", filepath.Base(path)[:2])
 		found := false
 		for _, e := range readContext(t, path, "").Table {
 			if e != nil && !e.Free {

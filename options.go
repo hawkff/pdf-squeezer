@@ -138,7 +138,7 @@ func parseFlags(flags *flag.FlagSet, args []string) ([]string, error) {
 
 func profileFlag(name string) bool {
 	switch name {
-	case "o", "output", "profile", "profile-entry", "save-profile", "password-file", "encrypt-user-file", "encrypt-owner-file", "metadata", "v", "version", "V", "verbose", "recursive", "collision", "extract", "output-intent", "font-file":
+	case "o", "output", "profile", "profile-entry", "save-profile", "password-file", "encrypt-user-file", "encrypt-owner-file", "metadata", "v", "version", "V", "verbose", "recursive", "jobs", "collision", "extract", "output-intent", "font-file":
 		return false
 	}
 	return true
