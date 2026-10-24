@@ -17,6 +17,8 @@ import sys
 import time
 from pathlib import Path
 
+GRACE_SECONDS = 60  # after SIGTERM, before SIGKILL
+
 
 def classify(code, stderr):
     if code == 0:
@@ -55,14 +57,22 @@ def main():
     )
     args = parser.parse_args()
     args.results.mkdir(parents=True, exist_ok=True)
-    files = sorted(p for p in args.corpus.rglob("*.pdf") if p.is_file())
+    # Scanners often write .PDF; glob patterns are case-sensitive on Linux.
+    files = sorted(
+        p for p in args.corpus.rglob("*") if p.suffix.lower() == ".pdf" and p.is_file()
+    )
     outcomes, details = (
         collections.Counter(),
         collections.defaultdict(collections.Counter),
     )
     for path in files:
         relative = path.relative_to(args.corpus)
-        output = args.results / relative.parent / f"{relative.stem}.pdfa{args.pdfa}.pdf"
+        # The input's own suffix keeps report.PDF and report.pdf apart.
+        output = (
+            args.results
+            / relative.parent
+            / f"{relative.stem}.pdfa{args.pdfa}{relative.suffix}"
+        )
         output.parent.mkdir(parents=True, exist_ok=True)
         if output.exists() and not args.overwrite:
             outcomes["skipped"] += 1
@@ -83,17 +93,22 @@ def main():
             str(path),
         ]
         started = time.monotonic()
-        try:
-            run = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=args.timeout,
-                check=False,
-            )
-            code, stderr = run.returncode, run.stderr
-        except subprocess.TimeoutExpired:
-            code, stderr = -1, "timed out"
+        with subprocess.Popen(
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+        ) as process:
+            try:
+                stderr = process.communicate(timeout=args.timeout)[1]
+                code = process.returncode
+            except subprocess.TimeoutExpired:
+                # SIGTERM lets the CLI stop its tool process groups and remove its
+                # staging files; SIGKILL would leave both behind.
+                process.terminate()
+                try:
+                    process.communicate(timeout=GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                code, stderr = -1, "timed out"
         outcome, detail = classify(code, stderr)
         if outcome == "converted":
             partial.replace(output)
