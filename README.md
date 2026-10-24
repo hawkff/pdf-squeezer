@@ -4,7 +4,7 @@ A PDF compressor and PDF/A-4 converter written in Go. Default compression needs 
 
 ## Install
 
-Download a binary for Linux, macOS, or Windows from the [releases page](https://github.com/hawkff/pdf-squeezer/releases), or install with Go 1.26 or newer:
+Download a binary for Linux or macOS from the [releases page](https://github.com/hawkff/pdf-squeezer/releases), or install with Go 1.26 or newer:
 
 ```sh
 go install github.com/hawkff/pdf-squeezer@latest
@@ -65,6 +65,8 @@ Flags may come before or after filenames. Use `--` before a filename that starts
 
 The CLI leaves inputs unchanged and refuses to overwrite outputs, including symlinks. `--collision number` chooses a numbered name instead. Directory scans skip hidden files, symlinks inside the tree, and generated `.squeezed.pdf` or `.squeezed.N.pdf` outputs. A directory named on the command line may itself be a symlink. Batch output retains relative subdirectories beneath an existing output directory. A batch reports individual failures and returns a failing exit status if any input fails. For separate destinations, repeat `-o` once per distinct input file. Inputs keep their command-line order; directory inputs cannot use this form. Every destination is checked before processing begins.
 
+`--jobs N` prepares up to N files of a batch at once. Reports and published outputs keep input order. Each file has its own `--image-memory` budget, so N jobs can use N times that memory for images.
+
 ```sh
 pdf-squeezer first.pdf second.pdf -o out/first.pdf -o elsewhere/second.pdf
 ```
@@ -115,12 +117,19 @@ python3 -m venv .venv
 export PDF_SQUEEZER_PYTHON="$PWD/.venv/bin/python"
 ```
 
-On Windows, set `PDF_SQUEEZER_PYTHON` to the environment's `Scripts\python.exe`. Otherwise the CLI looks for `python3` on `PATH`. The processing script is embedded in the Go binary; users do not need to copy it beside the executable. The CLI starts Python in isolated mode (`-I`), which ignores `PYTHONPATH` and packages installed with `pip install --user`. Use a virtual environment or your distribution's packages.
+Without `PDF_SQUEEZER_PYTHON`, the CLI looks for `python3` on `PATH`. The processing script is embedded in the Go binary; users do not need to copy it beside the executable. The CLI starts Python in isolated mode (`-I`), which ignores `PYTHONPATH` and packages installed with `pip install --user`. Use a virtual environment or your distribution's packages.
 
 On Debian or Ubuntu, the distribution provides the other optional tools. veraPDF and jbig2enc's `jbig2` need separate installs.
 
 ```sh
 sudo apt install qpdf ghostscript jbig2dec default-jre-headless fontconfig fonts-urw-base35 fonts-liberation python3-venv
+```
+
+On macOS, Homebrew provides the same tools. veraPDF also needs a Java runtime, and Intel Macs build pikepdf and PyMuPDF from source during the `pip install`, which needs the Xcode command line tools.
+
+```sh
+brew install qpdf ghostscript jbig2dec jbig2enc fontconfig
+brew install --cask font-urw-base35 font-liberation
 ```
 
 The optional dependencies have their own licenses. In particular, Ghostscript and PyMuPDF/MuPDF use AGPL or commercial licensing, and veraPDF is GPL/MPL. They are separate installations, not bundled third-party binaries. The binary does embed the ICC sRGB profile `sRGB2014.icc`, which the International Color Consortium distributes without restriction.
@@ -151,7 +160,7 @@ For monochrome images, the codec comparison may retain full resolution when a sm
 
 ### Ghostscript
 
-Install a current, security-patched Ghostscript and put `gs` on `PATH`. Windows also supports `gswin64c` and `gswin32c`.
+Install a current, security-patched Ghostscript and put `gs` on `PATH`.
 
 ```sh
 pdf-squeezer --engine ghostscript --quality ebook scan.pdf
@@ -260,7 +269,7 @@ pdf-squeezer --pdfa 4 --images --dpi 150 --image-quality 80 scan.pdf
 
 A batch runs veraPDF once per group of files rather than once per file.
 
-It requires the Python tools, qpdf, veraPDF with a Java runtime on `PATH`, and fontconfig with metric-compatible fonts for the standard 14 fonts: the URW Base35 family (`fonts-urw-base35`) or Liberation (`fonts-liberation`).
+It requires the Python tools, qpdf, veraPDF with a Java runtime on `PATH` (use 1.30.3 or newer; older releases leave a log file in `/tmp` on each run), and fontconfig with metric-compatible fonts for the standard 14 fonts: the URW Base35 family (`fonts-urw-base35`) or Liberation (`fonts-liberation`).
 
 The converter repairs what it can without changing page content:
 
@@ -310,13 +319,13 @@ Bitmap output replaces pages with rendered images. MRC output separates a high-r
 
 - All output is staged and validated before it gets its final name. Inputs and existing outputs are never replaced or moved to Trash.
 - The CLI publishes the staged result with a hard link, so a crash cannot leave a partial output. Filesystems without hard links, such as FAT and exFAT, get a copy instead, and a crash during that copy can leave an incomplete destination. Remove it before retrying. A reported write failure removes partial output.
-- Staging happens in a private directory next to the output, and optional tools keep their scratch files there. Temporary files and output use private permissions where the filesystem supports them. Keep free space next to the output for a few copies of the document.
+- Staging happens in a private directory next to the output, and optional tools keep their scratch files there. Temporary files and output use private permissions where the filesystem supports them. Keep free space next to the output for a few copies of the document. Python and Java tools cannot open paths that are not valid UTF-8, so for such a directory they work through a symlink in the temporary directory.
 - Compression invalidates digital signatures. Ghostscript, font rewriting, flattening, rasterization, and PDF/A-4 conversion can change document features. Keep originals and inspect results.
 - Default compression and the open-source processing tools run locally. Keep PDF parsers and optional tools patched before processing untrusted documents.
 
 ## Development
 
-CI runs Go tests with the race detector, `go vet`, formatting checks, Python lint checks, and synthetic render-comparison tests. It cross-compiles standalone binaries for the supported targets.
+CI runs the Go tests with the race detector and the synthetic render-comparison tests, with every optional tool installed, on Debian 13 and macOS. It also runs `go vet`, formatting checks, and Python lint checks, and cross-compiles standalone binaries for Linux and macOS.
 
 The tests cover shared-image cropping and DPI, masks and scan codecs, CMYK/JPEG 2000, font merging/subsetting, flattening and raster output, and PDF/A conversion of fonts, color, attachments, annotations, and forbidden features at every level, each verified with veraPDF. CI also builds the container image and pushes it on release tags. A missing optional dependency or a noncompliant validator report must fail without publishing an output.
 
