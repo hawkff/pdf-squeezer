@@ -16,8 +16,13 @@ import zlib
 from decimal import Decimal
 from pathlib import Path
 
+MISSING_MODULE = "Missing optional module {}. Install tools/requirements.txt in PDF_SQUEEZER_PYTHON's environment."
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import pdfa  # sibling module next to this script
+try:
+    import pdfa  # sibling module next to this script; it imports pikepdf
+except ModuleNotFoundError as exc:
+    sys.exit(MISSING_MODULE.format(exc.name))
 
 MAX_SAMPLES = 256 << 20
 FULL_RESOLUTION_SIZE_RATIO = 3.5
@@ -1355,10 +1360,8 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except ImportError as exc:
-        message(
-            f"Missing optional module {exc.name}. Install tools/requirements.txt in PDF_SQUEEZER_PYTHON's environment."
-        )
+    except ModuleNotFoundError as exc:
+        message(MISSING_MODULE.format(exc.name))
         sys.exit(1)
     except pdfa.ConversionError as exc:
         message(f"PDF/A: {exc}")
