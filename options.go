@@ -26,6 +26,7 @@ General:
   -o, --output PATH        output file/directory; repeat once per input for separate files
   --compression LEVEL     light, balanced, medium, strong, heavy; explicit flags override
   --recursive             recurse into directory inputs; skip *.squeezed.pdf
+  --jobs N                process N files at once (default 1); each has its own image budget
   --collision POLICY      error (default) or number
   --profile FILE          load JSON or .pdfscp profiles; repeat to combine bundles
   --profile-entry NAME|N  select a profile by name or 1-based index (default first)
@@ -89,7 +90,7 @@ type options struct {
 	engine, quality, output, collision, timestamps               string
 	compression, colorReduction                                  string
 	outputs                                                      stringList
-	dpi, grayDPI, monoDPI, imageQuality, imageMemory             int
+	dpi, grayDPI, monoDPI, imageQuality, imageMemory, jobs       int
 	dpiThreshold                                                 float64
 	gray, images, privacy, verbose, recursive                    bool
 	lossless, reduceBits, force, clip, inline, extended          bool
@@ -137,7 +138,7 @@ func parseFlags(flags *flag.FlagSet, args []string) ([]string, error) {
 
 func profileFlag(name string) bool {
 	switch name {
-	case "o", "output", "profile", "profile-entry", "save-profile", "password-file", "encrypt-user-file", "encrypt-owner-file", "metadata", "v", "version", "V", "verbose", "recursive", "collision", "extract", "output-intent", "font-file":
+	case "o", "output", "profile", "profile-entry", "save-profile", "password-file", "encrypt-user-file", "encrypt-owner-file", "metadata", "v", "version", "V", "verbose", "recursive", "jobs", "collision", "extract", "output-intent", "font-file":
 		return false
 	}
 	return true
@@ -157,6 +158,7 @@ func parseOptions(ctx context.Context, args []string, stderr io.Writer) (options
 	f.StringVar(&opts.collision, "collision", "error", "")
 	f.StringVar(&opts.timestamps, "timestamps", "preserve", "")
 	f.BoolVar(&opts.recursive, "recursive", false, "")
+	f.IntVar(&opts.jobs, "jobs", 1, "")
 	f.BoolVar(&opts.verbose, "verbose", false, "")
 	f.BoolVar(&opts.verbose, "V", false, "")
 	f.BoolVar(&opts.images, "images", false, "")
@@ -390,6 +392,9 @@ func (o *options) validate() error {
 	}
 	if o.imageQuality < 1 || o.imageQuality > 100 {
 		return errors.New("--image-quality must be between 1 and 100")
+	}
+	if o.jobs < 1 || o.jobs > 64 {
+		return errors.New("--jobs must be between 1 and 64")
 	}
 	if o.imageMemory < 16 || o.imageMemory > 8192 {
 		return errors.New("--image-memory must be between 16 and 8192 MiB")

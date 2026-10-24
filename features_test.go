@@ -489,6 +489,54 @@ func TestExpandInputsFollowsNamedSymlinkDirectory(t *testing.T) {
 	}
 }
 
+func TestParallelJobsKeepInputOrder(t *testing.T) {
+	dir, output := t.TempDir(), t.TempDir()
+	var want []string
+	for i := range 6 {
+		name := fmt.Sprintf("%02d.pdf", i)
+		// The replacement keeps the content stream length. The first file is the
+		// largest, so it finishes last and a completion-order report would show it.
+		padding := 64000
+		if i == 0 {
+			padding = 16 << 20
+		}
+		data := bytes.Replace(testPDF(padding), []byte("Squeeze this PDF."), []byte(fmt.Sprintf("Document %02d text.", i)), 1)
+		if i == 3 {
+			data = []byte("%PDF-1.7\nbroken")
+		} else {
+			want = append(want, filepath.Join(output, fmt.Sprintf("%02d.squeezed.pdf", i)))
+		}
+		writeFile(t, filepath.Join(dir, name), data)
+	}
+	var stdout, stderr bytes.Buffer
+	err := run(t.Context(), []string{"--jobs", "4", "-V", "-o", output, dir}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "03.pdf") || strings.Count(err.Error(), ".pdf:") != 1 {
+		t.Fatalf("expected one failure for 03.pdf: %v", err)
+	}
+	var got []string
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		got = append(got, strings.SplitN(line, ": ", 2)[0])
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("reports out of order:\n%s", &stdout)
+	}
+	for _, path := range want {
+		text := fmt.Sprintf("Document %s text.", filepath.Base(path)[:2])
+		found := false
+		for _, e := range readContext(t, path, "").Table {
+			if e != nil && !e.Free {
+				if sd, ok := e.Object.(types.StreamDict); ok && sd.Decode() == nil && bytes.Contains(sd.Content, []byte(text)) {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("%s does not hold %q", path, text)
+		}
+	}
+	assertNoTemps(t, output)
+}
+
 func TestProfilesBatchAndTimestamps(t *testing.T) {
 	dir, output := t.TempDir(), t.TempDir()
 	profilePath := filepath.Join(t.TempDir(), "profile.json")

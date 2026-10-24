@@ -266,6 +266,72 @@ func TestFinishedStagesAreRemovedEarly(t *testing.T) {
 	assertNoTemps(t, dir)
 }
 
+func TestCanceledJobsRemoveStagingFiles(t *testing.T) {
+	dir, output, tools := t.TempDir(), t.TempDir(), t.TempDir()
+	for i := range 3 {
+		writeFile(t, filepath.Join(dir, strconv.Itoa(i)+".pdf"), testPDF(0))
+	}
+	stub := filepath.Join(tools, "python")
+	writeFile(t, stub, []byte("#!/bin/sh\nexec sleep 60\n"))
+	if err := os.Chmod(stub, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PDF_SQUEEZER_PYTHON", stub)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	time.AfterFunc(500*time.Millisecond, cancel)
+	start := time.Now()
+	err := run(ctx, []string{"--jobs", "2", "--gray", "-o", output, dir}, io.Discard, io.Discard)
+	if !errors.Is(err, context.Canceled) || strings.Count(err.Error(), "context canceled") != 1 {
+		t.Fatalf("want one cancellation error, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("cancellation waited %v for the tools", elapsed)
+	}
+	assertNoTemps(t, output)
+}
+
+func TestJobsOverlapWithinTheLimit(t *testing.T) {
+	dir, output, tools := t.TempDir(), t.TempDir(), t.TempDir()
+	for i := range 4 {
+		writeFile(t, filepath.Join(dir, strconv.Itoa(i)+".pdf"), testPDF(0))
+	}
+	// A Python stand-in that records how many calls run at once. The first call
+	// stays active until a second one has started, so sequential processing cannot pass.
+	stub := filepath.Join(tools, "python")
+	writeFile(t, stub, []byte(`#!/bin/sh
+mkdir "$TEST_DIR/active.$$"
+echo $(( $(ls -d "$TEST_DIR"/active.* | wc -l) )) >> "$TEST_DIR/counts"
+if mkdir "$TEST_DIR/first" 2>/dev/null; then
+	for _ in $(seq 50); do
+		[ $(( $(wc -l < "$TEST_DIR/counts") )) -ge 2 ] && break
+		sleep 0.1
+	done
+fi
+cp "$4" "$5"
+rmdir "$TEST_DIR/active.$$"
+`))
+	if err := os.Chmod(stub, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PDF_SQUEEZER_PYTHON", stub)
+	t.Setenv("TEST_DIR", tools)
+	if err := run(t.Context(), []string{"--jobs", "2", "--gray", "-o", output, dir}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	most := 0
+	for _, count := range strings.Fields(string(readFile(t, filepath.Join(tools, "counts")))) {
+		n, err := strconv.Atoi(count)
+		if err != nil {
+			t.Fatal(err)
+		}
+		most = max(most, n)
+	}
+	if most != 2 {
+		t.Fatalf("%d tool calls ran at once with --jobs 2", most)
+	}
+}
+
 func TestNonUTF8DirectoriesReachPythonAndJava(t *testing.T) {
 	if os.Getenv("PDF_SQUEEZER_INTEGRATION") != "1" {
 		t.Skip("optional tool integration")
