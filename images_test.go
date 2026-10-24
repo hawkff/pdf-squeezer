@@ -401,6 +401,56 @@ func TestJPEGColorTransformPreservation(t *testing.T) {
 	}
 }
 
+func TestImagesSkipUnprofitableStreams(t *testing.T) {
+	samples := bytes.Repeat([]byte{128}, 64*64)
+	raw := deflate(t, samples)
+	if len(raw) >= minImageSavings {
+		t.Fatal("fixture is not below the minimum savings")
+	}
+	for _, force := range []bool{false, true} {
+		pdf, err := api.ReadAndValidate(t.Context(), bytes.NewReader(imagePDF(8, "DeviceGray", "/Filter /FlateDecode", raw)), configuration(""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobs := 0
+		stats, err := optimizeImages(t.Context(), pdf, options{imageMemory: 512, imageCodecs: "flate", force: force}, func(string, ...any) { jobs++ })
+		if err != nil {
+			t.Fatal(err)
+		}
+		sd := firstImage(t, pdf)
+		if force {
+			if stats.changed != 1 || jobs != 1 {
+				t.Fatalf("forced encoding was skipped: %v, jobs %d", stats, jobs)
+			}
+		} else if stats.changed != 0 || stats.preserved["no gain"] != 1 || jobs != 0 || !bytes.Equal(sd.Raw, raw) {
+			t.Fatalf("unprofitable image was processed: %v, jobs %d", stats, jobs)
+		}
+		if err := sd.Decode(); err != nil || !bytes.Equal(sd.Content, samples) {
+			t.Fatalf("samples changed: %v", err)
+		}
+	}
+}
+
+func BenchmarkImagesBelowSavingsThreshold(b *testing.B) {
+	raw, err := deflateSamples(b.Context(), bytes.Repeat([]byte{128}, 512*512), false, 0)
+	if err != nil || len(raw) >= minImageSavings {
+		b.Fatalf("invalid fixture: %v", err)
+	}
+	sd := types.StreamDict{
+		Dict: types.Dict{"Subtype": types.Name("Image"), "Width": types.Integer(512), "Height": types.Integer(512), "BitsPerComponent": types.Integer(8), "ColorSpace": types.Name("DeviceGray")},
+		Raw:  raw, FilterPipeline: []types.PDFFilter{{Name: "FlateDecode"}},
+	}
+	pdf := &model.Context{XRefTable: &model.XRefTable{Table: map[int]*model.XRefTableEntry{1: {Object: sd}}}}
+	opts := options{imageMemory: 512, imageCodecs: "flate", lossless: true}
+	b.ReportAllocs()
+	for b.Loop() {
+		stats, err := optimizeImages(b.Context(), pdf, opts, func(string, ...any) {})
+		if err != nil || stats.changed != 0 || stats.preserved["no gain"] != 1 {
+			b.Fatalf("unexpected result: %v, %v", stats, err)
+		}
+	}
+}
+
 func BenchmarkJPEGSamplesYCbCr(b *testing.B) {
 	img := image.NewYCbCr(image.Rect(0, 0, 512, 512), image.YCbCrSubsampleRatio420)
 	for j, plane := range [][]byte{img.Y, img.Cb, img.Cr} {

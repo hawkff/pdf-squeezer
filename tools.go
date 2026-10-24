@@ -412,7 +412,7 @@ func validatePDFA(ctx context.Context, flavour string, paths []string, stderr io
 }
 
 func extract(ctx context.Context, input, output string, opts options, stderr io.Writer) (err error) {
-	f, err := os.Open(input)
+	f, _, err := openInput(input)
 	if err != nil {
 		return err
 	}
@@ -425,6 +425,14 @@ func extract(ctx context.Context, input, output string, opts options, stderr io.
 		return err
 	}
 	defer os.RemoveAll(work)
+	if opts.extract == "text" || opts.inline {
+		if input, err = stagePath(work); err != nil {
+			return err
+		}
+		if err := copyStage(ctx, input, f); err != nil {
+			return err
+		}
+	}
 	if opts.extract == "text" {
 		staged := filepath.Join(work, "text.txt")
 		if err := pythonPDF(ctx, "text", input, staged, opts, stderr); err != nil {

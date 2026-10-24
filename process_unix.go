@@ -10,6 +10,9 @@ import (
 	"time"
 )
 
+// A pathname replaced by a FIFO must not block before the descriptor can be checked.
+const inputOpenFlags = os.O_RDONLY | syscall.O_NONBLOCK
+
 func configureCommand(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {

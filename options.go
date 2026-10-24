@@ -589,6 +589,9 @@ func expandInputs(ctx context.Context, inputs []string, recursive bool) ([]input
 			return nil, err
 		}
 		if !info.IsDir() {
+			if !info.Mode().IsRegular() {
+				return nil, fmt.Errorf("input must be a regular PDF file: %s", input)
+			}
 			if err := add(input, filepath.Base(input)); err != nil {
 				return nil, err
 			}
@@ -607,7 +610,7 @@ func expandInputs(ctx context.Context, inputs []string, recursive bool) ([]input
 				}
 				return nil
 			}
-			if d.Type()&os.ModeSymlink != 0 || !strings.EqualFold(filepath.Ext(path), ".pdf") || strings.HasPrefix(d.Name(), ".") || generatedPDF(d.Name()) {
+			if !d.Type().IsRegular() || !strings.EqualFold(filepath.Ext(path), ".pdf") || strings.HasPrefix(d.Name(), ".") || generatedPDF(d.Name()) {
 				return nil
 			}
 			rel, err := filepath.Rel(input, path)

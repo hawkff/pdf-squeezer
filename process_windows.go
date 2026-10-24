@@ -1,10 +1,13 @@
 package main
 
 import (
+	"os"
 	"os/exec"
 	"strconv"
 	"time"
 )
+
+const inputOpenFlags = os.O_RDONLY
 
 func configureCommand(cmd *exec.Cmd) {
 	cmd.Cancel = func() error {

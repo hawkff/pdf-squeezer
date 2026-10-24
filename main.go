@@ -198,10 +198,10 @@ const validationBatch = 32
 // staged is a compressed document that pdfcpu validated and that waits for
 // publication, and for veraPDF when a PDF/A flavour has to be confirmed.
 type staged struct {
-	input, output, path, work string
-	info                      os.FileInfo
-	flavour                   string // veraPDF flavour to confirm, "" for none
-	converted                 bool   // --pdfa produced it: a failed check is fatal
+	input, output, path, work, original string
+	info                                os.FileInfo
+	flavour                             string // veraPDF flavour to confirm, "" for none
+	converted                           bool   // --pdfa produced it: a failed check is fatal
 }
 
 func (s *staged) cleanup() { os.RemoveAll(s.work) }
@@ -278,12 +278,12 @@ func (v *verifier) check(ctx context.Context, s *staged) error {
 	if s.converted {
 		return verdict
 	}
-	inputs, err := validatePDFA(ctx, s.flavour, []string{s.input}, v.stderr)
+	inputs, err := validatePDFA(ctx, s.flavour, []string{s.original}, v.stderr)
 	if err != nil {
 		// A rejected output is published only with proof that the input did not conform.
 		return errors.Join(verdict, err)
 	}
-	if inputs[s.input] == nil {
+	if inputs[s.original] == nil {
 		return fmt.Errorf("compression broke the input's %s conformance; use --pdfa to repair it or report this:\n%w", label, verdict)
 	}
 	fmt.Fprintf(v.stderr, "warning: %s declares %s but does not conform to it; the output is not verified\n", s.input, label)
@@ -354,18 +354,11 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	in, err := os.Open(input)
+	in, info, err := openInput(input)
 	if err != nil {
 		return nil, err
 	}
 	defer in.Close()
-	info, err := in.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, errors.New("input must be a regular PDF file")
-	}
 	if err := checkPDF(in); err != nil {
 		return nil, fmt.Errorf("input: %w", err)
 	}
@@ -428,30 +421,28 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 		fmt.Fprintln(stderr, "warning: rewriting this signed PDF invalidates its digital signatures")
 	}
 	start := time.Now()
-	current, err := filepath.Abs(input)
+	// Every tool works on a private snapshot of the opened input, never its path.
+	original, err := stagePath(work)
 	if err != nil {
 		return nil, err
 	}
-	// Every tool works on a private staged copy, never the original path.
-	stage, err := stagePath(work)
-	if err != nil {
+	if _, err := in.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
+	if err := copyStage(ctx, original, in); err != nil {
+		return nil, err
+	}
+	current := original
 	if encrypted {
 		logf("decrypting working copy")
-		if err := qpdf(ctx, []string{"--decrypt", current, stage}, opts.password, stderr); err != nil {
+		if current, err = stagePath(work); err != nil {
+			return nil, err
+		}
+		if err := qpdf(ctx, []string{"--decrypt", original, current}, opts.password, stderr); err != nil {
 			return nil, err
 		}
 		pdf = nil
-	} else {
-		if _, err := in.Seek(0, io.SeekStart); err != nil {
-			return nil, err
-		}
-		if err := copyStage(ctx, stage, in); err != nil {
-			return nil, err
-		}
 	}
-	current = stage
 	apply := func(label string, process func(string, string) error) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -604,10 +595,6 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 		err = apply("encrypting output", func(in, out string) error { return encryptPDF(ctx, in, out, opts) })
 		outputPassword = opts.encryptOwner
 	} else if encrypted && !opts.decrypt {
-		original, absErr := filepath.Abs(input)
-		if absErr != nil {
-			return nil, absErr
-		}
 		err = apply("preserving encryption", func(in, out string) error {
 			return qpdf(ctx, []string{"--copy-encryption=" + original, "--encryption-file-password=" + opts.password, in, out}, "", stderr)
 		})
@@ -632,31 +619,19 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 	}
 	logf("%s: %d bytes in %s; validated", opts.engine, ci.Size(), time.Since(start).Round(time.Millisecond))
 	if ci.Size() >= info.Size() && !opts.requiredOutput() {
-		// The input is published unchanged. A staged copy of the bytes this run
-		// opened is what veraPDF checks and what publish copies, so a file
-		// swapped in under the input path cannot slip through.
-		if current, err = stagePath(work); err != nil {
-			return nil, err
-		}
-		if _, err := in.Seek(0, io.SeekStart); err != nil {
-			return nil, err
-		}
-		if err := copyStage(ctx, current, in); err != nil {
-			return nil, err
-		}
+		current = original
 	}
-	// Only the final stage waits for publication; intermediates would otherwise
-	// pile up across a validation batch.
+	// Keep the original snapshot only when a failed conformance verdict may need it.
 	entries, err := os.ReadDir(work)
 	if err != nil {
 		return nil, err
 	}
 	for _, entry := range entries {
-		if path := filepath.Join(work, entry.Name()); path != current {
+		if path := filepath.Join(work, entry.Name()); path != current && !(path == original && flavour != "" && !converted) {
 			os.RemoveAll(path)
 		}
 	}
-	return &staged{input: input, output: output, path: current, work: work, info: info, flavour: flavour, converted: converted}, nil
+	return &staged{input: input, output: output, path: current, work: work, original: original, info: info, flavour: flavour, converted: converted}, nil
 }
 func stagePath(dir string) (string, error) {
 	f, err := os.CreateTemp(dir, "stage-*.pdf")
@@ -673,6 +648,21 @@ func copyStage(ctx context.Context, path string, in io.Reader) error {
 	}
 	_, err = io.Copy(f, contextReader{ctx, in})
 	return errors.Join(err, f.Close())
+}
+
+func openInput(path string) (*os.File, os.FileInfo, error) {
+	f, err := os.OpenFile(path, inputOpenFlags, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := f.Stat()
+	if err == nil && !info.Mode().IsRegular() {
+		err = errors.New("input must be a regular PDF file")
+	}
+	if err != nil {
+		return nil, nil, errors.Join(err, f.Close())
+	}
+	return f, info, nil
 }
 
 func checkPDF(file *os.File) error {

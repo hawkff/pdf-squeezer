@@ -1546,17 +1546,16 @@ def embed_simple_font(pdf, font, codes, invisible_codes, options, notes):
             for code in mapping
             if first <= code <= last and code - first < len(existing)
         }
-        if unknown_usage:
-            # Outside /Widths the document uses MissingWidth, not the substitute's
-            # advance. Without usage information we cannot discard those metrics.
-            document.update(
-                {code: missing_width for code in mapping if code not in document}
-            )
         mismatched = {
             code: width
             for code, width in document.items()
             if abs(width - widths[code]) > 1
         }
+        if unknown_usage:
+            # MissingWidth preserves advances outside /Widths but does not identify a wrong font.
+            document.update(
+                {code: missing_width for code in mapping if code not in document}
+            )
         if mismatched and unknown_usage:
             raise ConversionError(
                 f"font usage could not be determined and document widths for {name} "
