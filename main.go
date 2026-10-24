@@ -652,12 +652,13 @@ func stagingDir(output string) (string, func(), error) {
 	if err == nil {
 		err = os.Symlink(work, filepath.Join(alias, "work"))
 	}
-	remove := func() { os.RemoveAll(alias); os.RemoveAll(work) } // RemoveAll deletes the link, not its target
 	if err != nil {
-		remove()
-		return "", nil, err
+		// Native processing still works; only the external tools will refuse the path.
+		os.RemoveAll(alias)
+		return work, func() { os.RemoveAll(work) }, nil
 	}
-	return filepath.Join(alias, "work"), remove, nil
+	// RemoveAll deletes the link, not its target.
+	return filepath.Join(alias, "work"), func() { os.RemoveAll(alias); os.RemoveAll(work) }, nil
 }
 
 func stagePath(dir string) (string, error) {

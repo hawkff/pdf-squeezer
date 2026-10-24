@@ -294,3 +294,18 @@ func TestNonUTF8DirectoriesReachPythonAndJava(t *testing.T) {
 		t.Fatalf("staging aliases remain: %v, %v", entries, err)
 	}
 }
+
+func TestNonUTF8DirectoryWithoutAliasKeepsNativeProcessing(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "M\xe4rz")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Skip("this filesystem rejects names that are not UTF-8:", err)
+	}
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing")) // the alias cannot be created
+	input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+	writeFile(t, input, testPDF(64000))
+	if err := run(t.Context(), []string{"-o", output, input}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	readContext(t, output, "")
+	assertNoTemps(t, dir)
+}
