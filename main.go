@@ -17,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/log"
@@ -200,13 +201,14 @@ const validationBatch = 32
 // staged is a compressed document that pdfcpu validated and that waits for
 // publication, and for veraPDF when a PDF/A flavour has to be confirmed.
 type staged struct {
-	input, output, path, work, original string
-	info                                os.FileInfo
-	flavour                             string // veraPDF flavour to confirm, "" for none
-	converted                           bool   // --pdfa produced it: a failed check is fatal
+	input, output, path, original string
+	remove                        func() // deletes the staging directory
+	info                          os.FileInfo
+	flavour                       string // veraPDF flavour to confirm, "" for none
+	converted                     bool   // --pdfa produced it: a failed check is fatal
 }
 
-func (s *staged) cleanup() { os.RemoveAll(s.work) }
+func (s *staged) cleanup() { s.remove() }
 
 // verifier runs veraPDF once per batch and flavour and keeps each verdict.
 type verifier struct {
@@ -364,13 +366,13 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	work, err := os.MkdirTemp(filepath.Dir(output), ".pdf-squeezer-*")
+	work, removeWork, err := stagingDir(output)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		if err != nil { // the named result: every failed return reaches it
-			os.RemoveAll(work)
+			removeWork()
 		}
 	}()
 	logf("input: %s (%d bytes)", input, info.Size())
@@ -632,8 +634,32 @@ func prepare(ctx context.Context, input, output string, opts options, stderr io.
 			os.RemoveAll(path)
 		}
 	}
-	return &staged{input: input, output: output, path: current, work: work, original: original, info: info, flavour: flavour, converted: converted}, nil
+	return &staged{input: input, output: output, path: current, original: original, remove: removeWork, info: info, flavour: flavour, converted: converted}, nil
 }
+
+// stagingDir creates the private staging directory next to output. Python and
+// Java tools cannot open paths that are not valid UTF-8, so they reach such a
+// directory through a symlink in the system temporary directory.
+func stagingDir(output string) (string, func(), error) {
+	work, err := os.MkdirTemp(filepath.Dir(output), ".pdf-squeezer-*")
+	if err != nil {
+		return "", nil, err
+	}
+	if utf8.ValidString(work) {
+		return work, func() { os.RemoveAll(work) }, nil
+	}
+	alias, err := os.MkdirTemp("", "pdf-squeezer-*")
+	if err == nil {
+		err = os.Symlink(work, filepath.Join(alias, "work"))
+	}
+	remove := func() { os.RemoveAll(alias); os.RemoveAll(work) } // RemoveAll deletes the link, not its target
+	if err != nil {
+		remove()
+		return "", nil, err
+	}
+	return filepath.Join(alias, "work"), remove, nil
+}
+
 func stagePath(dir string) (string, error) {
 	f, err := os.CreateTemp(dir, "stage-*.pdf")
 	if err != nil {

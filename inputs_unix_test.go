@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -264,4 +265,32 @@ func TestFinishedStagesAreRemovedEarly(t *testing.T) {
 		t.Fatalf("stage files while tools ran:\n%s", got)
 	}
 	assertNoTemps(t, dir)
+}
+
+func TestNonUTF8DirectoriesReachPythonAndJava(t *testing.T) {
+	if os.Getenv("PDF_SQUEEZER_INTEGRATION") != "1" {
+		t.Skip("optional tool integration")
+	}
+	requirePythonTools(t)
+	requireTool(t, "qpdf")
+	requireTool(t, "verapdf")
+	dir := filepath.Join(t.TempDir(), "M\xe4rz")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Skip("this filesystem rejects names that are not UTF-8:", err)
+	}
+	aliases := t.TempDir()
+	t.Setenv("TMPDIR", aliases)
+	input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+	writeFile(t, input, testPDF(0))
+	var messages bytes.Buffer
+	if err := run(t.Context(), []string{"--pdfa", "4", "-o", output, input}, io.Discard, &messages); err != nil {
+		t.Fatalf("%v\n%s", err, &messages)
+	}
+	if flavour, err := declaredFlavour(t.Context(), output); err != nil || flavour != "4" {
+		t.Fatalf("flavour %q, %v", flavour, err)
+	}
+	assertNoTemps(t, dir)
+	if entries, err := os.ReadDir(aliases); err != nil || len(entries) != 0 {
+		t.Fatalf("staging aliases remain: %v, %v", entries, err)
+	}
 }
