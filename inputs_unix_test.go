@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // Signal tests run the real entry point in a child copy of this test binary.
@@ -327,5 +329,54 @@ rmdir "$TEST_DIR/active.$$"
 	}
 	if most != 2 {
 		t.Fatalf("%d tool calls ran at once with --jobs 2", most)
+	}
+}
+
+func TestNonUTF8DirectoriesReachPythonAndJava(t *testing.T) {
+	if os.Getenv("PDF_SQUEEZER_INTEGRATION") != "1" {
+		t.Skip("optional tool integration")
+	}
+	requirePythonTools(t)
+	requireTool(t, "qpdf")
+	requireTool(t, "verapdf")
+	dir := filepath.Join(t.TempDir(), "M\xe4rz")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Skip("this filesystem rejects names that are not UTF-8:", err)
+	}
+	aliases := t.TempDir()
+	t.Setenv("TMPDIR", aliases)
+	input, output := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.pdf")
+	writeFile(t, input, testPDF(0))
+	var messages bytes.Buffer
+	if err := run(t.Context(), []string{"--pdfa", "4", "-o", output, input}, io.Discard, &messages); err != nil {
+		t.Fatalf("%v\n%s", err, &messages)
+	}
+	if flavour, err := declaredFlavour(t.Context(), output); err != nil || flavour != "4" {
+		t.Fatalf("flavour %q, %v", flavour, err)
+	}
+	assertNoTemps(t, dir)
+	if entries, err := os.ReadDir(aliases); err != nil || len(entries) != 0 {
+		t.Fatalf("staging aliases remain: %v, %v", entries, err)
+	}
+}
+
+func TestStagingAliasAvoidsNonUTF8TempDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "M\xe4rz")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Skip("this filesystem rejects names that are not UTF-8:", err)
+	}
+	t.Setenv("TMPDIR", dir) // an alias here would be no better than the original path
+	work, remove, err := stagingDir(filepath.Join(dir, "out.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.ValidString(work) {
+		t.Fatalf("staging path %q is not valid UTF-8", work)
+	}
+	writeFile(t, filepath.Join(work, "stage.pdf"), testPDF(0))
+	remove()
+	assertNoTemps(t, dir)
+	if _, err := os.Lstat(filepath.Dir(work)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("alias remains: %v", err)
 	}
 }
