@@ -1174,7 +1174,7 @@ def merge_fonts(pdf, verbose):
 def rasterize(document, output, options):
     import pikepdf
     import pymupdf
-    from PIL import Image, ImageFilter
+    from PIL import Image, ImageChops, ImageFilter
 
     result = pikepdf.Pdf.new()
     for number, page in enumerate(document):
@@ -1198,18 +1198,22 @@ def rasterize(document, output, options):
             mask = image.convert("L").point(
                 lambda value: 0 if value < 96 else 255, mode="1"
             )
-            background = image.copy()
-            filled = image.filter(ImageFilter.MaxFilter(9))
-            from PIL import ImageChops
-
-            background.paste(filled, mask=ImageChops.invert(mask).convert("L"))
             ratio = min(1, options["background_dpi"] / dpi)
-            background = background.resize(
-                (
-                    max(1, round(image.width * ratio)),
-                    max(1, round(image.height * ratio)),
-                ),
-                Image.Resampling.LANCZOS,
+            size = (
+                max(1, round(image.width * ratio)),
+                max(1, round(image.height * ratio)),
+            )
+            # Paint over the text with nearby paper after shrinking; a full-resolution
+            # filter took most of each page's time. It still reaches 4 rendered pixels.
+            background = image.resize(size, Image.Resampling.LANCZOS)
+            text = (
+                ImageChops.invert(mask).convert("L").resize(size, Image.Resampling.BOX)
+            )
+            text = text.point(lambda value: 255 if value else 0)
+            reach = 2 * math.ceil(4 * ratio) + 1
+            background.paste(
+                background.filter(ImageFilter.MaxFilter(reach)),
+                mask=text.filter(ImageFilter.MaxFilter(3)),
             )
             payload, filter_name, parms = mono_candidate(
                 mask, options["mono_codecs"].split(",")

@@ -2059,6 +2059,11 @@ class PDFToolsTests(unittest.TestCase):
                         self.assertGreater(
                             int(images.Foreground.Width), int(images.Background.Width)
                         )
+                        # The mask draws the text; the background keeps none of it.
+                        background = Image.open(
+                            io.BytesIO(images.Background.read_raw_bytes())
+                        )
+                        self.assertGreater(min(background.convert("L").getdata()), 128)
                     else:
                         self.assertEqual(len(images), 1)
 

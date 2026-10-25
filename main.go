@@ -23,6 +23,10 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
+// buildVersion is set with -ldflags "-X main.buildVersion=..." where Go has no
+// version control data to stamp, as in the container image build.
+var buildVersion string
+
 func main() {
 	// A closed terminal cancels too, so tool process groups and staging files are cleaned up.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
@@ -40,9 +44,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if version {
-		v := "unknown"
-		if info, ok := debug.ReadBuildInfo(); ok {
-			v = info.Main.Version
+		v := buildVersion
+		if v == "" {
+			v = "unknown"
+			if info, ok := debug.ReadBuildInfo(); ok {
+				v = info.Main.Version
+			}
 		}
 		fmt.Fprintln(stdout, v)
 		return nil

@@ -5,7 +5,10 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /pdf-squeezer .
+# .dockerignore leaves out .git, so Go cannot stamp the version; CI passes it as VERSION.
+ARG VERSION
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.buildVersion=${VERSION}" -o /pdf-squeezer . \
+    && { [ -z "$VERSION" ] || [ "$(/pdf-squeezer --version)" = "$VERSION" ]; }
 
 # jbig2enc provides the lossless JBIG2 encoder behind --mono-codecs jbig2.
 FROM debian:trixie AS jbig2
