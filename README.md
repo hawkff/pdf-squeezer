@@ -170,7 +170,7 @@ Downsampling loses detail, so check fine text before you share a scan.
 - To give each input its own destination, repeat `-o` once per input file, in order: `pdf-squeezer a.pdf b.pdf -o out/a.pdf -o elsewhere/b.pdf`. This form does not accept directory inputs.
 - The CLI checks every destination before it starts and never overwrites an existing file or symlink. `--collision number` writes `NAME.squeezed.1.pdf` and so on instead of stopping.
 - A directory input covers its top-level `.pdf` files, and `--recursive` adds subdirectories. Scans skip hidden files and directories, symlinks inside the tree, and earlier `.squeezed.pdf` outputs.
-- `--jobs N` processes up to N files at once, from 1 to 64, and keeps reports and outputs in input order. Each job has its own `--image-memory` budget.
+- `--jobs N` processes up to N files at once, from 1 to 64, and keeps reports and outputs in input order. Each job has its own `--image-memory` budget. With more than one job, every line a file prints on stderr starts with its path.
 - A batch reports each failed file, continues with the rest, and exits with a nonzero status if any file failed.
 
 If compression does not make a file smaller, the output is a copy of the original. Options that change the document on purpose, such as `--privacy`, `--strip`, `--flatten`, `--gray`, or `--pdfa`, keep their result even when it grows. So does `--force-recompression`.
