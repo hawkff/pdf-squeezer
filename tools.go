@@ -9,15 +9,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
 // The Python helpers and the ICC sRGB profile (International Color Consortium,
@@ -481,21 +485,44 @@ func extract(ctx context.Context, input, output string, opts options, stderr io.
 	if err := os.Mkdir(imagesDir, 0700); err != nil {
 		return err
 	}
-	seen := map[int]bool{}
-	err = api.ExtractImages(ctx, f, nil, func(img model.Image, _ bool, objNr int) error {
-		if seen[objNr] {
-			return nil
-		}
-		seen[objNr] = true
-		if !listContains("png,jpg,jpeg,tif,tiff,jp2,jpx,pbm", img.FileType) {
-			return fmt.Errorf("unsupported extracted image format %q", img.FileType)
-		}
-		name := fmt.Sprintf("image-%06d.%s", objNr, img.FileType)
-		_, err := writeNew(ctx, filepath.Join(imagesDir, name), img.Reader)
-		return err
-	}, configuration(opts.password))
+	conf := configuration(opts.password)
+	conf.Cmd = model.EXTRACTIMAGES
+	pdf, err := api.ReadValidateAndOptimize(ctx, f, conf, nil)
 	if err != nil {
 		return err
+	}
+	seen := map[int]bool{}
+	for pageNr := 1; pageNr <= pdf.PageCount; pageNr++ {
+		// Stubs name a page's images without decoding them, so each object is decoded once.
+		stubs, err := pdfcpu.ExtractPageImages(ctx, pdf, pageNr, true)
+		if err != nil {
+			return err
+		}
+		for _, objNr := range slices.Sorted(maps.Keys(stubs)) {
+			if seen[objNr] {
+				continue
+			}
+			seen[objNr] = true
+			var sd *types.StreamDict
+			if o := pdf.Optimize.ImageObjects[objNr]; o != nil {
+				sd = o.ImageDict
+			} else if sd, _, err = pdf.DereferenceStreamDict(pdf.PageThumbs[pageNr]); err != nil || sd == nil {
+				return fmt.Errorf("page %d image object %d is unreadable: %v", pageNr, objNr, err)
+			}
+			img, err := pdfcpu.ExtractImage(ctx, pdf, sd, stubs[objNr].Thumb, stubs[objNr].Name, objNr, false)
+			if err != nil {
+				return err
+			}
+			if !listContains("png,jpg,jpeg,tif,tiff,jp2,jpx,pbm", img.FileType) {
+				return fmt.Errorf("unsupported extracted image format %q", img.FileType)
+			}
+			name := fmt.Sprintf("image-%06d.%s", objNr, img.FileType)
+			if _, err := writeNew(ctx, filepath.Join(imagesDir, name), img.Reader); err != nil {
+				return err
+			}
+			// pdfcpu keeps decoded images on the document; free each one once it is written.
+			sd.Content = nil
+		}
 	}
 	entries, err := os.ReadDir(imagesDir)
 	if err != nil {

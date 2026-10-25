@@ -697,6 +697,41 @@ func TestExtractAndInlineImages(t *testing.T) {
 	}
 }
 
+func TestExtractWritesEveryImageOnce(t *testing.T) {
+	dir := t.TempDir()
+	input, extracted := filepath.Join(dir, "in.pdf"), filepath.Join(dir, "extracted")
+	image := func(level byte) string {
+		data := bytes.Repeat([]byte{level}, 64*64)
+		return fmt.Sprintf("<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length %d >>\nstream\n%s\nendstream", len(data), data)
+	}
+	stream := func(content string) string {
+		return fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content)
+	}
+	// Page 2 draws page 1's image again next to its own, which must be written once.
+	writeFile(t, input, buildPDF(0,
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] /Resources << /XObject << /A 7 0 R >> >> /Contents 5 0 R >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] /Resources << /XObject << /A 7 0 R /B 8 0 R >> >> /Contents 6 0 R >>",
+		stream("q 64 0 0 64 0 0 cm /A Do Q\n"),
+		stream("q 32 0 0 32 0 0 cm /A Do Q q 32 0 0 32 32 32 cm /B Do Q\n"),
+		image(0x40), image(0xc0)))
+	if err := run(t.Context(), []string{"--extract", "images", "-o", extracted, input}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(extracted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	if strings.Join(names, " ") != "image-000007.png image-000008.png" {
+		t.Fatalf("extracted %v, want one file per image object", names)
+	}
+}
+
 func TestGhostscriptCompactFontPrograms(t *testing.T) {
 	requireTool(t, "gs")
 	dir := t.TempDir()
