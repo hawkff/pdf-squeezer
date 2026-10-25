@@ -156,10 +156,17 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 				return result{err: err}
 			}
 		}
-		if opts.extract != "" {
-			return result{err: extract(ctx, files[i].path, outputs[i], opts, stderr)}
+		out := stderr
+		if opts.jobs > 1 && len(files) > 1 {
+			// Parallel files share stderr, so every line names its file.
+			prefixed := &prefixWriter{writer: stderr, prefix: files[i].path + ": "}
+			defer prefixed.Close() // tools and image workers have finished by then
+			out = &lockedWriter{writer: prefixed}
 		}
-		s, err := prepare(ctx, files[i].path, outputs[i], opts, stderr)
+		if opts.extract != "" {
+			return result{err: extract(ctx, files[i].path, outputs[i], opts, out)}
+		}
+		s, err := prepare(ctx, files[i].path, outputs[i], opts, out)
 		return result{s, err}
 	}
 	// Up to --jobs files are prepared at once; results are handled in input order.
@@ -368,7 +375,6 @@ func configuration(password string) *model.Configuration {
 // prepare compresses and transforms input into a staged file that pdfcpu has
 // validated. The caller confirms PDF/A with veraPDF when needed and publishes.
 func prepare(ctx context.Context, input, output string, opts options, stderr io.Writer) (result *staged, err error) {
-	stderr = &lockedWriter{writer: stderr}
 	logf := func(format string, args ...any) {
 		if opts.verbose {
 			fmt.Fprintf(stderr, format+"\n", args...)

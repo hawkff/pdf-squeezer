@@ -520,6 +520,9 @@ func TestParallelJobsKeepInputOrder(t *testing.T) {
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("reports out of order:\n%s", &stdout)
 	}
+	if !strings.Contains(stderr.String(), filepath.Join(dir, "05.pdf")+": input: ") {
+		t.Fatalf("parallel lines do not name their file:\n%s", &stderr)
+	}
 	for _, path := range want {
 		text := fmt.Sprintf("Document %s text.", filepath.Base(path)[:2])
 		found := false
@@ -535,6 +538,24 @@ func TestParallelJobsKeepInputOrder(t *testing.T) {
 		}
 	}
 	assertNoTemps(t, output)
+}
+
+func TestPrefixWriterPassesWholeLines(t *testing.T) {
+	var out bytes.Buffer
+	w := &prefixWriter{writer: &out, prefix: "a.pdf: "}
+	for _, step := range []struct{ chunk, want string }{
+		{"one\ntw", "a.pdf: one\n"}, // an unfinished line waits for its newline
+		{"o\n", "a.pdf: one\na.pdf: two\n"},
+		{"", "a.pdf: one\na.pdf: two\n"},
+		{"three", "a.pdf: one\na.pdf: two\n"},
+	} {
+		if n, err := w.Write([]byte(step.chunk)); err != nil || n != len(step.chunk) || out.String() != step.want {
+			t.Fatalf("Write(%q) = %d, %v; got %q, want %q", step.chunk, n, err, out.String(), step.want)
+		}
+	}
+	if err := w.Close(); err != nil || out.String() != "a.pdf: one\na.pdf: two\na.pdf: three\n" {
+		t.Fatalf("Close: %v; got %q", err, out.String())
+	}
 }
 
 func TestProfilesBatchAndTimestamps(t *testing.T) {
