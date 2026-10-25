@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/color"
+	"image/png"
 	"io"
 	"math"
 	"os"
@@ -729,6 +731,15 @@ func TestExtractWritesEveryImageOnce(t *testing.T) {
 	}
 	if strings.Join(names, " ") != "image-000007.png image-000008.png" {
 		t.Fatalf("extracted %v, want one file per image object", names)
+	}
+	for name, level := range map[string]uint8{"image-000007.png": 0x40, "image-000008.png": 0xc0} {
+		img, err := png.Decode(bytes.NewReader(readFile(t, filepath.Join(extracted, name))))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if gray := color.GrayModel.Convert(img.At(10, 10)).(color.Gray); gray.Y != level {
+			t.Fatalf("%s holds gray %#x, want %#x", name, gray.Y, level)
+		}
 	}
 }
 
