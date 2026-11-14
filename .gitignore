@@ -1,0 +1,32 @@
+# Build output
+/target/
+/dist/
+
+# Credentials and logs
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.log
+
+# Local documents
+*.pdf
+!testdata/**/*.pdf
+
+# Optional Python tools and private compression settings
+.venv/
+.ruff_cache/
+__pycache__/
+*.pyc
+*.profile.json
+*.pdfscp
+*-password.txt
+
+# Editors and macOS metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+._*

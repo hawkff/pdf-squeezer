@@ -1,0 +1,220 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Set the CI_RUNNER repository variable to move the Linux jobs to another runner label.
+env:
+  CARGO_TERM_COLOR: never
+  LINUX_TARGETS: x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+  DARWIN_TARGETS: aarch64-apple-darwin x86_64-apple-darwin
+
+jobs:
+  check:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    # Debian 13 ships Ghostscript 10, whose PDF interpreter the image-skipping test targets.
+    container: debian:trixie
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools and test dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: apt-get update && apt-get install -y --no-install-recommends ghostscript qpdf poppler-utils gcc g++ make libc6-dev ca-certificates git cmake pkg-config libleptonica-dev jbig2dec python3 python3-venv fonts-dejavu-core fontconfig fonts-urw-base35 fonts-liberation default-jre-headless curl unzip
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --component clippy,rustfmt
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install optional Python tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pdf-tools"
+          "$RUNNER_TEMP/pdf-tools/bin/pip" install -r tools/requirements.txt ruff==0.17.2
+          echo "$RUNNER_TEMP/pdf-tools/bin" >> "$GITHUB_PATH"
+      - name: Install lossless JBIG2 encoder
+        run: |
+          git init "$RUNNER_TEMP/jbig2enc"
+          git -C "$RUNNER_TEMP/jbig2enc" remote add origin https://github.com/agl/jbig2enc.git
+          git -C "$RUNNER_TEMP/jbig2enc" fetch --depth 1 origin d0dfca46216c98f11312a9c9f15615ed490cd7b3
+          git -C "$RUNNER_TEMP/jbig2enc" checkout --detach FETCH_HEAD
+          cmake -S "$RUNNER_TEMP/jbig2enc" -B "$RUNNER_TEMP/jbig2enc/build" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/jbig2enc/build" -j4
+          cmake --install "$RUNNER_TEMP/jbig2enc/build"
+      - name: Install veraPDF
+        run: |
+          sh tools/install-verapdf.sh "$RUNNER_TEMP/verapdf"
+          echo "$RUNNER_TEMP/verapdf" >> "$GITHUB_PATH"
+      - name: Check formatting and lints
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+          ruff check tools
+          ruff format --check tools
+      - name: Test
+        env:
+          PDF_SQUEEZER_INTEGRATION: "1"
+        run: cargo test --locked
+      - name: Compare PDF rendering and optional operations
+        env:
+          PDF_SQUEEZER_INTEGRATION: "1"
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+      - name: Check the other release targets
+        # Checking needs no linker, so every target builds here; releases link on their own platforms.
+        run: |
+          for target in aarch64-unknown-linux-gnu $DARWIN_TARGETS; do
+            rustup target add "$target"
+            cargo check --release --locked --target "$target"
+          done
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Install PDF tools and test dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install qpdf ghostscript poppler jbig2dec jbig2enc fontconfig
+          # The same metric-compatible fonts as the Linux job, so PDF/A picks the same substitutes.
+          brew install --cask font-urw-base35 font-liberation font-dejavu
+      - name: Install optional Python tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pdf-tools"
+          "$RUNNER_TEMP/pdf-tools/bin/pip" install -r tools/requirements.txt
+          echo "$RUNNER_TEMP/pdf-tools/bin" >> "$GITHUB_PATH"
+      - name: Install veraPDF
+        run: |
+          sh tools/install-verapdf.sh "$RUNNER_TEMP/verapdf"
+          echo "$RUNNER_TEMP/verapdf" >> "$GITHUB_PATH"
+      - name: Test
+        env:
+          PDF_SQUEEZER_INTEGRATION: "1"
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable test --locked
+      - name: Compare PDF rendering and optional operations
+        env:
+          PDF_SQUEEZER_INTEGRATION: "1"
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+
+  image:
+    needs: check
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # the build context must not carry the token
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the image with every optional tool; push on tags
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          # A commit build stamps its SHA, so the Dockerfile's version check runs on every build.
+          build-args: VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+          platforms: ${{ github.ref_type == 'tag' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ github.ref_type == 'tag' }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_type == 'tag' && github.ref_name || 'ci' }}
+            ghcr.io/${{ github.repository }}:latest
+
+  darwin:
+    if: github.ref_type == 'tag'
+    needs: [check, macos]
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build macOS binaries
+        env:
+          PDF_SQUEEZER_VERSION: ${{ github.ref_name }}
+        run: |
+          rustup toolchain install stable --profile minimal
+          mkdir dist
+          for target in $DARWIN_TARGETS; do
+            rustup +stable target add "$target"
+            cargo +stable build --release --locked --target "$target"
+            case "$target" in aarch64-*) arch=arm64 ;; *) arch=amd64 ;; esac
+            cp "target/$target/release/pdf-squeezer" "dist/pdf-squeezer_darwin_$arch"
+          done
+          test "$(./dist/pdf-squeezer_darwin_arm64 --version)" = "$GITHUB_REF_NAME"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: darwin
+          path: dist/
+          retention-days: 1
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [check, macos, image, darwin]
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: darwin
+          path: ${{ runner.temp }}/dist
+      - name: Build Linux binaries
+        # Zig links against glibc 2.17, so the binaries run on old distributions too.
+        env:
+          PDF_SQUEEZER_VERSION: ${{ github.ref_name }}
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          . "$HOME/.cargo/env"
+          python3 -m pip install --user ziglang==0.17.1
+          cargo install --locked cargo-zigbuild@0.24.1
+          for target in $LINUX_TARGETS; do
+            rustup target add "$target"
+            cargo zigbuild --release --locked --target "$target.2.17"
+            case "$target" in aarch64-*) arch=arm64 ;; *) arch=amd64 ;; esac
+            cp "target/$target/release/pdf-squeezer" "$RUNNER_TEMP/dist/pdf-squeezer_linux_$arch"
+          done
+          cp tools/requirements.txt "$RUNNER_TEMP/dist/pdf-tools-requirements.txt"
+          cd "$RUNNER_TEMP/dist"
+          chmod +x pdf-squeezer_*
+          test "$(./pdf-squeezer_linux_amd64 --version)" = "$GITHUB_REF_NAME"
+          sha256sum * > checksums.txt
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # The generated notes stay private until they are edited and the draft is published.
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --generate-notes "$RUNNER_TEMP"/dist/*
